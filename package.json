@@ -1,25 +1,25 @@
 {
-  "name": "@well-known-components/base-component",
+  "name": "@dcl/catalyst-storage",
   "version": "1.0.0",
-  "description": "base component",
+  "description": "Storage component for catalysts (WKC)",
   "main": "dist/index.js",
   "typings": "dist/index.d.ts",
   "scripts": {},
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/well-known-components/base-component.git"
+    "url": "git+https://github.com/decentraland/catalyst-storage.git"
   },
   "keywords": [],
   "author": "",
   "license": "Apache-2.0",
   "bugs": {
-    "url": "https://github.com/well-known-components/base-component/issues"
+    "url": "https://github.com/decentraland/catalyst-storage/issues"
   },
   "prettier": {
     "printWidth": 120,
     "semi": false
   },
-  "homepage": "https://github.com/well-known-components/base-component#readme",
+  "homepage": "https://github.com/decentraland/catalyst-storage#readme",
   "devDependencies": {
     "@microsoft/api-extractor": "^7.17.0",
     "@types/jest": "^28.1.0",
@@ -29,5 +29,12 @@
   },
   "files": [
     "dist"
-  ]
+  ],
+  "dependencies": {
+    "@types/destroy": "^1.0.0",
+    "@types/node": "^17.0.39",
+    "@well-known-components/interfaces": "^1.1.1",
+    "aws-sdk": "^2.1148.0",
+    "destroy": "^1.2.0"
+  }
 }
