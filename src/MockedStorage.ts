@@ -2,6 +2,9 @@ import { Readable } from 'stream'
 import { ContentItem, IContentStorageComponent } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
 
+/**
+ * @public
+ */
 export class MockedStorage implements IContentStorageComponent {
   public storage: Map<string, Uint8Array> = new Map()
 

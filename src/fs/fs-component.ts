@@ -11,6 +11,9 @@ async function existPath(path: string): Promise<boolean> {
   }
 }
 
+/**
+ * @public
+ */
 export function createFsComponent(): IFileSystemComponent {
   return {
     createReadStream: fs.createReadStream,

@@ -4,6 +4,9 @@ import { AppComponents } from "./types"
 import { SimpleContentItem } from "./content-item"
 import { ContentItem, IContentStorageComponent } from "./types"
 
+/**
+ * @public
+ */
 export async function createAwsS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, "fs" | "config">,
   bucket: string
@@ -19,6 +22,9 @@ export async function createAwsS3BasedFileSystemContentStorage(
   return createS3BasedFileSystemContentStorage({}, s3, { Bucket: bucket, getKey })
 }
 
+/**
+ * @beta
+ */
 export async function createS3BasedFileSystemContentStorage(
   components: {},
   s3: Pick<S3, "headObject" | "putObject" | "getObject" | "deleteObjects">,

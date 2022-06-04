@@ -2,6 +2,9 @@ import { Readable } from "stream"
 import { createGunzip } from "zlib"
 import { ContentItem } from "./types"
 
+/**
+ * @public
+ */
 export class SimpleContentItem implements ContentItem {
   constructor(
     private streamCreator: () => Promise<Readable>,
@@ -36,10 +39,12 @@ export class SimpleContentItem implements ContentItem {
   }
 }
 
+// @internal
 export function bufferToStream(buffer: Uint8Array | Buffer): Readable {
   return Readable.from(Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer))
 }
 
+// @internal
 export function streamToBuffer(stream: Readable): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const buffers: Uint8Array[] = []

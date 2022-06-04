@@ -1,12 +1,17 @@
 import { Readable } from "stream"
 import { IFileSystemComponent } from "./fs/types"
 import { IConfigComponent } from "@well-known-components/interfaces"
-
+/**
+ * @public
+ */
 export type AppComponents = {
   fs: IFileSystemComponent
   config: IConfigComponent
 }
 
+/**
+ * @public
+ */
 export type IContentStorageComponent = {
   storeStream(fileId: string, content: Readable): Promise<void>
   storeStreamAndCompress(fileId: string, content: Readable): Promise<void>
@@ -16,6 +21,9 @@ export type IContentStorageComponent = {
   existMultiple(fileIds: string[]): Promise<Map<string, boolean>>
 }
 
+/**
+ * @public
+ */
 export interface ContentItem {
   encoding: string | null
   size: number | null

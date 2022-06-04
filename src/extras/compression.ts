@@ -6,12 +6,18 @@ import { promisify } from 'util'
 import { createGzip } from 'zlib'
 const pipe = promisify(pipeline)
 
+/**
+ * @public
+ */
 export type CompressionResult = {
   originalSize: number
   compressedSize: number
 }
 
-// this whole file can be extracted to a worker in a different process
+
+/**
+ * @public
+ */
 export async function compressContentFile(contentFilePath: string): Promise<boolean> {
   const result = await gzipCompressFile(contentFilePath, contentFilePath + '.gzip')
   if (result) {

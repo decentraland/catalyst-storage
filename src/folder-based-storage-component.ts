@@ -9,10 +9,16 @@ import { ContentItem, IContentStorageComponent } from "./types"
 
 const pipe = promisify(pipeline)
 
+/**
+ * @public
+ */
 export type FolderBasedContentStorage = IContentStorageComponent & {
   allFileIds(): AsyncIterable<string>
 }
 
+/**
+ * @public
+ */
 export async function createFolderBasedFileSystemContentStorage(
   components: Pick<AppComponents, "fs">,
   root: string

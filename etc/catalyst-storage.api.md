@@ -19,28 +19,34 @@ export type AppComponents = {
 };
 
 // @public (undocumented)
-export type ContentEncoding = "gzip";
-
-// @public (undocumented)
 export interface ContentItem {
-    asRawStream(): Promise<RawContent>;
+    asRawStream(): Promise<Readable>;
     asStream(): Promise<Readable>;
+    // (undocumented)
+    encoding: string | null;
+    // (undocumented)
+    size: number | null;
 }
 
 // @public (undocumented)
 export function createAwsS3BasedFileSystemContentStorage(components: Pick<AppComponents, "fs" | "config">, bucket: string): Promise<IContentStorageComponent>;
 
 // @public (undocumented)
-export function createFolderBasedFileSystemContentStorage(components: Pick<AppComponents, "fs">, root: string): Promise<IContentStorageComponent>;
+export function createFolderBasedFileSystemContentStorage(components: Pick<AppComponents, "fs">, root: string): Promise<FolderBasedContentStorage>;
 
 // @public (undocumented)
 export function createFsComponent(): IFileSystemComponent;
 
-// @public (undocumented)
+// @beta (undocumented)
 export function createS3BasedFileSystemContentStorage(components: {}, s3: Pick<S3, "headObject" | "putObject" | "getObject" | "deleteObjects">, options: {
     Bucket: string;
     getKey?: (hash: string) => string;
 }): Promise<IContentStorageComponent>;
+
+// @public (undocumented)
+export type FolderBasedContentStorage = IContentStorageComponent & {
+    allFileIds(): AsyncIterable<string>;
+};
 
 // @public (undocumented)
 export type IContentStorageComponent = {
@@ -52,18 +58,11 @@ export type IContentStorageComponent = {
     existMultiple(fileIds: string[]): Promise<Map<string, boolean>>;
 };
 
-// @public (undocumented)
+// @public
 export type IFileSystemComponent = Pick<typeof fs, "createReadStream"> & Pick<typeof fs, "createWriteStream"> & Pick<typeof fsPromises, "access" | "opendir" | "stat" | "unlink" | "mkdir" | "readdir" | "readFile"> & {
     constants: Pick<typeof fs.constants, "F_OK" | "R_OK">;
 } & {
     existPath(path: string): Promise<boolean>;
-};
-
-// @public (undocumented)
-export type RawContent = {
-    stream: Readable;
-    encoding: ContentEncoding | null;
-    size: number | null;
 };
 
 // (No @packageDocumentation comment for this package)
