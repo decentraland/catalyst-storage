@@ -27,7 +27,7 @@ export async function createAwsS3BasedFileSystemContentStorage(
  */
 export async function createS3BasedFileSystemContentStorage(
   components: {},
-  s3: Pick<S3, "headObject" | "putObject" | "getObject" | "deleteObjects">,
+  s3: Pick<S3, "headObject" | "upload" | "getObject" | "deleteObjects">,
   options: { Bucket: string; getKey?: (hash: string) => string }
 ): Promise<IContentStorageComponent> {
   const getKey = options.getKey || ((hash: string) => hash)
@@ -46,7 +46,7 @@ export async function createS3BasedFileSystemContentStorage(
     exist,
     async storeStream(id: string, stream: Readable): Promise<void> {
       await s3
-        .putObject({
+        .upload({
           Bucket,
           Key: getKey(id),
           Body: stream,
@@ -69,7 +69,7 @@ export async function createS3BasedFileSystemContentStorage(
     },
     async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
       await s3
-        .putObject({
+        .upload({
           Bucket,
           Key: getKey(id),
           Body: stream,
