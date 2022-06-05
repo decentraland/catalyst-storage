@@ -36,7 +36,6 @@ export async function createS3BasedFileSystemContentStorage(
   async function exist(id: string): Promise<boolean> {
     try {
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
-      console.dir(obj)
       return !!obj.ETag
     } catch {
       return false
