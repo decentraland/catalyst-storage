@@ -34,11 +34,15 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function exist(id: string): Promise<boolean> {
     try {
-      const obj = await s3.headObject({ ...options, Key: getKey(id) }).promise()
+      const obj = await s3.headObject({ ...extraArgs, Key: getKey(id) }).promise()
       return !!obj.LastModified
     } catch {
       return false
     }
+  }
+
+  const extraArgs: { Bucket: string } = {
+    Bucket: options.Bucket,
   }
 
   return {
@@ -46,7 +50,7 @@ export async function createS3BasedFileSystemContentStorage(
     async storeStream(id: string, stream: Readable): Promise<void> {
       await s3
         .putObject({
-          ...options,
+          ...extraArgs,
           Key: getKey(id),
           Body: stream,
         })
@@ -54,10 +58,10 @@ export async function createS3BasedFileSystemContentStorage(
     },
     async retrieve(id: string): Promise<ContentItem | undefined> {
       try {
-        const obj = await s3.headObject({ ...options, Key: getKey(id) }).promise()
+        const obj = await s3.headObject({ ...extraArgs, Key: getKey(id) }).promise()
 
         return new SimpleContentItem(
-          async () => s3.getObject({ ...options, Key: getKey(id) }).createReadStream(),
+          async () => s3.getObject({ ...extraArgs, Key: getKey(id) }).createReadStream(),
           obj.ContentLength || null,
           obj.ContentEncoding || null
         )
@@ -69,7 +73,7 @@ export async function createS3BasedFileSystemContentStorage(
     async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
       await s3
         .putObject({
-          ...options,
+          ...extraArgs,
           Key: getKey(id),
           Body: stream,
         })
@@ -78,7 +82,7 @@ export async function createS3BasedFileSystemContentStorage(
     async delete(ids: string[]): Promise<void> {
       await s3
         .deleteObjects({
-          ...options,
+          ...extraArgs,
           Delete: { Objects: ids.map(($) => ({ Key: getKey($) })) },
         })
         .promise()
