@@ -39,12 +39,16 @@ export class SimpleContentItem implements ContentItem {
   }
 }
 
-// @internal
+/**
+ * @public
+ */
 export function bufferToStream(buffer: Uint8Array | Buffer): Readable {
   return Readable.from(Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer))
 }
 
-// @internal
+/**
+ * @public
+ */
 export function streamToBuffer(stream: Readable): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const buffers: Uint8Array[] = []

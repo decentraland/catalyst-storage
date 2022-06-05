@@ -31,18 +31,16 @@ export async function createS3BasedFileSystemContentStorage(
   options: { Bucket: string; getKey?: (hash: string) => string }
 ): Promise<IContentStorageComponent> {
   const getKey = options.getKey || ((hash: string) => hash)
+  const Bucket = options.Bucket
 
   async function exist(id: string): Promise<boolean> {
     try {
-      const obj = await s3.headObject({ ...extraArgs, Key: getKey(id) }).promise()
-      return !!obj.LastModified
+      const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
+      console.dir(obj)
+      return !!obj.ETag
     } catch {
       return false
     }
-  }
-
-  const extraArgs: { Bucket: string } = {
-    Bucket: options.Bucket,
   }
 
   return {
@@ -50,7 +48,7 @@ export async function createS3BasedFileSystemContentStorage(
     async storeStream(id: string, stream: Readable): Promise<void> {
       await s3
         .putObject({
-          ...extraArgs,
+          Bucket,
           Key: getKey(id),
           Body: stream,
         })
@@ -58,10 +56,10 @@ export async function createS3BasedFileSystemContentStorage(
     },
     async retrieve(id: string): Promise<ContentItem | undefined> {
       try {
-        const obj = await s3.headObject({ ...extraArgs, Key: getKey(id) }).promise()
+        const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
 
         return new SimpleContentItem(
-          async () => s3.getObject({ ...extraArgs, Key: getKey(id) }).createReadStream(),
+          async () => s3.getObject({ Bucket, Key: getKey(id) }).createReadStream(),
           obj.ContentLength || null,
           obj.ContentEncoding || null
         )
@@ -73,7 +71,7 @@ export async function createS3BasedFileSystemContentStorage(
     async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
       await s3
         .putObject({
-          ...extraArgs,
+          Bucket,
           Key: getKey(id),
           Body: stream,
         })
@@ -82,7 +80,7 @@ export async function createS3BasedFileSystemContentStorage(
     async delete(ids: string[]): Promise<void> {
       await s3
         .deleteObjects({
-          ...extraArgs,
+          Bucket,
           Delete: { Objects: ids.map(($) => ({ Key: getKey($) })) },
         })
         .promise()
