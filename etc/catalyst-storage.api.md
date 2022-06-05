@@ -38,7 +38,7 @@ export function createFolderBasedFileSystemContentStorage(components: Pick<AppCo
 export function createFsComponent(): IFileSystemComponent;
 
 // @beta (undocumented)
-export function createS3BasedFileSystemContentStorage(components: {}, s3: Pick<S3, "headObject" | "putObject" | "getObject" | "deleteObjects">, options: {
+export function createS3BasedFileSystemContentStorage(components: {}, s3: Pick<S3, "headObject" | "upload" | "getObject" | "deleteObjects">, options: {
     Bucket: string;
     getKey?: (hash: string) => string;
 }): Promise<IContentStorageComponent>;
