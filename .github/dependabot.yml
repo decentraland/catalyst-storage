@@ -10,4 +10,9 @@ updates:
   versioning-strategy: auto
   commit-message:
     prefix: "chore: "
+  allow:
+    - dependency-name: "@dcl/*"
+    - dependency-name: "@catalyst/*"
+    - dependency-name: "@well-known-components/*"
+    - dependency-name: "dcl-*"
   open-pull-requests-limit: 10
