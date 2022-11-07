@@ -35,7 +35,7 @@
     "@types/destroy": "^1.0.0",
     "@types/node": "^18.6.3",
     "@well-known-components/interfaces": "^1.1.1",
-    "aws-sdk": "^2.1148.0",
+    "aws-sdk": "^2.1248.0",
     "destroy": "^1.2.0"
   }
 }
