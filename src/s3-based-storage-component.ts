@@ -53,7 +53,11 @@ export async function createS3BasedFileSystemContentStorage(
         }, {
           partSize: 5 * 1024 * 1024 // Chunks of 5 Mb
         })
-      data.on("httpUploadProgress", (progress) => console.log(progress))
+      try {
+        data.on("httpUploadProgress", (progress) => console.log(progress))
+      } catch (error) {
+        console.log(error)
+      }
 
       console.log(await data.promise())
     },
