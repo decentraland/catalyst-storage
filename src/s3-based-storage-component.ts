@@ -45,13 +45,17 @@ export async function createS3BasedFileSystemContentStorage(
   return {
     exist,
     async storeStream(id: string, stream: Readable): Promise<void> {
-      await s3
+      const data = s3
         .upload({
           Bucket,
           Key: getKey(id),
           Body: stream,
+        }, {
+          partSize: 5 * 1024 * 1024 // Chunks of 5 Mb
         })
-        .promise()
+      data.on("httpUploadProgress", (progress) => console.log(progress))
+
+      console.log(await data.promise())
     },
     async retrieve(id: string): Promise<ContentItem | undefined> {
       try {
