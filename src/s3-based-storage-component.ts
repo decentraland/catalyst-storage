@@ -1,8 +1,7 @@
 import { S3 } from "aws-sdk"
 import { Readable } from "stream"
-import { AppComponents } from "./types"
+import { AppComponents, ContentItem, IContentStorageComponent } from "./types"
 import { SimpleContentItem } from "./content-item"
-import { ContentItem, IContentStorageComponent } from "./types"
 
 /**
  * @public
@@ -45,21 +44,15 @@ export async function createS3BasedFileSystemContentStorage(
   return {
     exist,
     async storeStream(id: string, stream: Readable): Promise<void> {
-      const data = s3
-        .upload({
-          Bucket,
-          Key: getKey(id),
-          Body: stream,
-        }, {
-          partSize: 5 * 1024 * 1024 // Chunks of 5 Mb
-        })
-      try {
-        data.on("httpUploadProgress", (progress) => console.log(progress))
-      } catch (error) {
-        console.log(error)
-      }
-
-      console.log(await data.promise())
+      await s3
+          .upload({
+            Bucket,
+            Key: getKey(id),
+            Body: stream,
+          }, {
+            partSize: 5 * 1024 * 1024 // Chunks of 5 Mb
+          })
+          .promise()
     },
     async retrieve(id: string): Promise<ContentItem | undefined> {
       try {
