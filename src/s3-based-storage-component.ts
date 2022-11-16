@@ -50,7 +50,8 @@ export async function createS3BasedFileSystemContentStorage(
             Key: getKey(id),
             Body: stream,
           }, {
-            partSize: 5 * 1024 * 1024 // Chunks of 5 Mb
+            // Forcing chunks of 5Mb to improve upload of large files
+            partSize: 5 * 1024 * 1024
           })
           .promise()
     },
