@@ -41,6 +41,8 @@ jobs:
           node-version: 14.x
       - name: install
         run:  npm install
+      - name: check code lint
+        run:  yarn lint:check
       - name: build
         run:  make build
       - name: test
