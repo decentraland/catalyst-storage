@@ -3,6 +3,7 @@ import { Readable } from 'stream'
 import { AppComponents, ContentItem, IContentStorageComponent } from './types'
 import { SimpleContentItem } from './content-item'
 import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
+import { FolderBasedContentStorage } from './folder-based-storage-component'
 
 /**
  * @public
@@ -10,7 +11,7 @@ import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
 export async function createAwsS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, 'fs' | 'config'>,
   bucket: string
-): Promise<IContentStorageComponent> {
+): Promise<FolderBasedContentStorage> {
   const { config } = components
 
   const s3 = new S3({
@@ -29,7 +30,7 @@ export async function createS3BasedFileSystemContentStorage(
   components: Partial<AppComponents>,
   s3: Pick<S3, 'headObject' | 'upload' | 'getObject' | 'deleteObjects' | 'listObjectsV2'>,
   options: { Bucket: string; getKey?: (hash: string) => string }
-): Promise<IContentStorageComponent> {
+): Promise<FolderBasedContentStorage> {
   const getKey = options.getKey || ((hash: string) => hash)
   const Bucket = options.Bucket
 
@@ -96,7 +97,7 @@ export async function createS3BasedFileSystemContentStorage(
       return new Map(entries)
     },
 
-    findKeys: async function* findKeys(prefix?: string): AsyncIterable<string> {
+    allFileIds: async function* allFileIds(prefix?: string): AsyncIterable<string> {
       const params: S3.Types.ListObjectsV2Request = {
         Bucket,
         ContinuationToken: undefined

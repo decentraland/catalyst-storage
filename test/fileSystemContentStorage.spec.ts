@@ -113,7 +113,7 @@ describe('fileSystemContentStorage', () => {
 
     async function check(prefix: string, expected: string[]) {
       const filtered = []
-      for await (const key of await fileSystemContentStorage.findKeys(prefix)) {
+      for await (const key of await fileSystemContentStorage.allFileIds(prefix)) {
         filtered.push(key)
       }
       for (const filteredKey of expected) {
