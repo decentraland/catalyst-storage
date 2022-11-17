@@ -1,6 +1,5 @@
-import { createReadStream, readFileSync } from 'fs'
 import path from 'path'
-import { createFolderBasedFileSystemContentStorage, createFsComponent, FolderBasedContentStorage, IContentStorageComponent } from '../src'
+import { createFolderBasedFileSystemContentStorage, createFsComponent, FolderBasedContentStorage } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 import { FileSystemUtils as fsu } from './FileSystemUtils'
 
@@ -30,7 +29,7 @@ describe('ContentStorage', () => {
     await storage.storeStream(id, bufferToStream(content))
 
     const exists = await storage.existMultiple([id])
-console.dir(exists)
+    console.dir(exists)
     expect(exists.get(id)).toBe(true)
     expect(await storage.exist(id)).toBe(true)
   })
@@ -68,7 +67,10 @@ console.dir(exists)
 
     const retrievedContent = await storage.retrieve(id)
 
-    expect({ encoding: retrievedContent?.encoding, size: retrievedContent?.size }).toEqual({ encoding: 'gzip', size: 45 })
+    expect({ encoding: retrievedContent?.encoding, size: retrievedContent?.size }).toEqual({
+      encoding: 'gzip',
+      size: 45
+    })
     expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(newContent)
   })
 })

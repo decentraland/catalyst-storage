@@ -1,6 +1,6 @@
-import * as fs from "fs"
-import * as fsPromises from "fs/promises"
-import { IFileSystemComponent } from "./types"
+import * as fs from 'fs'
+import * as fsPromises from 'fs/promises'
+import { IFileSystemComponent } from './types'
 
 async function existPath(path: string): Promise<boolean> {
   try {
@@ -27,7 +27,7 @@ export function createFsComponent(): IFileSystemComponent {
     readFile: fsPromises.readFile,
     constants: {
       F_OK: fs.constants.F_OK,
-      R_OK: fs.constants.R_OK,
+      R_OK: fs.constants.R_OK
     },
     existPath
   }

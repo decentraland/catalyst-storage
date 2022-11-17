@@ -1,11 +1,11 @@
-import { createHash } from "crypto"
-import path from "path"
-import { pipeline, Readable } from "stream"
-import { promisify } from "util"
-import { AppComponents } from "./types"
-import { SimpleContentItem } from "./content-item"
-import { compressContentFile } from "./extras/compression"
-import { ContentItem, IContentStorageComponent } from "./types"
+import { createHash } from 'crypto'
+import path from 'path'
+import { pipeline, Readable } from 'stream'
+import { promisify } from 'util'
+import { AppComponents } from './types'
+import { SimpleContentItem } from './content-item'
+import { compressContentFile } from './extras/compression'
+import { ContentItem, IContentStorageComponent } from './types'
 
 const pipe = promisify(pipeline)
 
@@ -20,7 +20,7 @@ export type FolderBasedContentStorage = IContentStorageComponent & {
  * @public
  */
 export async function createFolderBasedFileSystemContentStorage(
-  components: Pick<AppComponents, "fs">,
+  components: Pick<AppComponents, 'fs'>,
   root: string
 ): Promise<FolderBasedContentStorage> {
   // remove path separators / \ from the end of the folder
@@ -34,7 +34,7 @@ export async function createFolderBasedFileSystemContentStorage(
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
     // for the file system to handle millions of files in the same directory.
     // This way, asuming that sha1 hash distribution is ~uniform we are reducing by 16^4 the max amount of files in a directory.
-    const directoryPath = path.join(root, createHash("sha1").update(id).digest("hex").substring(0, 4))
+    const directoryPath = path.join(root, createHash('sha1').update(id).digest('hex').substring(0, 4))
     if (!(await components.fs.existPath(directoryPath))) {
       await components.fs.mkdir(directoryPath, { recursive: true })
     }
@@ -42,7 +42,7 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   const retrieveWithEncoding = async (id: string, encoding: string | null): Promise<ContentItem | undefined> => {
-    const extension = encoding ? "." + encoding : ""
+    const extension = encoding ? '.' + encoding : ''
     const filePath = (await getFilePath(id)) + extension
 
     if (await components.fs.existPath(filePath)) {
@@ -67,7 +67,7 @@ export async function createFolderBasedFileSystemContentStorage(
 
   const retrieve = async (id: string): Promise<ContentItem | undefined> => {
     try {
-      return (await retrieveWithEncoding(id, "gzip")) || (await retrieveWithEncoding(id, null))
+      return (await retrieveWithEncoding(id, 'gzip')) || (await retrieveWithEncoding(id, null))
     } catch (error) {
       console.error(error)
     }
@@ -83,7 +83,7 @@ export async function createFolderBasedFileSystemContentStorage(
     for await (const entry of dirEntries) {
       entry.isDirectory()
         ? yield* allFileIdsRec(path.resolve(folder, entry.name))
-        : yield entry.name.replace(/\.gzip/, "")
+        : yield entry.name.replace(/\.gzip/, '')
     }
   }
 
@@ -104,13 +104,13 @@ export async function createFolderBasedFileSystemContentStorage(
     async delete(ids: string[]): Promise<void> {
       for (const id of ids) {
         await noFailUnlink(await getFilePath(id))
-        await noFailUnlink((await getFilePath(id)) + ".gzip")
+        await noFailUnlink((await getFilePath(id)) + '.gzip')
       }
     },
     async existMultiple(cids: string[]): Promise<Map<string, boolean>> {
       const entries = await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]))
       return new Map(entries)
     },
-    allFileIds: () => allFileIdsRec(root),
+    allFileIds: () => allFileIdsRec(root)
   }
 }
