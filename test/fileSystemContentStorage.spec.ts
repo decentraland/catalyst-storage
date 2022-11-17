@@ -116,7 +116,9 @@ describe('fileSystemContentStorage', () => {
       for await (const key of await fileSystemContentStorage.findKeys(prefix)) {
         filtered.push(key)
       }
-      expect(filtered).toEqual(expected)
+      for (const filteredKey of expected) {
+        expect(filtered).toContain(filteredKey)
+      }
       return filtered
     }
 
