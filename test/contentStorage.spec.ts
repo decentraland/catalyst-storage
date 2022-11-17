@@ -1,11 +1,11 @@
 import { createReadStream, readFileSync } from 'fs'
 import path from 'path'
-import { createFolderBasedFileSystemContentStorage, createFsComponent, FolderBasedContentStorage } from '../src'
+import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 import { FileSystemUtils as fsu } from './FileSystemUtils'
 
 describe('ContentStorageWithStreams', () => {
-  let storage: FolderBasedContentStorage
+  let storage: IContentStorageComponent
   let id: string
   let content: Buffer
   let id2: string

@@ -1,13 +1,13 @@
 import { mkdtempSync, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { createFolderBasedFileSystemContentStorage, createFsComponent, FolderBasedContentStorage } from '../src'
+import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 
 describe('fileSystemContentStorage', () => {
   const fs = createFsComponent()
   let tmpRootDir: string
-  let fileSystemContentStorage: FolderBasedContentStorage
+  let fileSystemContentStorage: IContentStorageComponent
 
   // sha1('some-id') = 9584b661c135a43f2fbbe43cc5104f7bd693d048
   const id: string = 'some-id'
@@ -113,7 +113,7 @@ describe('fileSystemContentStorage', () => {
 
     async function check(prefix: string, expected: string[]) {
       const filtered = []
-      for await (const key of await fileSystemContentStorage.findKeys(prefix)) {
+      for await (const key of await fileSystemContentStorage.allFileIds(prefix)) {
         filtered.push(key)
       }
       for (const filteredKey of expected) {

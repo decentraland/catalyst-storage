@@ -32,7 +32,7 @@ export interface ContentItem {
 export function createAwsS3BasedFileSystemContentStorage(components: Pick<AppComponents, 'fs' | 'config'>, bucket: string): Promise<IContentStorageComponent>;
 
 // @public (undocumented)
-export function createFolderBasedFileSystemContentStorage(components: Pick<AppComponents, 'fs'>, root: string): Promise<FolderBasedContentStorage>;
+export function createFolderBasedFileSystemContentStorage(components: Pick<AppComponents, 'fs'>, root: string): Promise<IContentStorageComponent>;
 
 // @public (undocumented)
 export function createFsComponent(): IFileSystemComponent;
@@ -44,11 +44,6 @@ export function createS3BasedFileSystemContentStorage(components: Partial<AppCom
 }): Promise<IContentStorageComponent>;
 
 // @public (undocumented)
-export type FolderBasedContentStorage = IContentStorageComponent & {
-    allFileIds(): AsyncIterable<string>;
-};
-
-// @public (undocumented)
 export type IContentStorageComponent = {
     storeStream(fileId: string, content: Readable): Promise<void>;
     storeStreamAndCompress(fileId: string, content: Readable): Promise<void>;
@@ -56,7 +51,7 @@ export type IContentStorageComponent = {
     retrieve(fileId: string): Promise<ContentItem | undefined>;
     exist(fileId: string): Promise<boolean>;
     existMultiple(fileIds: string[]): Promise<Map<string, boolean>>;
-    findKeys(prefix?: string): AsyncIterable<string>;
+    allFileIds(prefix?: string): AsyncIterable<string>;
 };
 
 // @public

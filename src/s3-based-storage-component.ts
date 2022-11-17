@@ -96,7 +96,7 @@ export async function createS3BasedFileSystemContentStorage(
       return new Map(entries)
     },
 
-    findKeys: async function* findKeys(prefix?: string): AsyncIterable<string> {
+    allFileIds: async function* allFileIds(prefix?: string): AsyncIterable<string> {
       const params: S3.Types.ListObjectsV2Request = {
         Bucket,
         ContinuationToken: undefined

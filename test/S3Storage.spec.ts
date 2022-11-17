@@ -135,7 +135,7 @@ describe('S3 Storage', () => {
 
     async function check(prefix: string, expected: string[]) {
       const filtered = []
-      for await (const key of await storage.findKeys(prefix)) {
+      for await (const key of await storage.allFileIds(prefix)) {
         filtered.push(key)
       }
       for (const filteredKey of expected) {

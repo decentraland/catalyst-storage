@@ -11,17 +11,10 @@ const pipe = promisify(pipeline)
 /**
  * @public
  */
-export type FolderBasedContentStorage = IContentStorageComponent & {
-  allFileIds(): AsyncIterable<string>
-}
-
-/**
- * @public
- */
 export async function createFolderBasedFileSystemContentStorage(
   components: Pick<AppComponents, 'fs'>,
   root: string
-): Promise<FolderBasedContentStorage> {
+): Promise<IContentStorageComponent> {
   // remove path separators / \ from the end of the folder
   while (root.endsWith(path.sep)) {
     root = root.slice(0, -1)
@@ -77,12 +70,14 @@ export async function createFolderBasedFileSystemContentStorage(
     return !!(await retrieve(id))
   }
 
-  const allFileIdsRec = async function* (folder: string): AsyncIterable<string> {
+  const allFileIdsRec = async function* (folder: string, prefix?: string): AsyncIterable<string> {
     const dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
     for await (const entry of dirEntries) {
-      entry.isDirectory()
-        ? yield* allFileIdsRec(path.resolve(folder, entry.name))
-        : yield entry.name.replace(/\.gzip/, '')
+      if (entry.isDirectory()) {
+        yield* allFileIdsRec(path.resolve(folder, entry.name))
+      } else if (!prefix || entry.name.startsWith(prefix)) {
+        yield entry.name.replace(/\.gzip/, '')
+      }
     }
   }
 
@@ -110,14 +105,6 @@ export async function createFolderBasedFileSystemContentStorage(
       const entries = await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]))
       return new Map(entries)
     },
-    allFileIds: () => allFileIdsRec(root),
-
-    findKeys: async function* findKeys(prefix?: string): AsyncIterable<string> {
-      for await (const key of allFileIdsRec(root)) {
-        if (!prefix || key.startsWith(prefix)) {
-          yield key
-        }
-      }
-    }
+    allFileIds: (prefix?: string) => allFileIdsRec(root, prefix)
   }
 }
