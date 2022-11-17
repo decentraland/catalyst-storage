@@ -1,6 +1,6 @@
 import { createReadStream, readFileSync } from 'fs'
 import path from 'path'
-import {createS3BasedFileSystemContentStorage, IContentStorageComponent} from '../src'
+import { createS3BasedFileSystemContentStorage, IContentStorageComponent } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 import { FileSystemUtils as fsu } from './FileSystemUtils'
 import AWSMock from 'mock-aws-s3'
