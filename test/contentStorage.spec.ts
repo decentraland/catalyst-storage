@@ -1,6 +1,6 @@
 import { createReadStream, readFileSync } from 'fs'
 import path from 'path'
-import { createFolderBasedFileSystemContentStorage, createFsComponent, FolderBasedContentStorage, IContentStorageComponent } from '../src'
+import { createFolderBasedFileSystemContentStorage, createFsComponent, FolderBasedContentStorage } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 import { FileSystemUtils as fsu } from './FileSystemUtils'
 
@@ -93,9 +93,13 @@ describe('ContentStorageWithStreams', () => {
     await storage.storeStream(id, bufferToStream(content))
     await storage.storeStream(id2, bufferToStream(content2))
     expect((await storage.existMultiple([id, id2, 'notStored'])).entries()).toEqual(
-      new Map([[id, true], [id2, true], ['notStored', false]]).entries()
+      new Map([
+        [id, true],
+        [id2, true],
+        ['notStored', false]
+      ]).entries()
     )
-})
+  })
 
   it(`When multiple content is stored, then multiple content is correct`, async () => {
     await storage.storeStream(id, bufferToStream(content))
@@ -116,7 +120,7 @@ describe('ContentStorageWithStreams', () => {
 
   it(`When a content with bad compression ratio is stored and compressed, then it is not stored compressed`, async () => {
     await storage.storeStreamAndCompress(id, bufferToStream(content))
-    const retrievedContent = (await storage.retrieve(id))
+    const retrievedContent = await storage.retrieve(id)
     expect(retrievedContent?.encoding).toBeNull()
     expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(content)
   })
@@ -124,7 +128,7 @@ describe('ContentStorageWithStreams', () => {
   it(`When a content with good compression ratio is stored and compressed, then it is stored compressed`, async () => {
     const goodCompresstionRatioContent = Buffer.from(new Uint8Array(100).fill(0))
     await storage.storeStreamAndCompress(id, bufferToStream(goodCompresstionRatioContent))
-    const retrievedContent = (await storage.retrieve(id))
+    const retrievedContent = await storage.retrieve(id)
     expect(retrievedContent?.encoding).toBe('gzip')
     expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(goodCompresstionRatioContent)
   })

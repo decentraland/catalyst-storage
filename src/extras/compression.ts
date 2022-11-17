@@ -14,7 +14,6 @@ export type CompressionResult = {
   compressedSize: number
 }
 
-
 /**
  * @public
  */

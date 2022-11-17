@@ -1,6 +1,6 @@
-import { Readable } from "stream"
-import { IFileSystemComponent } from "./fs/types"
-import { IConfigComponent } from "@well-known-components/interfaces"
+import { Readable } from 'stream'
+import { IFileSystemComponent } from './fs/types'
+import { IConfigComponent } from '@well-known-components/interfaces'
 /**
  * @public
  */

@@ -1,61 +1,54 @@
-import { createReadStream, readFileSync } from "fs"
-import path from "path"
-import {
-  createFolderBasedFileSystemContentStorage,
-  createFsComponent,
-  createS3BasedFileSystemContentStorage,
-  FolderBasedContentStorage,
-  IContentStorageComponent,
-} from "../src"
-import { bufferToStream, streamToBuffer } from "../src/content-item"
-import { FileSystemUtils as fsu } from "./FileSystemUtils"
-var AWSMock = require("mock-aws-s3")
+import { createReadStream, readFileSync } from 'fs'
+import path from 'path'
+import { createS3BasedFileSystemContentStorage, IContentStorageComponent } from '../src'
+import { bufferToStream, streamToBuffer } from '../src/content-item'
+import { FileSystemUtils as fsu } from './FileSystemUtils'
+import AWSMock from 'mock-aws-s3'
 
-describe("S3 Storage", () => {
+describe('S3 Storage', () => {
   let storage: IContentStorageComponent
   let id: string
   let content: Buffer
   let id2: string
   let content2: Buffer
 
-  it("starts the env", async () => {
+  it('starts the env', async () => {
     const root = fsu.createTempDirectory()
-    const contentFolder = path.join(root, "buckets")
-    AWSMock.config.basePath = contentFolder // Can configure a basePath for your local buckets
-    var s3 = AWSMock.S3({
-      params: { Bucket: "example" },
+    AWSMock.config.basePath = path.join(root, 'buckets') // Can configure a basePath for your local buckets
+    const s3 = AWSMock.S3({
+      params: { Bucket: 'example' }
     })
-    storage = await createS3BasedFileSystemContentStorage({}, s3, { Bucket: "example" })
+    storage = await createS3BasedFileSystemContentStorage({}, s3, { Bucket: 'example' })
 
-    id = "some-id"
-    content = Buffer.from("123")
-    id2 = "another-id"
-    content2 = Buffer.from("456")
+    id = 'some-id'
+    content = Buffer.from('123')
+    id2 = 'another-id'
+    content2 = Buffer.from('456')
   })
 
-  describe("Buffer utils", () => {
-    it("unit test small", async () => {
-      const b = Buffer.from("123")
+  describe('Buffer utils', () => {
+    it('unit test small', async () => {
+      const b = Buffer.from('123')
       const s = bufferToStream(b)
       expect(await streamToBuffer(s)).toEqual(b)
     })
-    it("unit test small uses buffer", async () => {
-      const b = Buffer.from("123")
+    it('unit test small uses buffer', async () => {
+      const b = Buffer.from('123')
       for await (const chunk of bufferToStream(b)) {
         expect(Buffer.isBuffer(chunk)).toBe(true)
       }
     })
-    it("streamToBuffer package.json", async () => {
+    it('streamToBuffer package.json', async () => {
       const stream = createReadStream(__filename)
       const raw = readFileSync(__filename)
       expect(await streamToBuffer(stream)).toEqual(raw)
     })
-    it("streamToBuffer package.json uses buffer", async () => {
+    it('streamToBuffer package.json uses buffer', async () => {
       for await (const chunk of createReadStream(__filename)) {
         expect(Buffer.isBuffer(chunk)).toBe(true)
       }
     })
-    it("unit test big", async () => {
+    it('unit test big', async () => {
       const b = Buffer.from(new Uint8Array(1000000).fill(0))
       const s = bufferToStream(b)
       expect(await streamToBuffer(s)).toEqual(b)
@@ -78,7 +71,7 @@ describe("S3 Storage", () => {
   })
 
   it(`When content is stored on already existing id, then it overwrites the previous content`, async function () {
-    const newContent = Buffer.from("456")
+    const newContent = Buffer.from('456')
 
     await storage.storeStream(id, bufferToStream(content))
     await storage.storeStream(id, bufferToStream(newContent))
@@ -103,10 +96,10 @@ describe("S3 Storage", () => {
   it(`When multiple content is stored, then multiple content exist`, async () => {
     await storage.storeStream(id, bufferToStream(content))
     await storage.storeStream(id2, bufferToStream(content2))
-    expect(Array.from((await storage.existMultiple([id, id2, "notStored"])).entries())).toEqual([
+    expect(Array.from((await storage.existMultiple([id, id2, 'notStored'])).entries())).toEqual([
       [id, true],
       [id2, true],
-      ["notStored", false],
+      ['notStored', false]
     ])
   })
 

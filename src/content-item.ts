@@ -1,6 +1,6 @@
-import { Readable } from "stream"
-import { createGunzip } from "zlib"
-import { ContentItem } from "./types"
+import { Readable } from 'stream'
+import { createGunzip } from 'zlib'
+import { ContentItem } from './types'
 
 /**
  * @public
@@ -22,7 +22,7 @@ export class SimpleContentItem implements ContentItem {
   async asStream(): Promise<Readable> {
     const stream = await this.streamCreator()
 
-    if (this.encoding == "gzip") {
+    if (this.encoding == 'gzip') {
       return stream.pipe(createGunzip())
     }
 
@@ -52,15 +52,15 @@ export function bufferToStream(buffer: Uint8Array | Buffer): Readable {
 export function streamToBuffer(stream: Readable): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const buffers: Uint8Array[] = []
-    stream.on("error", reject)
-    stream.on("data", (data) => {
+    stream.on('error', reject)
+    stream.on('data', (data) => {
       if (data instanceof Uint8Array || Buffer.isBuffer(data)) {
         buffers.push(data)
       } else {
-        reject(new Error("Stream did not emit Uint8Array"))
+        reject(new Error('Stream did not emit Uint8Array'))
         stream.destroy()
       }
     })
-    stream.on("end", () => resolve(Buffer.concat(buffers)))
+    stream.on('end', () => resolve(Buffer.concat(buffers)))
   })
 }

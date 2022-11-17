@@ -1,19 +1,19 @@
-import { S3 } from "aws-sdk"
-import { Readable } from "stream"
-import { AppComponents, ContentItem, IContentStorageComponent } from "./types"
-import { SimpleContentItem } from "./content-item"
+import { S3 } from 'aws-sdk'
+import { Readable } from 'stream'
+import { AppComponents, ContentItem, IContentStorageComponent } from './types'
+import { SimpleContentItem } from './content-item'
 
 /**
  * @public
  */
 export async function createAwsS3BasedFileSystemContentStorage(
-  components: Pick<AppComponents, "fs" | "config">,
+  components: Pick<AppComponents, 'fs' | 'config'>,
   bucket: string
 ): Promise<IContentStorageComponent> {
   const { config } = components
 
   const s3 = new S3({
-    region: await config.requireString("AWS_REGION"),
+    region: await config.requireString('AWS_REGION')
   })
 
   const getKey = (hash: string) => hash
@@ -25,8 +25,8 @@ export async function createAwsS3BasedFileSystemContentStorage(
  * @beta
  */
 export async function createS3BasedFileSystemContentStorage(
-  components: {},
-  s3: Pick<S3, "headObject" | "upload" | "getObject" | "deleteObjects">,
+  components: Partial<AppComponents>,
+  s3: Pick<S3, 'headObject' | 'upload' | 'getObject' | 'deleteObjects'>,
   options: { Bucket: string; getKey?: (hash: string) => string }
 ): Promise<IContentStorageComponent> {
   const getKey = options.getKey || ((hash: string) => hash)
@@ -45,15 +45,18 @@ export async function createS3BasedFileSystemContentStorage(
     exist,
     async storeStream(id: string, stream: Readable): Promise<void> {
       await s3
-          .upload({
+        .upload(
+          {
             Bucket,
             Key: getKey(id),
-            Body: stream,
-          }, {
+            Body: stream
+          },
+          {
             // Forcing chunks of 5Mb to improve upload of large files
             partSize: 5 * 1024 * 1024
-          })
-          .promise()
+          }
+        )
+        .promise()
     },
     async retrieve(id: string): Promise<ContentItem | undefined> {
       try {
@@ -74,7 +77,7 @@ export async function createS3BasedFileSystemContentStorage(
         .upload({
           Bucket,
           Key: getKey(id),
-          Body: stream,
+          Body: stream
         })
         .promise()
     },
@@ -82,7 +85,7 @@ export async function createS3BasedFileSystemContentStorage(
       await s3
         .deleteObjects({
           Bucket,
-          Delete: { Objects: ids.map(($) => ({ Key: getKey($) })) },
+          Delete: { Objects: ids.map(($) => ({ Key: getKey($) })) }
         })
         .promise()
     },
@@ -90,6 +93,6 @@ export async function createS3BasedFileSystemContentStorage(
     async existMultiple(cids: string[]): Promise<Map<string, boolean>> {
       const entries = await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]))
       return new Map(entries)
-    },
+    }
   }
 }

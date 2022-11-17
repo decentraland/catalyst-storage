@@ -1,10 +1,8 @@
 import { mkdtempSync, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { createFolderBasedFileSystemContentStorage, createFsComponent, FolderBasedContentStorage, IContentStorageComponent } from '../src'
+import { createFolderBasedFileSystemContentStorage, createFsComponent, FolderBasedContentStorage } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
-import { FileSystemUtils as fsu } from './FileSystemUtils'
-
 
 describe('fileSystemContentStorage', () => {
   const fs = createFsComponent()

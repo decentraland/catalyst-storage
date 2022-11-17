@@ -19,6 +19,8 @@ jobs:
           node-version: 16.x
       - name: install
         run:  npm install
+      - name: check code lint
+        run:  npm run lint:check
       - name: build
         run:  make build
       - name: test
@@ -41,6 +43,8 @@ jobs:
           node-version: 14.x
       - name: install
         run:  npm install
+      - name: check code lint
+        run:  npm run lint:check
       - name: build
         run:  make build
       - name: test

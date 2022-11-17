@@ -4,7 +4,10 @@
   "description": "Storage component for catalysts (WKC)",
   "main": "dist/index.js",
   "typings": "dist/index.d.ts",
-  "scripts": {},
+  "scripts": {
+    "lint:check": "eslint '**/*.{js,ts}'",
+    "lint:fix": "eslint '**/*.{js,ts}' --fix"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/decentraland/catalyst-storage.git"
@@ -17,12 +20,19 @@
   },
   "prettier": {
     "printWidth": 120,
-    "semi": false
+    "semi": false,
+    "singleQuote": true
   },
   "homepage": "https://github.com/decentraland/catalyst-storage#readme",
   "devDependencies": {
+    "@dcl/eslint-config": "^1.0.6",
     "@microsoft/api-extractor": "^7.17.0",
     "@types/jest": "^28.1.0",
+    "@typescript-eslint/eslint-plugin": "^5.43.0",
+    "@typescript-eslint/parser": "^5.43.0",
+    "eslint": "^8.27.0",
+    "eslint-config-prettier": "^8.5.0",
+    "eslint-plugin-prettier": "^4.2.1",
     "jest": "^28.1.0",
     "mock-aws-s3": "^4.0.2",
     "ts-jest": "^28.0.4",

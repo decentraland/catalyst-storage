@@ -29,16 +29,16 @@ export interface ContentItem {
 }
 
 // @public (undocumented)
-export function createAwsS3BasedFileSystemContentStorage(components: Pick<AppComponents, "fs" | "config">, bucket: string): Promise<IContentStorageComponent>;
+export function createAwsS3BasedFileSystemContentStorage(components: Pick<AppComponents, 'fs' | 'config'>, bucket: string): Promise<IContentStorageComponent>;
 
 // @public (undocumented)
-export function createFolderBasedFileSystemContentStorage(components: Pick<AppComponents, "fs">, root: string): Promise<FolderBasedContentStorage>;
+export function createFolderBasedFileSystemContentStorage(components: Pick<AppComponents, 'fs'>, root: string): Promise<FolderBasedContentStorage>;
 
 // @public (undocumented)
 export function createFsComponent(): IFileSystemComponent;
 
 // @beta (undocumented)
-export function createS3BasedFileSystemContentStorage(components: {}, s3: Pick<S3, "headObject" | "upload" | "getObject" | "deleteObjects">, options: {
+export function createS3BasedFileSystemContentStorage(components: Partial<AppComponents>, s3: Pick<S3, 'headObject' | 'upload' | 'getObject' | 'deleteObjects'>, options: {
     Bucket: string;
     getKey?: (hash: string) => string;
 }): Promise<IContentStorageComponent>;
@@ -59,8 +59,8 @@ export type IContentStorageComponent = {
 };
 
 // @public
-export type IFileSystemComponent = Pick<typeof fs, "createReadStream"> & Pick<typeof fs, "createWriteStream"> & Pick<typeof fsPromises, "access" | "opendir" | "stat" | "unlink" | "mkdir" | "readdir" | "readFile"> & {
-    constants: Pick<typeof fs.constants, "F_OK" | "R_OK">;
+export type IFileSystemComponent = Pick<typeof fs, 'createReadStream'> & Pick<typeof fs, 'createWriteStream'> & Pick<typeof fsPromises, 'access' | 'opendir' | 'stat' | 'unlink' | 'mkdir' | 'readdir' | 'readFile'> & {
+    constants: Pick<typeof fs.constants, 'F_OK' | 'R_OK'>;
 } & {
     existPath(path: string): Promise<boolean>;
 };
