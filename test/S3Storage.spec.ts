@@ -1,12 +1,12 @@
 import { createReadStream, readFileSync } from 'fs'
 import path from 'path'
-import {createS3BasedFileSystemContentStorage, FolderBasedContentStorage, IContentStorageComponent} from '../src'
+import {createS3BasedFileSystemContentStorage, IContentStorageComponent} from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 import { FileSystemUtils as fsu } from './FileSystemUtils'
 import AWSMock from 'mock-aws-s3'
 
 describe('S3 Storage', () => {
-  let storage: FolderBasedContentStorage
+  let storage: IContentStorageComponent
   let id: string
   let content: Buffer
   let id2: string

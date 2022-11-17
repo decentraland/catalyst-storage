@@ -19,6 +19,7 @@ export type IContentStorageComponent = {
   retrieve(fileId: string): Promise<ContentItem | undefined>
   exist(fileId: string): Promise<boolean>
   existMultiple(fileIds: string[]): Promise<Map<string, boolean>>
+  allFileIds(prefix?: string): AsyncIterable<string>
 }
 
 /**

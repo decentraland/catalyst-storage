@@ -11,17 +11,10 @@ const pipe = promisify(pipeline)
 /**
  * @public
  */
-export type FolderBasedContentStorage = IContentStorageComponent & {
-  allFileIds(prefix?: string): AsyncIterable<string>
-}
-
-/**
- * @public
- */
 export async function createFolderBasedFileSystemContentStorage(
   components: Pick<AppComponents, 'fs'>,
   root: string
-): Promise<FolderBasedContentStorage> {
+): Promise<IContentStorageComponent> {
   // remove path separators / \ from the end of the folder
   while (root.endsWith(path.sep)) {
     root = root.slice(0, -1)

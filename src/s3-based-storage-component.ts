@@ -3,7 +3,6 @@ import { Readable } from 'stream'
 import { AppComponents, ContentItem, IContentStorageComponent } from './types'
 import { SimpleContentItem } from './content-item'
 import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
-import { FolderBasedContentStorage } from './folder-based-storage-component'
 
 /**
  * @public
@@ -11,7 +10,7 @@ import { FolderBasedContentStorage } from './folder-based-storage-component'
 export async function createAwsS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, 'fs' | 'config'>,
   bucket: string
-): Promise<FolderBasedContentStorage> {
+): Promise<IContentStorageComponent> {
   const { config } = components
 
   const s3 = new S3({
@@ -30,7 +29,7 @@ export async function createS3BasedFileSystemContentStorage(
   components: Partial<AppComponents>,
   s3: Pick<S3, 'headObject' | 'upload' | 'getObject' | 'deleteObjects' | 'listObjectsV2'>,
   options: { Bucket: string; getKey?: (hash: string) => string }
-): Promise<FolderBasedContentStorage> {
+): Promise<IContentStorageComponent> {
   const getKey = options.getKey || ((hash: string) => hash)
   const Bucket = options.Bucket
 
