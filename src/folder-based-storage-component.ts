@@ -2,10 +2,9 @@ import { createHash } from 'crypto'
 import path from 'path'
 import { pipeline, Readable } from 'stream'
 import { promisify } from 'util'
-import { AppComponents } from './types'
+import { AppComponents, ContentItem, IContentStorageComponent } from './types'
 import { SimpleContentItem } from './content-item'
 import { compressContentFile } from './extras/compression'
-import { ContentItem, IContentStorageComponent } from './types'
 
 const pipe = promisify(pipeline)
 
@@ -111,6 +110,14 @@ export async function createFolderBasedFileSystemContentStorage(
       const entries = await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]))
       return new Map(entries)
     },
-    allFileIds: () => allFileIdsRec(root)
+    allFileIds: () => allFileIdsRec(root),
+
+    findKeys: async function* findKeys(prefix?: string): AsyncIterable<string> {
+      for await (const key of allFileIdsRec(root)) {
+        if (!prefix || key.startsWith(prefix)) {
+          yield key
+        }
+      }
+    }
   }
 }

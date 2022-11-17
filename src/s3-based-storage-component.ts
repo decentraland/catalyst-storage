@@ -2,6 +2,7 @@ import { S3 } from 'aws-sdk'
 import { Readable } from 'stream'
 import { AppComponents, ContentItem, IContentStorageComponent } from './types'
 import { SimpleContentItem } from './content-item'
+import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
 
 /**
  * @public
@@ -26,7 +27,7 @@ export async function createAwsS3BasedFileSystemContentStorage(
  */
 export async function createS3BasedFileSystemContentStorage(
   components: Partial<AppComponents>,
-  s3: Pick<S3, 'headObject' | 'upload' | 'getObject' | 'deleteObjects'>,
+  s3: Pick<S3, 'headObject' | 'upload' | 'getObject' | 'deleteObjects' | 'listObjectsV2'>,
   options: { Bucket: string; getKey?: (hash: string) => string }
 ): Promise<IContentStorageComponent> {
   const getKey = options.getKey || ((hash: string) => hash)
@@ -93,6 +94,28 @@ export async function createS3BasedFileSystemContentStorage(
     async existMultiple(cids: string[]): Promise<Map<string, boolean>> {
       const entries = await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]))
       return new Map(entries)
+    },
+
+    findKeys: async function* findKeys(prefix?: string): AsyncIterable<string> {
+      const params: S3.Types.ListObjectsV2Request = {
+        Bucket,
+        ContinuationToken: undefined
+      }
+
+      if (prefix) {
+        params.Prefix = prefix
+      }
+
+      let fetched: ListObjectsV2Output
+      do {
+        fetched = await s3.listObjectsV2(params).promise()
+        if (fetched.Contents) {
+          for (const content of fetched.Contents) {
+            yield content.Key!
+          }
+        }
+        params.ContinuationToken = fetched.NextContinuationToken
+      } while (fetched.IsTruncated)
     }
   }
 }
