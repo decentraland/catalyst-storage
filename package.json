@@ -6,7 +6,9 @@
   "typings": "dist/index.d.ts",
   "scripts": {
     "lint:check": "eslint '**/*.{js,ts}'",
-    "lint:fix": "eslint '**/*.{js,ts}' --fix"
+    "lint:fix": "eslint '**/*.{js,ts}' --fix",
+    "build": "tsc -p tsconfig.json",
+    "build:watch": "tsc -p tsconfig.json --watch"
   },
   "repository": {
     "type": "git",
