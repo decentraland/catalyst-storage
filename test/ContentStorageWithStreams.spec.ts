@@ -29,7 +29,7 @@ describe('ContentStorage', () => {
     await storage.storeStream(id, bufferToStream(content))
 
     const exists = await storage.existMultiple([id])
-    console.dir(exists)
+
     expect(exists.get(id)).toBe(true)
     expect(await storage.exist(id)).toBe(true)
   })

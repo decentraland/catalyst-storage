@@ -12,7 +12,7 @@ describe('S3 Storage', () => {
   let id2: string
   let content2: Buffer
 
-  it('starts the env', async () => {
+  beforeEach(async () => {
     const root = fsu.createTempDirectory()
     AWSMock.config.basePath = path.join(root, 'buckets') // Can configure a basePath for your local buckets
     const s3 = AWSMock.S3({
@@ -118,8 +118,34 @@ describe('S3 Storage', () => {
     expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(content)
   })
 
+  it(`When attempting to retrieve content by nonexistent key, then it is returns undefined`, async () => {
+    await storage.storeStreamAndCompress(id, bufferToStream(content))
+    const retrievedContent = await storage.retrieve('saraza')
+    expect(retrievedContent?.encoding).toBeUndefined()
+  })
+
   async function retrieveAndExpectStoredContentToBe(idToRetrieve: string, expectedContent: Buffer) {
     const retrievedContent = await storage.retrieve(idToRetrieve)
     expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(expectedContent)
   }
+
+  it(`When content exists, then it is possible to iterate over all keys in storage`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await storage.storeStream(id2, bufferToStream(content2))
+
+    async function check(prefix: string, expected: string[]) {
+      const filtered = []
+      for await (const key of await storage.findKeys(prefix)) {
+        filtered.push(key)
+      }
+      for (const filteredKey of expected) {
+        expect(filtered).toContain(filteredKey)
+      }
+      return filtered
+    }
+
+    await check('an', ['another-id'])
+    await check('so', ['some-id'])
+    await check(undefined, ['another-id', 'some-id'])
+  })
 })

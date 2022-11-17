@@ -33,7 +33,11 @@ export class MockedStorage implements IContentStorageComponent {
     return new Map(fileIds.map((fileId) => [fileId, this.storage.has(fileId)]))
   }
 
-  allFileIds(): AsyncIterable<string> {
-    throw new Error('Method not implemented.')
+  async *findKeys(prefix?: string): AsyncIterable<string> {
+    for (const key in this.storage.keys()) {
+      if (!prefix || key.startsWith(prefix)) {
+        yield key
+      }
+    }
   }
 }

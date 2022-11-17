@@ -106,4 +106,24 @@ describe('fileSystemContentStorage', () => {
       expect(buffer.length).toBe(compressedItemSize)
     }
   })
+
+  it(`When content exists, then it is possible to iterate over all keys in storage`, async () => {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+    await fileSystemContentStorage.storeStream(id2, bufferToStream(content2))
+
+    async function check(prefix: string, expected: string[]) {
+      const filtered = []
+      for await (const key of await fileSystemContentStorage.findKeys(prefix)) {
+        filtered.push(key)
+      }
+      for (const filteredKey of expected) {
+        expect(filtered).toContain(filteredKey)
+      }
+      return filtered
+    }
+
+    await check('an', ['another-id'])
+    await check('so', ['some-id'])
+    await check(undefined, ['another-id', 'some-id'])
+  })
 })
