@@ -1,7 +1,7 @@
 import { createReadStream, readFileSync } from 'fs'
 import { IContentStorageComponent } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
-import { MockedStorage } from "../src/MockedStorage";
+import { MockedStorage } from '../src/MockedStorage'
 
 describe('MockedStorage', () => {
   let storage: IContentStorageComponent
