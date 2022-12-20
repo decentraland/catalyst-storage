@@ -74,7 +74,7 @@ export async function createFolderBasedFileSystemContentStorage(
     const dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
     for await (const entry of dirEntries) {
       if (entry.isDirectory()) {
-        yield* allFileIdsRec(path.resolve(folder, entry.name))
+        yield* allFileIdsRec(path.resolve(folder, entry.name), prefix)
       } else if (!prefix || entry.name.startsWith(prefix)) {
         yield entry.name.replace(/\.gzip/, '')
       }

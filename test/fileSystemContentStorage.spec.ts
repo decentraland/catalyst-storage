@@ -116,6 +116,7 @@ describe('fileSystemContentStorage', () => {
       for await (const key of await fileSystemContentStorage.allFileIds(prefix)) {
         filtered.push(key)
       }
+      expect(filtered.length).toBe(expected.length)
       for (const filteredKey of expected) {
         expect(filtered).toContain(filteredKey)
       }
