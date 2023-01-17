@@ -44,6 +44,9 @@ export function createS3BasedFileSystemContentStorage(components: Partial<AppCom
 }): Promise<IContentStorageComponent>;
 
 // @public (undocumented)
+export function createStorageMock(): IContentStorageComponent;
+
+// @public (undocumented)
 export type IContentStorageComponent = {
     storeStream(fileId: string, content: Readable): Promise<void>;
     storeStreamAndCompress(fileId: string, content: Readable): Promise<void>;
