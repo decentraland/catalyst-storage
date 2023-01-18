@@ -37,14 +37,14 @@ export function createFolderBasedFileSystemContentStorage(components: Pick<AppCo
 // @public (undocumented)
 export function createFsComponent(): IFileSystemComponent;
 
+// @public (undocumented)
+export function createInMemoryStorage(): IContentStorageComponent;
+
 // @beta (undocumented)
 export function createS3BasedFileSystemContentStorage(components: Partial<AppComponents>, s3: Pick<S3, 'headObject' | 'upload' | 'getObject' | 'deleteObjects' | 'listObjectsV2'>, options: {
     Bucket: string;
     getKey?: (hash: string) => string;
 }): Promise<IContentStorageComponent>;
-
-// @public (undocumented)
-export function createStorageMock(): IContentStorageComponent;
 
 // @public (undocumented)
 export type IContentStorageComponent = {

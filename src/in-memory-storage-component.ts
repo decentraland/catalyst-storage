@@ -5,7 +5,7 @@ import { SimpleContentItem, streamToBuffer } from './content-item'
 /**
  * @public
  */
-export function createStorageMock(): IContentStorageComponent {
+export function createInMemoryStorage(): IContentStorageComponent {
   const storage: Map<string, Uint8Array> = new Map()
 
   return {

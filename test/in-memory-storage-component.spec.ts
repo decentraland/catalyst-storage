@@ -1,7 +1,7 @@
 import { createReadStream, readFileSync } from 'fs'
 import { IContentStorageComponent } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
-import { createStorageMock } from '../src/mock-storage-component'
+import { createInMemoryStorage } from '../src/in-memory-storage-component'
 
 describe('storage mock', () => {
   let storage: IContentStorageComponent
@@ -11,7 +11,7 @@ describe('storage mock', () => {
   let content2: Buffer
 
   beforeEach(async () => {
-    storage = createStorageMock()
+    storage = createInMemoryStorage()
 
     id = 'some-id'
     content = Buffer.from('123')
