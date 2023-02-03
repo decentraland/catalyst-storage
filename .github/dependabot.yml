@@ -7,12 +7,11 @@ updates:
     day: monday
     time: "09:00"
     timezone: "America/Buenos_Aires"
-  versioning-strategy: auto
-  commit-message:
-    prefix: "chore: "
   allow:
     - dependency-name: "@dcl/*"
     - dependency-name: "@catalyst/*"
     - dependency-name: "@well-known-components/*"
     - dependency-name: "dcl-*"
-  open-pull-requests-limit: 10
+  versioning-strategy: auto
+  commit-message:
+    prefix: "chore: "
