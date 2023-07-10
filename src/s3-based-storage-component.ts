@@ -44,8 +44,8 @@ export async function createS3BasedFileSystemContentStorage(
   async function exist(id: string): Promise<boolean> {
     try {
       const command = new HeadObjectCommand({ Bucket, Key: getKey(id) })
-      const obj = await s3.send(command)
-      return !!obj.ETag
+      const output = await s3.send(command)
+      return !!output.ETag
     } catch {
       return false
     }
@@ -68,18 +68,17 @@ export async function createS3BasedFileSystemContentStorage(
   async function retrieve(id: string): Promise<ContentItem | undefined> {
     try {
       const command = new GetObjectCommand({ Bucket, Key: getKey(id) })
-      const getObjectCommandOutput = await s3.send(command)
+      const output = await s3.send(command)
 
-      // const getObjectCommandOutput = await s3.getObject({ Bucket, Key: getKey(id) })
-      const body = getObjectCommandOutput?.Body
+      const body = output?.Body
       if (!body) {
         return undefined
       }
 
       return new SimpleContentItem(
         () => Readable.fromWeb(body.transformToWebStream() as any) as any,
-        getObjectCommandOutput.ContentLength || null,
-        getObjectCommandOutput.ContentEncoding || null
+        output.ContentLength || null,
+        output.ContentEncoding || null
       )
     } catch (error) {
       console.error(error)
@@ -103,8 +102,7 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   async function existMultiple(cids: string[]): Promise<Map<string, boolean>> {
-    const entries = await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]))
-    return new Map(entries)
+    return new Map(await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)])))
   }
 
   async function* allFileIds(prefix?: string): AsyncIterable<string> {
@@ -117,17 +115,17 @@ export async function createS3BasedFileSystemContentStorage(
       params.Prefix = prefix
     }
 
-    let fetched: ListObjectsV2CommandOutput
+    let output: ListObjectsV2CommandOutput
     do {
       const command = new ListObjectsV2Command(params)
-      fetched = await s3.send(command)
-      if (fetched.Contents) {
-        for (const content of fetched.Contents) {
+      output = await s3.send(command)
+      if (output.Contents) {
+        for (const content of output.Contents) {
           yield content.Key!
         }
       }
-      params.ContinuationToken = fetched.NextContinuationToken
-    } while (fetched.IsTruncated)
+      params.ContinuationToken = output.NextContinuationToken
+    } while (output.IsTruncated)
   }
 
   return {
