@@ -1,7 +1,7 @@
 import path from 'path'
 import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
-import { FileSystemUtils as fsu } from './FileSystemUtils'
+import { FileSystemUtils as fsu } from './file-system-utils'
 
 describe('ContentStorageWithStreams', () => {
   let storage: IContentStorageComponent
