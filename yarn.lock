@@ -2027,6 +2027,13 @@
     "@typescript-eslint/types" "5.61.0"
     eslint-visitor-keys "^3.3.0"
 
+"@well-known-components/env-config-provider@^1.2.0":
+  version "1.2.0"
+  resolved "https://registry.yarnpkg.com/@well-known-components/env-config-provider/-/env-config-provider-1.2.0.tgz#bd170c0af24cd8a34ebff23245fe53466db7f8be"
+  integrity sha512-QYDL9Uk1zEs5Q4ymgeZo1GVzuHe9Pp/jOLPRIbhwtPOCQ2Bd9yIlUWiFoC36JpcUSIlQ7Fzh8x21v2U95q5/+Q==
+  dependencies:
+    dotenv "^16.0.1"
+
 "@well-known-components/interfaces@^1.1.1":
   version "1.4.2"
   resolved "https://registry.yarnpkg.com/@well-known-components/interfaces/-/interfaces-1.4.2.tgz#e37eb296280abfcab14f0608b3bdfc84d5a21929"
@@ -2035,6 +2042,11 @@
     "@types/node" "^20.3.1"
     "@types/node-fetch" "^2.5.12"
     typed-url-params "^1.0.1"
+
+"@well-known-components/logger@^3.1.2":
+  version "3.1.2"
+  resolved "https://registry.yarnpkg.com/@well-known-components/logger/-/logger-3.1.2.tgz#0644e7a25515235b7ffee4d6c1f0a34fd94b910e"
+  integrity sha512-nT2ULsvtxcaehnUPcmRfVWIspVq6iYTPTzs5D9lBxqE3Pt+j5StzPfo814IqSo4xhN9cJhJAQ/EggMmKuYMaZg==
 
 "@well-known-components/test-helpers@^1.5.2":
   version "1.5.3"
@@ -2519,6 +2531,11 @@ doctrine@^3.0.0:
   integrity sha512-yS+Q5i3hBf7GBkd4KG8a7eBNNWNGLTaEwwYWUijIYM7zrlYDM0BFXHjjPWlWZ1Rg7UaddZeIDmi9jF3HmqiQ2w==
   dependencies:
     esutils "^2.0.2"
+
+dotenv@^16.0.1:
+  version "16.3.1"
+  resolved "https://registry.yarnpkg.com/dotenv/-/dotenv-16.3.1.tgz#369034de7d7e5b120972693352a3bf112172cc3e"
+  integrity sha512-IPzF4w4/Rd94bA9imS68tZBaYyBWSCE47V1RGuMrB94iyTOIEwRmVL2x/4An+6mETpLrKJ5hQkB8W4kFAadeIQ==
 
 electron-to-chromium@^1.4.431:
   version "1.4.450"

@@ -2,6 +2,7 @@ import path from 'path'
 import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 import { FileSystemUtils as fsu } from './file-system-utils'
+import { createLogComponent } from '@well-known-components/logger'
 
 describe('ContentStorage', () => {
   let storage: IContentStorageComponent
@@ -11,7 +12,10 @@ describe('ContentStorage', () => {
   beforeAll(async () => {
     const root = fsu.createTempDirectory()
     const contentFolder = path.join(root, 'contents')
-    storage = await createFolderBasedFileSystemContentStorage({ fs: createFsComponent() }, contentFolder)
+    storage = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      contentFolder
+    )
 
     id = 'some-id'
     content = Buffer.from('123')

@@ -1,4 +1,8 @@
-import { createS3BasedFileSystemContentStorage, IContentStorageComponent } from '../src'
+import {
+  createAwsS3BasedFileSystemContentStorage,
+  createS3BasedFileSystemContentStorage,
+  IContentStorageComponent
+} from '../src'
 import { AwsClientStub, mockClient } from 'aws-sdk-client-mock'
 import {
   CompleteMultipartUploadCommand,
@@ -13,6 +17,22 @@ import { Readable } from 'stream'
 import 'aws-sdk-client-mock-jest'
 import { sdkStreamMixin } from '@aws-sdk/util-stream-node'
 import { streamToBuffer } from '../src/content-item'
+import { createLogComponent } from '@well-known-components/logger'
+import { createConfigComponent } from '@well-known-components/env-config-provider'
+
+describe('S3 Storage using ', () => {
+  it('creates storage with right config', async () => {
+    await expect(
+      createAwsS3BasedFileSystemContentStorage(
+        {
+          config: createConfigComponent({ AWS_REGION: 'eu-west-1' }),
+          logs: await createLogComponent({})
+        },
+        'some-bucket'
+      )
+    ).resolves.toBeDefined()
+  })
+})
 
 describe('S3 Storage', () => {
   let storage: IContentStorageComponent
@@ -22,7 +42,11 @@ describe('S3 Storage', () => {
 
   beforeEach(async () => {
     s3 = mockClient(S3Client)
-    storage = await createS3BasedFileSystemContentStorage({}, s3 as unknown as S3Client, { Bucket: 'example' })
+    storage = await createS3BasedFileSystemContentStorage(
+      { logs: await createLogComponent({}) },
+      s3 as unknown as S3Client,
+      { Bucket: 'example' }
+    )
   })
 
   it('exists works', async () => {

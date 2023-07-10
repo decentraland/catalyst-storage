@@ -16,10 +16,10 @@ import { SimpleContentItem } from './content-item'
  * @public
  */
 export async function createAwsS3BasedFileSystemContentStorage(
-  components: Pick<AppComponents, 'fs' | 'config'>,
+  components: Pick<AppComponents, 'config' | 'logs'>,
   bucket: string
 ): Promise<IContentStorageComponent> {
-  const { config } = components
+  const { config, logs } = components
 
   const s3 = new S3Client({
     region: await config.requireString('AWS_REGION')
@@ -27,17 +27,18 @@ export async function createAwsS3BasedFileSystemContentStorage(
 
   const getKey = (hash: string) => hash
 
-  return createS3BasedFileSystemContentStorage({}, s3, { Bucket: bucket, getKey })
+  return createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: bucket, getKey })
 }
 
 /**
  * @public
  */
 export async function createS3BasedFileSystemContentStorage(
-  components: Partial<AppComponents>,
+  components: Pick<AppComponents, 'logs'>,
   s3: S3Client,
   options: { Bucket: string; getKey?: (hash: string) => string }
 ): Promise<IContentStorageComponent> {
+  const logger = components.logs.getLogger('s3-based-content-storage')
   const getKey = options.getKey || ((hash: string) => hash)
   const Bucket = options.Bucket
 
@@ -80,8 +81,8 @@ export async function createS3BasedFileSystemContentStorage(
         output.ContentLength || null,
         output.ContentEncoding || null
       )
-    } catch (error) {
-      console.error(error)
+    } catch (error: any) {
+      logger.error(error)
     }
     return undefined
   }

@@ -1,12 +1,13 @@
 import { Readable } from 'stream'
 import { IFileSystemComponent } from './fs/types'
-import { IConfigComponent } from '@well-known-components/interfaces'
+import { IConfigComponent, ILoggerComponent } from '@well-known-components/interfaces'
 /**
  * @public
  */
 export type AppComponents = {
   fs: IFileSystemComponent
   config: IConfigComponent
+  logs: ILoggerComponent
 }
 
 /**
