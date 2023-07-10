@@ -37,6 +37,7 @@ describe('ContentStorage', () => {
   it(`When content is stored on already existing id, then it overwrites the previous content`, async function () {
     const newContent = Buffer.from('456')
 
+    await storage.storeStream(id, bufferToStream(content))
     await storage.storeStream(id, bufferToStream(newContent))
 
     const retrievedContent = await storage.retrieve(id)
