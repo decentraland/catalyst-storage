@@ -125,6 +125,6 @@ describe('fileSystemContentStorage', () => {
 
     await check('an', ['another-id'])
     await check('so', ['some-id'])
-    await check(undefined, ['another-id', 'some-id'])
+    await check(undefined as any, ['another-id', 'some-id'])
   })
 })
