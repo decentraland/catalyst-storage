@@ -6,6 +6,7 @@ import {
   ListObjectsV2Command,
   ListObjectsV2CommandOutput,
   ListObjectsV2Request,
+  NoSuchKey,
   S3Client
 } from '@aws-sdk/client-s3'
 import { Readable } from 'stream'
@@ -82,7 +83,9 @@ export async function createS3BasedFileSystemContentStorage(
         output.ContentEncoding || null
       )
     } catch (error: any) {
-      logger.error(error)
+      if (!(error instanceof NoSuchKey)) {
+        logger.error(error)
+      }
     }
     return undefined
   }
