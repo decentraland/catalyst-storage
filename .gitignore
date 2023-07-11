@@ -1,6 +1,7 @@
-dist
-node_modules
-temp
+dist/
+node_modules/
+temp/
 tsdoc-metadata.json
-coverage
+coverage/
 buckets
+**/.DS_Store

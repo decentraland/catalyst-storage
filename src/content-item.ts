@@ -22,7 +22,7 @@ export class SimpleContentItem implements ContentItem {
   async asStream(): Promise<Readable> {
     const stream = await this.streamCreator()
 
-    if (this.encoding == 'gzip') {
+    if (this.encoding === 'gzip') {
       return stream.pipe(createGunzip())
     }
 
