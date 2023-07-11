@@ -12,9 +12,11 @@ const pipe = promisify(pipeline)
  * @public
  */
 export async function createFolderBasedFileSystemContentStorage(
-  components: Pick<AppComponents, 'fs'>,
+  components: Pick<AppComponents, 'fs' | 'logs'>,
   root: string
 ): Promise<IContentStorageComponent> {
+  const logger = components.logs.getLogger('folder-based-content-storage')
+
   // remove path separators / \ from the end of the folder
   while (root.endsWith(path.sep)) {
     root = root.slice(0, -1)
@@ -60,8 +62,8 @@ export async function createFolderBasedFileSystemContentStorage(
   const retrieve = async (id: string): Promise<ContentItem | undefined> => {
     try {
       return (await retrieveWithEncoding(id, 'gzip')) || (await retrieveWithEncoding(id, null))
-    } catch (error) {
-      console.error(error)
+    } catch (error: any) {
+      logger.error(error)
     }
     return undefined
   }

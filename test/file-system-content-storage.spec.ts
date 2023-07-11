@@ -3,6 +3,7 @@ import os from 'os'
 import path from 'path'
 import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
+import { createLogComponent } from '@well-known-components/logger'
 
 describe('fileSystemContentStorage', () => {
   const fs = createFsComponent()
@@ -21,13 +22,15 @@ describe('fileSystemContentStorage', () => {
 
   beforeEach(async () => {
     tmpRootDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-'))
-    fileSystemContentStorage = await createFolderBasedFileSystemContentStorage({ fs }, tmpRootDir)
+    fileSystemContentStorage = await createFolderBasedFileSystemContentStorage(
+      { fs, logs: await createLogComponent({}) },
+      tmpRootDir
+    )
     filePath = path.join(tmpRootDir, '9584', id)
     filePath2 = path.join(tmpRootDir, 'ea6c', id2)
   })
 
   afterEach(() => {
-    console.log(`Deleting: ${tmpRootDir}`)
     rmSync(tmpRootDir, { recursive: true, force: false })
   })
 
@@ -125,6 +128,6 @@ describe('fileSystemContentStorage', () => {
 
     await check('an', ['another-id'])
     await check('so', ['some-id'])
-    await check(undefined, ['another-id', 'some-id'])
+    await check(undefined as any, ['another-id', 'some-id'])
   })
 })

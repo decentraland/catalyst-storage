@@ -1,121 +1,144 @@
-import { S3 } from 'aws-sdk'
+import { Upload } from '@aws-sdk/lib-storage'
+import {
+  DeleteObjectsCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  ListObjectsV2CommandOutput,
+  ListObjectsV2Request,
+  NoSuchKey,
+  S3Client
+} from '@aws-sdk/client-s3'
 import { Readable } from 'stream'
 import { AppComponents, ContentItem, IContentStorageComponent } from './types'
 import { SimpleContentItem } from './content-item'
-import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
 
 /**
  * @public
  */
 export async function createAwsS3BasedFileSystemContentStorage(
-  components: Pick<AppComponents, 'fs' | 'config'>,
+  components: Pick<AppComponents, 'config' | 'logs'>,
   bucket: string
 ): Promise<IContentStorageComponent> {
-  const { config } = components
+  const { config, logs } = components
 
-  const s3 = new S3({
+  const s3 = new S3Client({
     region: await config.requireString('AWS_REGION')
   })
 
   const getKey = (hash: string) => hash
 
-  return createS3BasedFileSystemContentStorage({}, s3, { Bucket: bucket, getKey })
+  return createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: bucket, getKey })
 }
 
 /**
- * @beta
+ * @public
  */
 export async function createS3BasedFileSystemContentStorage(
-  components: Partial<AppComponents>,
-  s3: Pick<S3, 'headObject' | 'upload' | 'getObject' | 'deleteObjects' | 'listObjectsV2'>,
+  components: Pick<AppComponents, 'logs'>,
+  s3: S3Client,
   options: { Bucket: string; getKey?: (hash: string) => string }
 ): Promise<IContentStorageComponent> {
+  const logger = components.logs.getLogger('s3-based-content-storage')
   const getKey = options.getKey || ((hash: string) => hash)
   const Bucket = options.Bucket
 
   async function exist(id: string): Promise<boolean> {
     try {
-      const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
-      return !!obj.ETag
+      const command = new HeadObjectCommand({ Bucket, Key: getKey(id) })
+      const output = await s3.send(command)
+      return !!output.ETag
     } catch {
       return false
     }
   }
 
+  async function storeStream(id: string, stream: Readable): Promise<void> {
+    await new Upload({
+      client: s3,
+      params: {
+        Bucket,
+        Key: getKey(id),
+        Body: stream
+      },
+
+      // Forcing chunks of 5Mb to improve upload of large files
+      partSize: 5 * 1024 * 1024
+    }).done()
+  }
+
+  async function retrieve(id: string): Promise<ContentItem | undefined> {
+    try {
+      const command = new GetObjectCommand({ Bucket, Key: getKey(id) })
+      const output = await s3.send(command)
+
+      const body = output?.Body
+      if (!body) {
+        return undefined
+      }
+
+      return new SimpleContentItem(
+        () => Readable.fromWeb(body.transformToWebStream() as any) as any,
+        output.ContentLength || null,
+        output.ContentEncoding || null
+      )
+    } catch (error: any) {
+      if (!(error instanceof NoSuchKey)) {
+        logger.error(error)
+      }
+    }
+    return undefined
+  }
+
+  async function storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
+    // In AWS S3 we don't compress
+    await storeStream(id, stream)
+  }
+
+  async function deleteFn(ids: string[]): Promise<void> {
+    const command = new DeleteObjectsCommand({
+      Bucket,
+      Delete: {
+        Objects: ids.map(($) => ({ Key: getKey($) }))
+      }
+    })
+    await s3.send(command)
+  }
+
+  async function existMultiple(cids: string[]): Promise<Map<string, boolean>> {
+    return new Map(await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)])))
+  }
+
+  async function* allFileIds(prefix?: string): AsyncIterable<string> {
+    const params: ListObjectsV2Request = {
+      Bucket,
+      ContinuationToken: undefined
+    }
+
+    if (prefix) {
+      params.Prefix = prefix
+    }
+
+    let output: ListObjectsV2CommandOutput
+    do {
+      const command = new ListObjectsV2Command(params)
+      output = await s3.send(command)
+      if (output.Contents) {
+        for (const content of output.Contents) {
+          yield content.Key!
+        }
+      }
+      params.ContinuationToken = output.NextContinuationToken
+    } while (output.IsTruncated)
+  }
+
   return {
     exist,
-    async storeStream(id: string, stream: Readable): Promise<void> {
-      await s3
-        .upload(
-          {
-            Bucket,
-            Key: getKey(id),
-            Body: stream
-          },
-          {
-            // Forcing chunks of 5Mb to improve upload of large files
-            partSize: 5 * 1024 * 1024
-          }
-        )
-        .promise()
-    },
-    async retrieve(id: string): Promise<ContentItem | undefined> {
-      try {
-        const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
-
-        return new SimpleContentItem(
-          async () => s3.getObject({ Bucket, Key: getKey(id) }).createReadStream(),
-          obj.ContentLength || null,
-          obj.ContentEncoding || null
-        )
-      } catch (error) {
-        console.error(error)
-      }
-      return undefined
-    },
-    async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
-      await s3
-        .upload({
-          Bucket,
-          Key: getKey(id),
-          Body: stream
-        })
-        .promise()
-    },
-    async delete(ids: string[]): Promise<void> {
-      await s3
-        .deleteObjects({
-          Bucket,
-          Delete: { Objects: ids.map(($) => ({ Key: getKey($) })) }
-        })
-        .promise()
-    },
-
-    async existMultiple(cids: string[]): Promise<Map<string, boolean>> {
-      const entries = await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]))
-      return new Map(entries)
-    },
-
-    allFileIds: async function* allFileIds(prefix?: string): AsyncIterable<string> {
-      const params: S3.Types.ListObjectsV2Request = {
-        Bucket,
-        ContinuationToken: undefined
-      }
-
-      if (prefix) {
-        params.Prefix = prefix
-      }
-
-      let fetched: ListObjectsV2Output
-      do {
-        fetched = await s3.listObjectsV2(params).promise()
-        if (fetched.Contents) {
-          for (const content of fetched.Contents) {
-            yield content.Key!
-          }
-        }
-        params.ContinuationToken = fetched.NextContinuationToken
-      } while (fetched.IsTruncated)
-    }
+    storeStream,
+    retrieve,
+    storeStreamAndCompress,
+    delete: deleteFn,
+    existMultiple,
+    allFileIds
   }
 }

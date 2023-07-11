@@ -19,16 +19,11 @@ export type CompressionResult = {
  */
 export async function compressContentFile(contentFilePath: string): Promise<boolean> {
   const result = await gzipCompressFile(contentFilePath, contentFilePath + '.gzip')
-  if (result) {
-    const ratio = ((result.compressedSize * 100) / result.originalSize).toFixed(2)
-    console.info(`Content file compressed. ratio=${ratio}% file=${contentFilePath}`)
-    return true
-  }
-  return false
+  return !!result
 }
 
 async function gzipCompressFile(input: string, output: string): Promise<CompressionResult | null> {
-  if (path.resolve(input) == path.resolve(output)) throw new Error("Can't compress a file using src==dst")
+  if (path.resolve(input) === path.resolve(output)) throw new Error("Can't compress a file using src==dst")
   const gzip = createGzip()
   const source = fs.createReadStream(input)
   const destination = fs.createWriteStream(output)
