@@ -26,7 +26,7 @@ export type IContentStorageComponent = {
 /**
  * @public
  */
-export interface ContentItem {
+export type ContentItem = {
   encoding: string | null
   size: number | null
   /**
