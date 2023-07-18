@@ -10,8 +10,8 @@
     "build:watch": "tsc -p tsconfig.json --watch",
     "lint:check": "eslint '**/*.{js,ts}'",
     "lint:fix": "eslint '**/*.{js,ts}' --fix",
-    "test": "jest --forceExit --detectOpenHandles --verbose",
-    "test:coverage": "jest --forceExit --detectOpenHandles --coverage --verbose"
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest --forceExit --detectOpenHandles --verbose",
+    "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --forceExit --detectOpenHandles --coverage --verbose"
   },
   "repository": {
     "type": "git",
