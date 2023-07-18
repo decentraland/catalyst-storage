@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Storage component for catalysts (WKC)",
   "main": "dist/index.js",
+  "type": "module",
   "typings": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -39,6 +40,7 @@
     "@well-known-components/logger": "^3.1.2",
     "@well-known-components/test-helpers": "^1.5.2",
     "aws-sdk-client-mock-jest": "^3.0.0",
+    "ts-node": "^10.9.1",
     "typescript": "^4.7.3"
   },
   "prettier": {

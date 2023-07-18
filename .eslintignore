@@ -2,4 +2,4 @@ coverage/
 dist/
 node_modules/
 tmpbin
-jest.config.js
+jest.config.ts
