@@ -3,6 +3,7 @@ import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentS
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 import { FileSystemUtils as fsu } from './file-system-utils'
 import { createLogComponent } from '@well-known-components/logger'
+import { beforeAll, describe, expect, it } from 'vitest'
 
 describe('ContentStorage', () => {
   let storage: IContentStorageComponent

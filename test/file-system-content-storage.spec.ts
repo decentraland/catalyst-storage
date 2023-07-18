@@ -4,6 +4,7 @@ import path from 'path'
 import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 import { createLogComponent } from '@well-known-components/logger'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 describe('fileSystemContentStorage', () => {
   const fs = createFsComponent()

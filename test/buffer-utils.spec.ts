@@ -1,5 +1,6 @@
 import { createReadStream, readFileSync } from 'fs'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
+import { describe, expect, it } from 'vitest'
 
 describe('Buffer utils', () => {
   it('unit test small', async () => {
