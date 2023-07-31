@@ -52,11 +52,16 @@ export function bufferToStream(buffer: Uint8Array | Buffer): Readable {
 export function streamToBuffer(stream: Readable): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const buffers: Uint8Array[] = []
-    stream.on('error', reject)
+    stream.on('error', (err) => {
+      const message = `Stream error ($err.name}) ${err.message}`
+      console.log(message)
+      reject(new Error(message))
+    })
     stream.on('data', (data) => {
       if (data instanceof Uint8Array || Buffer.isBuffer(data)) {
         buffers.push(data)
       } else {
+        console.log('Stream did not emit Uint8Array')
         reject(new Error('Stream did not emit Uint8Array'))
         stream.destroy()
       }

@@ -49,7 +49,8 @@ export async function createS3BasedFileSystemContentStorage(
       const command = new HeadObjectCommand({ Bucket, Key: getKey(id) })
       const output = await s3.send(command)
       return !!output.ETag
-    } catch {
+    } catch (error) {
+      console.log('error', error)
       return false
     }
   }
