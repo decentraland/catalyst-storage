@@ -21,6 +21,7 @@ export async function createFolderBasedFileSystemContentStorage(
   while (root.endsWith(path.sep)) {
     root = root.slice(0, -1)
   }
+  logger.info(`Using FS based storage with root folder: ${root}`)
 
   await components.fs.mkdir(root, { recursive: true })
 

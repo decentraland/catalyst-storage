@@ -42,6 +42,7 @@ export async function createS3BasedFileSystemContentStorage(
   const logger = components.logs.getLogger('s3-based-content-storage')
   const getKey = options.getKey || ((hash: string) => hash)
   const Bucket = options.Bucket
+  logger.info(`Using S3 based storage with bucket: ${Bucket}`)
 
   async function exist(id: string): Promise<boolean> {
     try {
