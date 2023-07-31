@@ -66,6 +66,9 @@ export function streamToBuffer(stream: Readable): Promise<Buffer> {
         stream.destroy()
       }
     })
-    stream.on('end', () => resolve(Buffer.concat(buffers)))
+    stream.on('end', () => {
+      // console.log('Stream ended')
+      resolve(Buffer.concat(buffers))
+    })
   })
 }

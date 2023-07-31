@@ -49,8 +49,8 @@ export async function createS3BasedFileSystemContentStorage(
       const command = new HeadObjectCommand({ Bucket, Key: getKey(id) })
       const output = await s3.send(command)
       return !!output.ETag
-    } catch (error) {
-      console.log('error', error)
+    } catch (error: any) {
+      console.log(`error in exists for key ${id}`, error.name)
       return false
     }
   }
@@ -76,6 +76,7 @@ export async function createS3BasedFileSystemContentStorage(
 
       const body = output?.Body
       if (!body) {
+        console.log('body is undefined')
         return undefined
       }
 
