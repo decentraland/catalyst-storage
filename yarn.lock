@@ -92,7 +92,7 @@
     "@aws-sdk/util-utf8-browser" "^3.0.0"
     tslib "^1.11.1"
 
-"@aws-sdk/client-s3@^3.374.0":
+"@aws-sdk/client-s3@^3.379.1":
   version "3.379.1"
   resolved "https://registry.yarnpkg.com/@aws-sdk/client-s3/-/client-s3-3.379.1.tgz#a2a40d60d17df238cfdf11e25bd245ed609afa01"
   integrity sha512-H4ECLySyEkLHRCBv7q5RS5AhesAsDlC7b3wK4YfbTjdqLVhQZIGqy4IJX98VStKZOea43txhndlDlGvKt8p7kA==
@@ -350,7 +350,7 @@
     "@smithy/types" "^2.0.2"
     tslib "^2.5.0"
 
-"@aws-sdk/lib-storage@^3.374.0":
+"@aws-sdk/lib-storage@^3.379.1":
   version "3.379.1"
   resolved "https://registry.yarnpkg.com/@aws-sdk/lib-storage/-/lib-storage-3.379.1.tgz#956689d9efc1e839aadeaad5f8516adfc91460af"
   integrity sha512-o/OFPQL/pZQ1ppjQnBu/3cXfIBz4h0qpwpA2B6osZGfuUzuZJYInEDKixswQligX1Sjxwxd+RL/2TEYNzx1vGw==
