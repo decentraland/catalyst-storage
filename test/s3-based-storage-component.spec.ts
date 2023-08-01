@@ -1,22 +1,12 @@
+import path from 'path'
 import {
   createAwsS3BasedFileSystemContentStorage,
   createS3BasedFileSystemContentStorage,
   IContentStorageComponent
 } from '../src'
-import { AwsClientStub, mockClient } from 'aws-sdk-client-mock'
-import {
-  CompleteMultipartUploadCommand,
-  CreateMultipartUploadCommand,
-  DeleteObjectsCommand,
-  GetObjectCommand,
-  HeadObjectCommand,
-  ListObjectsV2Command,
-  S3Client
-} from '@aws-sdk/client-s3'
-import { Readable } from 'stream'
-import 'aws-sdk-client-mock-jest'
-import { sdkStreamMixin } from '@aws-sdk/util-stream-node'
-import { streamToBuffer } from '../src/content-item'
+import { bufferToStream, streamToBuffer } from '../src'
+import { FileSystemUtils as fsu } from './file-system-utils'
+import AWSMock from 'mock-aws-s3'
 import { createLogComponent } from '@well-known-components/logger'
 import { createConfigComponent } from '@well-known-components/env-config-provider'
 
@@ -36,229 +26,117 @@ describe('S3 Storage using ', () => {
 
 describe('S3 Storage', () => {
   let storage: IContentStorageComponent
-  const id = 'some-id'
-  const id2 = 'another-id'
-  let s3: AwsClientStub<S3Client>
+  let id: string
+  let content: Buffer
+  let id2: string
+  let content2: Buffer
 
   beforeEach(async () => {
-    s3 = mockClient(S3Client)
-    storage = await createS3BasedFileSystemContentStorage(
-      { logs: await createLogComponent({}) },
-      s3 as unknown as S3Client,
-      { Bucket: 'example' }
-    )
+    const root = fsu.createTempDirectory()
+    AWSMock.config.basePath = path.join(root, 'buckets') // Can configure a basePath for your local buckets
+    const s3 = new AWSMock.S3({
+      params: { Bucket: 'example' }
+    })
+    const logs = await createLogComponent({})
+    storage = await createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: 'example' })
+
+    id = 'some-id'
+    content = Buffer.from('123')
+    id2 = 'another-id'
+    content2 = Buffer.from('456')
   })
 
-  it('exists works', async () => {
-    s3.on(HeadObjectCommand, { Bucket: 'example', Key: id }).resolves({})
-    expect(await storage.exist(id)).toBe(false)
+  it(`When content is stored, then it can be retrieved`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
 
-    s3.on(HeadObjectCommand, { Bucket: 'example', Key: id }).resolves({ ETag: 'something' })
+    await retrieveAndExpectStoredContentToBe(id, content)
+  })
+
+  it(`When content is stored, then we can check if it exists`, async function () {
+    await storage.storeStream(id, bufferToStream(content))
+
+    const exists = await storage.existMultiple([id])
+
+    expect(exists.get(id)).toEqual(true)
+    expect(await storage.exist(id)).toBe(true)
+  })
+
+  it(`When content is stored on already existing id, then it overwrites the previous content`, async function () {
+    const newContent = Buffer.from('456')
+
+    await storage.storeStream(id, bufferToStream(content))
+    await storage.storeStream(id, bufferToStream(newContent))
+
+    await retrieveAndExpectStoredContentToBe(id, newContent)
+  })
+
+  it(`When content is deleted, then it is no longer available`, async function () {
+    await storage.storeStream(id, bufferToStream(content))
+
+    let exists = await storage.existMultiple([id])
+    expect(exists.get(id)).toBe(true)
     expect(await storage.exist(id)).toBe(true)
 
-    s3.on(HeadObjectCommand, { Bucket: 'example', Key: id }).rejects({})
+    await storage.delete([id])
+
+    exists = await storage.existMultiple([id])
     expect(await storage.exist(id)).toBe(false)
+    expect(exists.get(id)).toBe(false)
   })
 
-  it('existsMultiple works', async () => {
-    s3.on(HeadObjectCommand, { Bucket: 'example', Key: id }).resolves({})
-    s3.on(HeadObjectCommand, { Bucket: 'example', Key: id2 }).resolves({})
-    expect(await storage.existMultiple([id, id2])).toEqual(
-      new Map([
-        [id, false],
-        [id2, false]
-      ])
-    )
-
-    s3.on(HeadObjectCommand, { Bucket: 'example', Key: id }).resolves({})
-    s3.on(HeadObjectCommand, { Bucket: 'example', Key: id2 }).resolves({ ETag: 'something' })
-    expect(await storage.existMultiple([id, id2])).toEqual(
-      new Map([
-        [id, false],
-        [id2, true]
-      ])
-    )
-
-    s3.on(HeadObjectCommand, { Bucket: 'example', Key: id }).rejects({})
-    s3.on(HeadObjectCommand, { Bucket: 'example', Key: id2 }).resolves({ ETag: 'something' })
-    expect(await storage.existMultiple([id, id2])).toEqual(
-      new Map([
-        [id, false],
-        [id2, true]
-      ])
-    )
+  it(`When multiple content is stored, then multiple content exist`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await storage.storeStream(id2, bufferToStream(content2))
+    expect(Array.from((await storage.existMultiple([id, id2, 'notStored'])).entries())).toEqual([
+      [id, true],
+      [id2, true],
+      ['notStored', false]
+    ])
   })
 
-  it('storeStream works with big files (multipart upload)', async () => {
-    const stream = new Readable()
-    stream.push('x'.repeat(100 * 1024 * 1024)) // 100 MB)
-    stream.push(null) // end of stream
+  it(`When multiple content is stored, then multiple content is correct`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await storage.storeStream(id2, bufferToStream(content2))
 
-    const sdkStream = sdkStreamMixin(stream)
-
-    s3.on(CreateMultipartUploadCommand, { Bucket: 'example', Key: 'some-id' }).resolves({
-      UploadId: '20'
-    })
-    s3.on(CompleteMultipartUploadCommand, {
-      Bucket: 'example',
-      Key: 'some-id',
-      MultipartUpload: { Parts: [] },
-      UploadId: '20'
-    }).resolves({ ETag: '1' })
-
-    await storage.storeStream(id, sdkStream)
-
-    expect(s3).toHaveReceivedCommand(CreateMultipartUploadCommand)
-    expect(s3).toHaveReceivedCommand(CompleteMultipartUploadCommand)
+    await retrieveAndExpectStoredContentToBe(id, content)
+    await retrieveAndExpectStoredContentToBe(id2, content2)
   })
 
-  it.skip('storeStream works with small files (putobject)', async () => {
-    /* This one is skipped for now as the mocking library is misbehaving and not handling
-       correctly the mocking of the client. What is doing wrong is not to create a config object
-       with a proper requestHandler, so the sdk hits a NPE and fails */
-    const stream = new Readable()
-    stream.push('x'.repeat(100 * 1024)) // 100 KB)
-    stream.push(null) // end of stream
-
-    const sdkStream = sdkStreamMixin(stream)
-
-    s3.on(CreateMultipartUploadCommand, { Bucket: 'example', Key: 'some-id' }).resolves({
-      UploadId: '20'
-    })
-    // s3.on(UploadPartCommand).resolves({ ETag: '1' })
-    s3.on(CompleteMultipartUploadCommand, {
-      Bucket: 'example',
-      Key: 'some-id',
-      MultipartUpload: { Parts: [] },
-      UploadId: '20'
-    }).resolves({ ETag: '1' })
-
-    await storage.storeStream(id, sdkStream)
-
-    expect(s3).toHaveReceivedCommand(CreateMultipartUploadCommand)
-    // expect(s3).toHaveReceivedCommand(UploadPartCommand)
-    expect(s3).toHaveReceivedCommand(CompleteMultipartUploadCommand)
+  it(`When a content with bad compression ratio is stored and compressed, then it is not stored compressed`, async () => {
+    await storage.storeStreamAndCompress(id, bufferToStream(content))
+    const retrievedContent = await storage.retrieve(id)
+    expect(retrievedContent?.encoding).toBeNull()
+    expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(content)
   })
 
-  it('retrieve works', async () => {
-    const stream = new Readable()
-    stream.push('hello world')
-    stream.push(null) // end of stream
-
-    const sdkStream = sdkStreamMixin(stream)
-
-    s3.on(GetObjectCommand, { Bucket: 'example', Key: 'some-id' }).resolves({
-      Body: sdkStream,
-      ContentLength: sdkStream.readableLength
-    })
-
-    const retrieved = await storage.retrieve(id)
-
-    expect(retrieved).toBeDefined()
-    expect(retrieved?.size).toBe(11)
-    const str = (await streamToBuffer(await retrieved!.asStream())).toString()
-    expect(str).toBe('hello world')
-    expect(s3).toHaveReceivedCommand(GetObjectCommand)
+  it(`When attempting to retrieve content by nonexistent key, then it is returns undefined`, async () => {
+    await storage.storeStreamAndCompress(id, bufferToStream(content))
+    const retrievedContent = await storage.retrieve('saraza')
+    expect(retrievedContent?.encoding).toBeUndefined()
   })
 
-  it('retrieve works with missing key', async () => {
-    const stream = new Readable()
-    stream.push('hello world')
-    stream.push(null) // end of stream
+  async function retrieveAndExpectStoredContentToBe(idToRetrieve: string, expectedContent: Buffer) {
+    const retrievedContent = await storage.retrieve(idToRetrieve)
+    expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(expectedContent)
+  }
 
-    const sdkStream = sdkStreamMixin(stream)
+  it(`When content exists, then it is possible to iterate over all keys in storage`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await storage.storeStream(id2, bufferToStream(content2))
 
-    s3.on(GetObjectCommand, { Bucket: 'example', Key: 'some-id' }).resolves({
-      Body: sdkStream,
-      ContentLength: sdkStream.readableLength
-    })
-
-    const retrieved = await storage.retrieve('other-id')
-
-    expect(retrieved).toBeUndefined()
-    expect(s3).toHaveReceivedCommand(GetObjectCommand)
-  })
-
-  it('retrieve works when S3 network error', async () => {
-    s3.on(GetObjectCommand, { Bucket: 'example', Key: id }).rejects('error')
-
-    const retrieved = await storage.retrieve(id)
-
-    expect(retrieved).toBeUndefined()
-    expect(s3).toHaveReceivedCommand(GetObjectCommand)
-  })
-
-  it('storeStreamAndCompress works with big files (multipart upload)', async () => {
-    const stream = new Readable()
-    stream.push('x'.repeat(100 * 1024 * 1024)) // 100 MB)
-    stream.push(null) // end of stream
-
-    const sdkStream = sdkStreamMixin(stream)
-
-    s3.on(CreateMultipartUploadCommand, { Bucket: 'example', Key: 'some-id' }).resolves({
-      UploadId: '20'
-    })
-    s3.on(CompleteMultipartUploadCommand, {
-      Bucket: 'example',
-      Key: 'some-id',
-      MultipartUpload: { Parts: [] },
-      UploadId: '20'
-    }).resolves({ ETag: '1' })
-
-    await storage.storeStreamAndCompress(id, sdkStream)
-
-    expect(s3).toHaveReceivedCommand(CreateMultipartUploadCommand)
-    expect(s3).toHaveReceivedCommand(CompleteMultipartUploadCommand)
-  })
-
-  it('delete works', async () => {
-    s3.on(DeleteObjectsCommand, { Bucket: 'example', Delete: { Objects: [{ Key: id }, { Key: id2 }] } }).resolves({})
-
-    await storage.delete([id, id2])
-
-    expect(s3).toHaveReceivedCommandWith(DeleteObjectsCommand, {
-      Bucket: 'example',
-      Delete: { Objects: [{ Key: id }, { Key: id2 }] }
-    })
-  })
-
-  it('allFileIds works', async () => {
-    s3.on(ListObjectsV2Command, { Bucket: 'example', ContinuationToken: undefined }).resolvesOnce({
-      Contents: [{ Key: 'id1' }, { Key: 'id2' }],
-      NextContinuationToken: 'token',
-      IsTruncated: true
-    })
-    s3.on(ListObjectsV2Command, { Bucket: 'example', ContinuationToken: 'token' }).resolvesOnce({
-      Contents: [{ Key: 'id3' }, { Key: 'id4' }],
-      IsTruncated: false
-    })
-
-    const allFileIds = await storage.allFileIds()
-    const result = []
-    for await (const fileId of allFileIds) {
-      result.push(fileId)
+    async function check(prefix: string, expected: string[]) {
+      const filtered = []
+      for await (const key of await storage.allFileIds(prefix)) {
+        filtered.push(key)
+      }
+      for (const filteredKey of expected) {
+        expect(filtered).toContain(filteredKey)
+      }
+      return filtered
     }
-    expect(result).toEqual(['id1', 'id2', 'id3', 'id4'])
-    expect(s3).toHaveReceivedCommandTimes(ListObjectsV2Command, 2)
-  })
 
-  it('allFileIds works with prefix', async () => {
-    s3.on(ListObjectsV2Command, { Bucket: 'example', ContinuationToken: undefined, Prefix: 'id' }).resolvesOnce({
-      Contents: [{ Key: 'id1' }, { Key: 'id2' }],
-      NextContinuationToken: 'token',
-      IsTruncated: true
-    })
-    s3.on(ListObjectsV2Command, { Bucket: 'example', ContinuationToken: 'token', Prefix: 'id' }).resolvesOnce({
-      Contents: [{ Key: 'id3' }],
-      IsTruncated: false
-    })
-
-    const allFileIds = await storage.allFileIds('id')
-    const result = []
-    for await (const fileId of allFileIds) {
-      result.push(fileId)
-    }
-    expect(result).toEqual(['id1', 'id2', 'id3'])
-    expect(s3).toHaveReceivedCommandTimes(ListObjectsV2Command, 2)
+    await check('an', ['another-id'])
+    await check('so', ['some-id'])
+    await check(undefined as any, ['another-id', 'some-id'])
   })
 })

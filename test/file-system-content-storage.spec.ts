@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
 import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
-import { bufferToStream, streamToBuffer } from '../src/content-item'
+import { bufferToStream, streamToBuffer } from '../src'
 import { createLogComponent } from '@well-known-components/logger'
 
 describe('fileSystemContentStorage', () => {

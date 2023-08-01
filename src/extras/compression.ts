@@ -23,7 +23,9 @@ export async function compressContentFile(contentFilePath: string): Promise<bool
 }
 
 async function gzipCompressFile(input: string, output: string): Promise<CompressionResult | null> {
-  if (path.resolve(input) === path.resolve(output)) throw new Error("Can't compress a file using src==dst")
+  if (path.resolve(input) === path.resolve(output)) {
+    throw new Error("Can't compress a file using src==dst")
+  }
   const gzip = createGzip()
   const source = fs.createReadStream(input)
   const destination = fs.createWriteStream(output)

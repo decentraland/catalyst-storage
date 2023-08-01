@@ -1,6 +1,6 @@
 import path from 'path'
 import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
-import { bufferToStream, streamToBuffer } from '../src/content-item'
+import { bufferToStream, streamToBuffer } from '../src'
 import { FileSystemUtils as fsu } from './file-system-utils'
 import { createLogComponent } from '@well-known-components/logger'
 

@@ -1,17 +1,8 @@
-import { Upload } from '@aws-sdk/lib-storage'
-import {
-  DeleteObjectsCommand,
-  GetObjectCommand,
-  HeadObjectCommand,
-  ListObjectsV2Command,
-  ListObjectsV2CommandOutput,
-  ListObjectsV2Request,
-  NoSuchKey,
-  S3Client
-} from '@aws-sdk/client-s3'
+import { S3 } from 'aws-sdk'
 import { Readable } from 'stream'
 import { AppComponents, ContentItem, IContentStorageComponent } from './types'
 import { SimpleContentItem } from './content-item'
+import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
 
 /**
  * @public
@@ -22,7 +13,7 @@ export async function createAwsS3BasedFileSystemContentStorage(
 ): Promise<IContentStorageComponent> {
   const { config, logs } = components
 
-  const s3 = new S3Client({
+  const s3 = new S3({
     region: await config.requireString('AWS_REGION')
   })
 
@@ -36,7 +27,7 @@ export async function createAwsS3BasedFileSystemContentStorage(
  */
 export async function createS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, 'logs'>,
-  s3: S3Client,
+  s3: Pick<S3, 'headObject' | 'upload' | 'getObject' | 'deleteObjects' | 'listObjectsV2'>,
   options: { Bucket: string; getKey?: (hash: string) => string }
 ): Promise<IContentStorageComponent> {
   const logger = components.logs.getLogger('s3-based-content-storage')
@@ -45,45 +36,40 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function exist(id: string): Promise<boolean> {
     try {
-      const command = new HeadObjectCommand({ Bucket, Key: getKey(id) })
-      const output = await s3.send(command)
-      return !!output.ETag
+      const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
+      return !!obj.ETag
     } catch {
       return false
     }
   }
 
   async function storeStream(id: string, stream: Readable): Promise<void> {
-    await new Upload({
-      client: s3,
-      params: {
-        Bucket,
-        Key: getKey(id),
-        Body: stream
-      },
-
-      // Forcing chunks of 5Mb to improve upload of large files
-      partSize: 5 * 1024 * 1024
-    }).done()
+    await s3
+      .upload(
+        {
+          Bucket,
+          Key: getKey(id),
+          Body: stream
+        },
+        {
+          // Forcing chunks of 5Mb to improve upload of large files
+          partSize: 5 * 1024 * 1024
+        }
+      )
+      .promise()
   }
 
   async function retrieve(id: string): Promise<ContentItem | undefined> {
     try {
-      const command = new GetObjectCommand({ Bucket, Key: getKey(id) })
-      const output = await s3.send(command)
-
-      const body = output?.Body
-      if (!body) {
-        return undefined
-      }
+      const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
 
       return new SimpleContentItem(
-        () => Readable.fromWeb(body.transformToWebStream() as any) as any,
-        output.ContentLength || null,
-        output.ContentEncoding || null
+        async () => s3.getObject({ Bucket, Key: getKey(id) }).createReadStream(),
+        obj.ContentLength || null,
+        obj.ContentEncoding || null
       )
     } catch (error: any) {
-      if (!(error instanceof NoSuchKey)) {
+      if (error.code !== 'NotFound') {
         logger.error(error)
       }
     }
@@ -96,13 +82,14 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   async function deleteFn(ids: string[]): Promise<void> {
-    const command = new DeleteObjectsCommand({
-      Bucket,
-      Delete: {
-        Objects: ids.map(($) => ({ Key: getKey($) }))
-      }
-    })
-    await s3.send(command)
+    await s3
+      .deleteObjects({
+        Bucket,
+        Delete: {
+          Objects: ids.map(($) => ({ Key: getKey($) }))
+        }
+      })
+      .promise()
   }
 
   async function existMultiple(cids: string[]): Promise<Map<string, boolean>> {
@@ -110,7 +97,7 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   async function* allFileIds(prefix?: string): AsyncIterable<string> {
-    const params: ListObjectsV2Request = {
+    const params: S3.Types.ListObjectsV2Request = {
       Bucket,
       ContinuationToken: undefined
     }
@@ -119,10 +106,9 @@ export async function createS3BasedFileSystemContentStorage(
       params.Prefix = prefix
     }
 
-    let output: ListObjectsV2CommandOutput
+    let output: ListObjectsV2Output
     do {
-      const command = new ListObjectsV2Command(params)
-      output = await s3.send(command)
+      output = await s3.listObjectsV2(params).promise()
       if (output.Contents) {
         for (const content of output.Contents) {
           yield content.Key!
