@@ -53,7 +53,7 @@ export function streamToBuffer(stream: Readable): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const buffers: Uint8Array[] = []
     stream.on('error', (err) => {
-      const message = `Stream error ($err.name}) ${err.message}`
+      const message = `Stream error (${err.name}) ${err.message}`
       console.log(message)
       reject(new Error(message))
     })
