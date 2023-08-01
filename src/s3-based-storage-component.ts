@@ -81,7 +81,7 @@ export async function createS3BasedFileSystemContentStorage(
       }
 
       return new SimpleContentItem(
-        () => Readable.fromWeb(body.transformToWebStream() as any) as any,
+        async () => body as Readable,
         output.ContentLength || null,
         output.ContentEncoding || null
       )
