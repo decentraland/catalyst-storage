@@ -875,6 +875,14 @@
   resolved "https://registry.npmjs.org/@types/json-schema/-/json-schema-7.0.12.tgz"
   integrity sha512-Hr5Jfhc9eYOQNPYO5WLDq/n4jqijdHNlDXjuAQkkt+mWdQR+XJToOHrsD4cPaMXpn6KO7y2+wM8AZEs8VpBLVA==
 
+"@types/mock-aws-s3@^2.6.3":
+  version "2.6.3"
+  resolved "https://registry.yarnpkg.com/@types/mock-aws-s3/-/mock-aws-s3-2.6.3.tgz#e352a96858c6f96195181a063c469f5adcd99eb8"
+  integrity sha512-ORhPszoDJrJ3ZxskEo0jHx/gsRJpHxu0gZ7RdsVH7VJj8hzZ0Mhp6FEC6cnof8BxC7KjvdYU+XiL4Hdu/WqwTw==
+  dependencies:
+    "@types/node" "*"
+    aws-sdk ">=2.814.0"
+
 "@types/node-fetch@^2.5.12":
   version "2.6.1"
   resolved "https://registry.npmjs.org/@types/node-fetch/-/node-fetch-2.6.1.tgz"
@@ -1143,7 +1151,7 @@ aws-sdk-client-mock@^3.0.0:
     sinon "^14.0.2"
     tslib "^2.1.0"
 
-aws-sdk@^2.1426.0:
+aws-sdk@>=2.814.0, aws-sdk@^2.1426.0:
   version "2.1426.0"
   resolved "https://registry.yarnpkg.com/aws-sdk/-/aws-sdk-2.1426.0.tgz#24c613d68c8ab0a340b486684c010a58e9823cb6"
   integrity sha512-qq4ydcRzQW2IqjMdCz5FklORREEtkSCJ2tm9CUJ2PaUOaljxpdxq9UI64vXiyRD+GIp5vdkmVNoTRi2rCXh3rA==
@@ -3588,10 +3596,10 @@ typed-url-params@^1.0.1:
   resolved "https://registry.npmjs.org/typed-url-params/-/typed-url-params-1.0.1.tgz"
   integrity sha512-762imXO+myoSDHD9+YxUfSmfT0yGH1j+3s9UJ6uqKkOYIwHH6/gsFo67ZoST0Ey/RSoaps1zGu1N+eiuuCxfeg==
 
-typescript@^4.7.3:
-  version "4.7.4"
-  resolved "https://registry.npmjs.org/typescript/-/typescript-4.7.4.tgz"
-  integrity sha512-C0WQT0gezHuw6AdY1M2jxUO83Rjf0HP7Sk1DtXj6j1EwkQNZrHAg2XPWlq62oqEhYvONq5pkC2Y9oPljWToLmQ==
+typescript@^4.9.5:
+  version "4.9.5"
+  resolved "https://registry.yarnpkg.com/typescript/-/typescript-4.9.5.tgz#095979f9bcc0d09da324d58d03ce8f8374cbe65a"
+  integrity sha512-1FXk9E2Hm+QzZQ7z+McJiHL4NW1F2EzMu9Nq9i3zAaGqibafqYwCVU6WyWAuyQRRzOlxou8xZSyXLEN8oKj24g==
 
 underscore@1.12.1:
   version "1.12.1"
