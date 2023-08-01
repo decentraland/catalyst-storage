@@ -24,8 +24,7 @@
   },
   "homepage": "https://github.com/decentraland/catalyst-storage#readme",
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.369.0",
-    "@aws-sdk/lib-storage": "^3.369.0",
+    "aws-sdk": "^2.1426.0",
     "@well-known-components/interfaces": "^1.1.1",
     "aws-sdk-client-mock": "^3.0.0",
     "destroy": "^1.2.0"
@@ -38,7 +37,7 @@
     "@well-known-components/env-config-provider": "^1.2.0",
     "@well-known-components/logger": "^3.1.2",
     "@well-known-components/test-helpers": "^1.5.2",
-    "aws-sdk-client-mock-jest": "^3.0.0",
+    "mock-aws-s3": "^4.0.2",
     "typescript": "^4.7.3"
   },
   "prettier": {
