@@ -1,5 +1,5 @@
 import { createInMemoryStorage, IContentStorageComponent } from '../src'
-import { bufferToStream, streamToBuffer } from '../src/content-item'
+import { bufferToStream, streamToBuffer } from '../src'
 
 describe('storage mock', () => {
   let storage: IContentStorageComponent
