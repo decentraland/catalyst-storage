@@ -69,7 +69,7 @@ export async function createS3BasedFileSystemContentStorage(
         obj.ContentEncoding || null
       )
     } catch (error: any) {
-      if (!(error.name === 'NoSuchKey')) {
+      if (error.code !== 'NotFound') {
         logger.error(error)
       }
     }
