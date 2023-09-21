@@ -1,5 +1,5 @@
 import { Readable } from 'stream'
-import { ContentItem, IContentStorageComponent } from './types'
+import { ContentItem, FileInfo, IContentStorageComponent } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
 
 /**
@@ -7,6 +7,11 @@ import { SimpleContentItem, streamToBuffer } from './content-item'
  */
 export function createInMemoryStorage(): IContentStorageComponent {
   const storage: Map<string, Uint8Array> = new Map()
+
+  async function fileInfo(id: string): Promise<FileInfo | undefined> {
+    const buffer = storage.get(id)
+    return buffer ? { encoding: null, size: buffer!.length } : undefined
+  }
 
   return {
     async storeStreamAndCompress(fileId: string, content: Readable): Promise<void> {
@@ -34,6 +39,14 @@ export function createInMemoryStorage(): IContentStorageComponent {
           yield key
         }
       }
+    },
+    fileInfo,
+    async fileInfoMultiple(fileIds: string[]): Promise<Map<string, FileInfo | undefined>> {
+      return new Map(
+        await Promise.all(
+          fileIds.map(async (cid): Promise<[string, FileInfo | undefined]> => [cid, await fileInfo(cid)])
+        )
+      )
     }
   }
 }

@@ -1,6 +1,6 @@
 import { S3 } from 'aws-sdk'
 import { Readable } from 'stream'
-import { AppComponents, ContentItem, IContentStorageComponent } from './types'
+import { AppComponents, ContentItem, FileInfo, IContentStorageComponent } from './types'
 import { SimpleContentItem } from './content-item'
 import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
 
@@ -118,8 +118,28 @@ export async function createS3BasedFileSystemContentStorage(
     } while (output.IsTruncated)
   }
 
+  async function fileInfo(id: string): Promise<FileInfo | undefined> {
+    try {
+      const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
+      return {
+        encoding: obj.ContentEncoding || null,
+        size: obj.ContentLength || null
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  async function fileInfoMultiple(cids: string[]): Promise<Map<string, FileInfo | undefined>> {
+    return new Map(
+      await Promise.all(cids.map(async (cid): Promise<[string, FileInfo | undefined]> => [cid, await fileInfo(cid)]))
+    )
+  }
+
   return {
     exist,
+    fileInfo,
+    fileInfoMultiple,
     storeStream,
     retrieve,
     storeStreamAndCompress,
