@@ -2,7 +2,7 @@ import { createHash } from 'crypto'
 import path from 'path'
 import { pipeline, Readable } from 'stream'
 import { promisify } from 'util'
-import { AppComponents, ContentItem, IContentStorageComponent } from './types'
+import { AppComponents, ContentItem, FileInfo, IContentStorageComponent } from './types'
 import { SimpleContentItem } from './content-item'
 import { compressContentFile } from './extras/compression'
 
@@ -83,6 +83,25 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  async function fileInfo(id: string): Promise<FileInfo | undefined> {
+    const possibleEncondings = ['gzip', null]
+    const baseFilePath = await getFilePath(id)
+
+    for (const encoding of possibleEncondings) {
+      const extension = encoding ? '.' + encoding : ''
+      const filePath = baseFilePath + extension
+      if (await components.fs.existPath(filePath)) {
+        const stat = await components.fs.stat(filePath)
+        return {
+          size: stat.size,
+          encoding
+        }
+      }
+    }
+
+    return undefined
+  }
+
   return {
     storeStream,
     retrieve,
@@ -107,6 +126,12 @@ export async function createFolderBasedFileSystemContentStorage(
       const entries = await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]))
       return new Map(entries)
     },
-    allFileIds: (prefix?: string) => allFileIdsRec(root, prefix)
+    allFileIds: (prefix?: string) => allFileIdsRec(root, prefix),
+    fileInfo,
+    async fileInfoMultiple(cids: string[]): Promise<Map<string, FileInfo | undefined>> {
+      return new Map(
+        await Promise.all(cids.map(async (cid): Promise<[string, FileInfo | undefined]> => [cid, await fileInfo(cid)]))
+      )
+    }
   }
 }
