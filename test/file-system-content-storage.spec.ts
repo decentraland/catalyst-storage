@@ -130,4 +130,17 @@ describe('fileSystemContentStorage', () => {
     await check('so', ['some-id'])
     await check(undefined as any, ['another-id', 'some-id'])
   })
+
+  it(`When content is stored, then we can check file info`, async function () {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+    await fileSystemContentStorage.storeStream(id2, bufferToStream(content2))
+
+    const exists = await fileSystemContentStorage.fileInfoMultiple([id, id2])
+
+    expect(exists.get(id)).toEqual({ encoding: null, size: 3 })
+    expect(exists.get(id2)).toEqual({ encoding: null, size: 3 })
+    expect(await fileSystemContentStorage.fileInfo(id)).toEqual({ encoding: null, size: 3 })
+    expect(await fileSystemContentStorage.fileInfo(id2)).toEqual({ encoding: null, size: 3 })
+    expect(await fileSystemContentStorage.fileInfo('non-existent-id')).toBeUndefined()
+  })
 })
