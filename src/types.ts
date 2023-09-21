@@ -25,6 +25,9 @@ export type IContentStorageComponent = {
   allFileIds(prefix?: string): AsyncIterable<string>
 }
 
+/**
+ * @public
+ */
 export type FileInfo = {
   encoding: string | null
   size: number | null
