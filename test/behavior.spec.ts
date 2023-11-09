@@ -1,14 +1,24 @@
 import { mkdtempSync, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { createFolderBasedFileSystemContentStorage, createFsComponent, createInMemoryStorage, createS3BasedFileSystemContentStorage, FolderStorageOptions, IContentStorageComponent } from '../src'
-import { bufferToStream, streamToBuffer } from '../src'
+import {
+  createFolderBasedFileSystemContentStorage,
+  createFsComponent,
+  createInMemoryStorage,
+  createS3BasedFileSystemContentStorage,
+  FolderStorageOptions,
+  IContentStorageComponent
+} from '../src'
+import { bufferToStream } from '../src'
 import { createLogComponent } from '@well-known-components/logger'
 import { FileSystemUtils as fsu } from './file-system-utils'
 import AWSMock from 'mock-aws-s3'
 
-const options: (undefined | FolderStorageOptions)[] = [undefined, { disablePrefixHash: true }, { disablePrefixHash: false }]
-
+const options: (undefined | FolderStorageOptions)[] = [
+  undefined,
+  { disablePrefixHash: true },
+  { disablePrefixHash: false }
+]
 
 function createCommonSuite(components: { storage?: IContentStorageComponent }) {
   it(`Stores the files`, async () => {
@@ -41,7 +51,7 @@ function createCommonSuite(components: { storage?: IContentStorageComponent }) {
 }
 
 describe('s3 behavior', () => {
-  let components: { storage?: IContentStorageComponent } = {}
+  const components: { storage?: IContentStorageComponent } = {}
 
   beforeAll(async () => {
     const root = fsu.createTempDirectory()
@@ -56,17 +66,15 @@ describe('s3 behavior', () => {
   createCommonSuite(components)
 })
 
-
 describe('in-memory behavior', () => {
-  let components: { storage: IContentStorageComponent } = { storage: createInMemoryStorage() }
+  const components: { storage: IContentStorageComponent } = { storage: createInMemoryStorage() }
 
   createCommonSuite(components)
 })
 
-
 options.forEach((options, index) =>
   describe(`fileSystemContentStorage behavior #${index}`, () => {
-    let components: { storage?: IContentStorageComponent } = {}
+    const components: { storage?: IContentStorageComponent } = {}
 
     const fs = createFsComponent()
     let tmpRootDir: string
