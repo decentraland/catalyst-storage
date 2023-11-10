@@ -8,12 +8,19 @@ import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
 
+/** @public */
+export type FolderStorageOptions = {
+  /// by default FALSE, disables the sha1 prefix for all files. @see getFilePath
+  disablePrefixHash: boolean
+}
+
 /**
  * @public
  */
 export async function createFolderBasedFileSystemContentStorage(
   components: Pick<AppComponents, 'fs' | 'logs'>,
-  root: string
+  root: string,
+  options?: Partial<FolderStorageOptions>
 ): Promise<IContentStorageComponent> {
   const logger = components.logs.getLogger('folder-based-content-storage')
 
@@ -24,15 +31,25 @@ export async function createFolderBasedFileSystemContentStorage(
 
   await components.fs.mkdir(root, { recursive: true })
 
+  const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
+
   const getFilePath = async (id: string): Promise<string> => {
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
     // for the file system to handle millions of files in the same directory.
     // This way, asuming that sha1 hash distribution is ~uniform we are reducing by 16^4 the max amount of files in a directory.
-    const directoryPath = path.join(root, createHash('sha1').update(id).digest('hex').substring(0, 4))
-    if (!(await components.fs.existPath(directoryPath))) {
-      await components.fs.mkdir(directoryPath, { recursive: true })
+    const hash = createHash('sha1').update(id).digest('hex').substring(0, 4)
+
+    const directoryPath = USE_HASH_PREFIX ? path.join(root, hash) : root
+
+    const finalPath = path.join(directoryPath, id)
+
+    // recursively creates the directory structure if needed
+    const dirname = path.dirname(finalPath)
+    if (!(await components.fs.existPath(dirname))) {
+      await components.fs.mkdir(dirname, { recursive: true })
     }
-    return path.join(directoryPath, id)
+
+    return finalPath
   }
 
   const retrieveWithEncoding = async (id: string, encoding: string | null): Promise<ContentItem | undefined> => {
