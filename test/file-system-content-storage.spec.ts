@@ -110,6 +110,10 @@ describe('fileSystemContentStorage', () => {
     }
   })
 
+  it(`When an id is outside of the root folder it should return undefined even if present`, async () => {
+    expect(await fileSystemContentStorage.retrieve(`../${id}`)).toBeUndefined()
+  })
+
   it(`When content exists, then it is possible to iterate over all keys in storage`, async () => {
     await fileSystemContentStorage.storeStream(id, bufferToStream(content))
     await fileSystemContentStorage.storeStream(id2, bufferToStream(content2))

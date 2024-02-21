@@ -33,18 +33,23 @@ export async function createFolderBasedFileSystemContentStorage(
 
   const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
 
-  const getFilePath = async (id: string): Promise<string> => {
+  async function getFilePath(id: string): Promise<string> {
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
     // for the file system to handle millions of files in the same directory.
     // This way, asuming that sha1 hash distribution is ~uniform we are reducing by 16^4 the max amount of files in a directory.
     const hash = createHash('sha1').update(id).digest('hex').substring(0, 4)
 
-    const directoryPath = USE_HASH_PREFIX ? path.join(root, hash) : root
+    const directoryPath = path.normalize(USE_HASH_PREFIX ? path.join(root, hash) : root)
 
-    const finalPath = path.join(directoryPath, id)
+    const finalPath = path.normalize(path.join(directoryPath, id))
 
     // recursively creates the directory structure if needed
     const dirname = path.dirname(finalPath)
+
+    if (!finalPath.startsWith(directoryPath)) {
+      throw new Error('Cannot manipulate files outside of the root storage folder')
+    }
+
     if (!(await components.fs.existPath(dirname))) {
       await components.fs.mkdir(dirname, { recursive: true })
     }
