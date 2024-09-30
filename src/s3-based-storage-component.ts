@@ -3,6 +3,36 @@ import { Readable } from 'stream'
 import { AppComponents, ContentItem, FileInfo, IContentStorageComponent } from './types'
 import { SimpleContentItem } from './content-item'
 import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
+import { fromBuffer } from 'file-type'
+
+/**
+ * Helper function to convert a buffer to a readable stream.
+ */
+function bufferToStream(buffer: Buffer): Readable {
+  const stream = new Readable()
+  stream.push(buffer)
+  stream.push(null) // End of stream
+  return stream
+}
+
+/**
+ * Helper function to buffer a stream for MIME type detection and further usage.
+ */
+async function streamToBuffer(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  for await (const chunk of stream) {
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
+}
+
+/**
+ * Detects the MIME type from a buffer.
+ */
+async function detectMimeTypeFromBuffer(buffer: Buffer): Promise<string> {
+  const mime = await fromBuffer(buffer)
+  return mime?.mime || 'application/octet-stream'
+}
 
 /**
  * @public
@@ -44,18 +74,20 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   async function storeStream(id: string, stream: Readable): Promise<void> {
+    // Buffer the entire stream to avoid consuming it multiple times
+    const fullBuffer = await streamToBuffer(stream)
+
+    // Detect MIME type from the buffer
+    const mimeType = await detectMimeTypeFromBuffer(fullBuffer)
+
+    // Upload to S3 using the buffered data
     await s3
-      .upload(
-        {
-          Bucket,
-          Key: getKey(id),
-          Body: stream
-        },
-        {
-          // Forcing chunks of 5Mb to improve upload of large files
-          partSize: 5 * 1024 * 1024
-        }
-      )
+      .upload({
+        Bucket,
+        Key: getKey(id),
+        Body: bufferToStream(fullBuffer), // Recreate stream from buffer for S3 upload
+        ContentType: mimeType // Set the detected MIME type
+      })
       .promise()
   }
 
@@ -77,7 +109,7 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   async function storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
-    // In AWS S3 we don't compress
+    // In AWS S3 we don't compress, we directly store the stream
     await storeStream(id, stream)
   }
 
