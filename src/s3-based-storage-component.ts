@@ -21,7 +21,8 @@ function bufferToStream(buffer: Buffer): Readable {
 async function streamToBuffer(stream: Readable): Promise<Buffer> {
   const chunks: Buffer[] = []
   for await (const chunk of stream) {
-    chunks.push(chunk)
+    // Ensure chunk is converted to Buffer (handles Uint8Array, Buffer, etc.)
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
   }
   return Buffer.concat(chunks)
 }
