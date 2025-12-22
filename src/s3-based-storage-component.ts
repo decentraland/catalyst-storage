@@ -21,17 +21,30 @@ function bufferToStream(buffer: Buffer): Readable {
 async function streamToBuffer(stream: Readable): Promise<Buffer> {
   const chunks: Buffer[] = []
   for await (const chunk of stream) {
-    chunks.push(chunk)
+    // Ensure chunk is converted to Buffer (handles Uint8Array, Buffer, etc.)
+    const bufferChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    chunks.push(bufferChunk)
   }
   return Buffer.concat(chunks)
 }
 
 /**
  * Detects the MIME type from a buffer.
+ * Uses only the first bytes of the buffer for detection.
+ * file-type v15 only needs the first ~4100 bytes to detect any file type.
  */
-async function detectMimeTypeFromBuffer(buffer: Buffer): Promise<string> {
-  const mime = await fromBuffer(buffer)
-  return mime?.mime || 'application/octet-stream'
+async function detectMimeTypeFromBuffer(buffer: Buffer | Uint8Array): Promise<string> {
+  // Use magic bytes from end of buffer to detect MIME type
+  const maxBytesForDetection = 4100
+  const bytesToUse = Math.min(maxBytesForDetection, buffer.length)
+  const detectionBuffer = Buffer.from(buffer.slice(0, bytesToUse))
+
+  try {
+    const mime = await fromBuffer(detectionBuffer)
+    return mime?.mime || 'application/octet-stream'
+  } catch (error: any) {
+    return 'application/octet-stream'
+  }
 }
 
 /**
@@ -74,7 +87,7 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   async function storeStream(id: string, stream: Readable): Promise<void> {
-    // Buffer the entire stream to avoid consuming it multiple times
+    // Buffer the entire stream to detect MIME type and upload
     const fullBuffer = await streamToBuffer(stream)
 
     // Detect MIME type from the buffer
@@ -85,8 +98,8 @@ export async function createS3BasedFileSystemContentStorage(
       .upload({
         Bucket,
         Key: getKey(id),
-        Body: bufferToStream(fullBuffer), // Recreate stream from buffer for S3 upload
-        ContentType: mimeType // Set the detected MIME type
+        Body: bufferToStream(fullBuffer),
+        ContentType: mimeType
       })
       .promise()
   }
