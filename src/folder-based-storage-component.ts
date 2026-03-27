@@ -71,7 +71,8 @@ export async function createFolderBasedFileSystemContentStorage(
       return new SimpleContentItem(
         async () => components.fs.createReadStream(filePath, range),
         range ? range.end - range.start + 1 : stat.size,
-        encoding)
+        encoding
+      )
     }
 
     return undefined
@@ -89,18 +90,13 @@ export async function createFolderBasedFileSystemContentStorage(
     await pipe(stream, components.fs.createWriteStream(await getFilePath(id)))
   }
 
-  const retrieve = async (
-    id: string,
-    range?: { start: number; end: number }
-  ): Promise<ContentItem | undefined> => {
+  const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
     try {
-      let contentItem: ContentItem | undefined = undefined;
+      let contentItem: ContentItem | undefined = undefined
 
-      if (!range)
-        contentItem = await retrieveWithEncoding(id, 'gzip')
+      if (!range) contentItem = await retrieveWithEncoding(id, 'gzip')
 
-      if (!contentItem)
-        contentItem = await retrieveWithEncoding(id, null, range)
+      if (!contentItem) contentItem = await retrieveWithEncoding(id, null, range)
 
       return contentItem
     } catch (error: any) {
