@@ -28,11 +28,8 @@ export function createInMemoryStorage(): IContentStorageComponent {
     },
     async retrieve(fileId: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
       let content = storage.get(fileId)
-
       if (!content) return undefined
-
       if (range) content = content.subarray(range.start, range.end + 1)
-
       return SimpleContentItem.fromBuffer(content)
     },
     async existMultiple(fileIds: string[]): Promise<Map<string, boolean>> {

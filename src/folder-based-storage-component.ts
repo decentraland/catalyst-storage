@@ -93,11 +93,8 @@ export async function createFolderBasedFileSystemContentStorage(
   const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
     try {
       let contentItem: ContentItem | undefined = undefined
-
       if (!range) contentItem = await retrieveWithEncoding(id, 'gzip')
-
       if (!contentItem) contentItem = await retrieveWithEncoding(id, null, range)
-
       return contentItem
     } catch (error: any) {
       logger.error(error)
