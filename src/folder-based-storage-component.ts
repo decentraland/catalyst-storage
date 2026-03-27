@@ -57,13 +57,21 @@ export async function createFolderBasedFileSystemContentStorage(
     return finalPath
   }
 
-  const retrieveWithEncoding = async (id: string, encoding: string | null): Promise<ContentItem | undefined> => {
+  const retrieveWithEncoding = async (
+    id: string,
+    encoding: string | null,
+    range?: { start: number; end: number }
+  ): Promise<ContentItem | undefined> => {
     const extension = encoding ? '.' + encoding : ''
     const filePath = (await getFilePath(id)) + extension
 
     if (await components.fs.existPath(filePath)) {
       const stat = await components.fs.stat(filePath)
-      return new SimpleContentItem(async () => components.fs.createReadStream(filePath), stat.size, encoding)
+
+      return new SimpleContentItem(
+        async () => components.fs.createReadStream(filePath, range),
+        range ? range.end - range.start + 1 : stat.size,
+        encoding)
     }
 
     return undefined
@@ -81,9 +89,20 @@ export async function createFolderBasedFileSystemContentStorage(
     await pipe(stream, components.fs.createWriteStream(await getFilePath(id)))
   }
 
-  const retrieve = async (id: string): Promise<ContentItem | undefined> => {
+  const retrieve = async (
+    id: string,
+    range?: { start: number; end: number }
+  ): Promise<ContentItem | undefined> => {
     try {
-      return (await retrieveWithEncoding(id, 'gzip')) || (await retrieveWithEncoding(id, null))
+      let contentItem: ContentItem | undefined = undefined;
+
+      if (!range)
+        contentItem = await retrieveWithEncoding(id, 'gzip')
+
+      if (!contentItem)
+        contentItem = await retrieveWithEncoding(id, null, range)
+
+      return contentItem
     } catch (error: any) {
       logger.error(error)
     }

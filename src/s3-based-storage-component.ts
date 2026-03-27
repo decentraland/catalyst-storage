@@ -104,13 +104,20 @@ export async function createS3BasedFileSystemContentStorage(
       .promise()
   }
 
-  async function retrieve(id: string): Promise<ContentItem | undefined> {
+  async function retrieve(
+    id: string,
+    range?: { start: number; end: number }
+  ): Promise<ContentItem | undefined> {
     try {
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
 
       return new SimpleContentItem(
-        async () => s3.getObject({ Bucket, Key: getKey(id) }).createReadStream(),
-        obj.ContentLength || null,
+        async () => s3.getObject({
+          Bucket,
+          Key: getKey(id),
+          Range: range ? `bytes=${range.start}-${range.end}` : undefined
+        }).createReadStream(),
+        range ? range.end - range.start + 1 : obj.ContentLength || null,
         obj.ContentEncoding || null
       )
     } catch (error: any) {

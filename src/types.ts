@@ -17,7 +17,7 @@ export type IContentStorageComponent = {
   storeStream(fileId: string, content: Readable): Promise<void>
   storeStreamAndCompress(fileId: string, content: Readable): Promise<void>
   delete(fileIds: string[]): Promise<void>
-  retrieve(fileId: string): Promise<ContentItem | undefined>
+  retrieve(fileId: string, range?: { start: number; end: number }): Promise<ContentItem | undefined>
   fileInfo(fileId: string): Promise<FileInfo | undefined>
   fileInfoMultiple(fileIds: string[]): Promise<Map<string, FileInfo | undefined>>
   exist(fileId: string): Promise<boolean>

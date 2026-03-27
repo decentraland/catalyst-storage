@@ -26,9 +26,19 @@ export function createInMemoryStorage(): IContentStorageComponent {
     async delete(ids: string[]): Promise<void> {
       ids.forEach((id) => storage.delete(id))
     },
-    async retrieve(fileId: string): Promise<ContentItem | undefined> {
-      const content = storage.get(fileId)
-      return content ? SimpleContentItem.fromBuffer(content) : undefined
+    async retrieve(
+      fileId: string,
+      range?: { start: number; end: number }
+    ): Promise<ContentItem | undefined> {
+      let content = storage.get(fileId)
+
+      if (!content)
+        return undefined
+
+      if (range)
+        content = content.subarray(range.start, range.end + 1)
+
+      return SimpleContentItem.fromBuffer(content)
     },
     async existMultiple(fileIds: string[]): Promise<Map<string, boolean>> {
       return new Map(fileIds.map((fileId) => [fileId, storage.has(fileId)]))
