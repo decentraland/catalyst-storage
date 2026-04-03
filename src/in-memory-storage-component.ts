@@ -27,9 +27,15 @@ export function createInMemoryStorage(): IContentStorageComponent {
       ids.forEach((id) => storage.delete(id))
     },
     async retrieve(fileId: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
-      let content = storage.get(fileId)
+      const content = storage.get(fileId)
       if (!content) return undefined
-      if (range) content = content.subarray(range.start, range.end + 1)
+      if (range) {
+        if (range.start < 0 || range.start > range.end) {
+          throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
+        }
+        const clampedEnd = Math.min(range.end, content.length - 1)
+        return SimpleContentItem.fromBuffer(content.subarray(range.start, clampedEnd + 1))
+      }
       return SimpleContentItem.fromBuffer(content)
     },
     async existMultiple(fileIds: string[]): Promise<Map<string, boolean>> {

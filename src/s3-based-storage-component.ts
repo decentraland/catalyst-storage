@@ -106,7 +106,13 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function retrieve(id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
     try {
+      if (range && (range.start < 0 || range.start > range.end)) {
+        throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
+      }
+
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
+
+      const clampedEnd = range && obj.ContentLength ? Math.min(range.end, obj.ContentLength - 1) : range?.end
 
       return new SimpleContentItem(
         async () =>
@@ -114,13 +120,14 @@ export async function createS3BasedFileSystemContentStorage(
             .getObject({
               Bucket,
               Key: getKey(id),
-              Range: range ? `bytes=${range.start}-${range.end}` : undefined
+              Range: range ? `bytes=${range.start}-${clampedEnd}` : undefined
             })
             .createReadStream(),
-        range ? range.end - range.start + 1 : obj.ContentLength || null,
+        range && clampedEnd !== undefined ? clampedEnd - range.start + 1 : obj.ContentLength || null,
         obj.ContentEncoding || null
       )
     } catch (error: any) {
+      if (error instanceof RangeError) throw error
       if (error.code !== 'NotFound') {
         logger.error(error)
       }

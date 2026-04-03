@@ -68,11 +68,19 @@ export async function createFolderBasedFileSystemContentStorage(
     if (await components.fs.existPath(filePath)) {
       const stat = await components.fs.stat(filePath)
 
-      return new SimpleContentItem(
-        async () => components.fs.createReadStream(filePath, range),
-        range ? range.end - range.start + 1 : stat.size,
-        encoding
-      )
+      if (range) {
+        if (range.start < 0 || range.start > range.end) {
+          throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
+        }
+        const clampedEnd = Math.min(range.end, stat.size - 1)
+        return new SimpleContentItem(
+          async () => components.fs.createReadStream(filePath, { start: range.start, end: clampedEnd }),
+          clampedEnd - range.start + 1,
+          encoding
+        )
+      }
+
+      return new SimpleContentItem(async () => components.fs.createReadStream(filePath), stat.size, encoding)
     }
 
     return undefined
@@ -97,6 +105,7 @@ export async function createFolderBasedFileSystemContentStorage(
       if (!contentItem) contentItem = await retrieveWithEncoding(id, null, range)
       return contentItem
     } catch (error: any) {
+      if (error instanceof RangeError) throw error
       logger.error(error)
     }
     return undefined

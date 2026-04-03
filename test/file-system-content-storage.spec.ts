@@ -135,6 +135,61 @@ describe('fileSystemContentStorage', () => {
     await check(undefined as any, ['another-id', 'some-id'])
   })
 
+  it(`When content is stored, then a range can be retrieved`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await fileSystemContentStorage.storeStream(id, bufferToStream(data))
+
+    const item = await fileSystemContentStorage.retrieve(id, { start: 0, end: 4 })
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('Hello'))
+    expect(item!.size).toBe(5)
+  })
+
+  it(`When content is stored, then a range in the middle can be retrieved`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await fileSystemContentStorage.storeStream(id, bufferToStream(data))
+
+    const item = await fileSystemContentStorage.retrieve(id, { start: 7, end: 11 })
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('World'))
+    expect(item!.size).toBe(5)
+  })
+
+  it(`When a range with end beyond file size is requested, then it clamps to file size`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await fileSystemContentStorage.storeStream(id, bufferToStream(data))
+
+    const item = await fileSystemContentStorage.retrieve(id, { start: 7, end: 999 })
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('World!'))
+    expect(item!.size).toBe(6)
+  })
+
+  it(`When a range with start > end is requested, then it throws a RangeError`, async () => {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+    await expect(fileSystemContentStorage.retrieve(id, { start: 5, end: 2 })).rejects.toThrow(RangeError)
+  })
+
+  it(`When a range with negative start is requested, then it throws a RangeError`, async () => {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+    await expect(fileSystemContentStorage.retrieve(id, { start: -1, end: 2 })).rejects.toThrow(RangeError)
+  })
+
+  it(`When content is stored with bad compression ratio, then a range can be retrieved from the uncompressed file`, async () => {
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from('Hello, World!')))
+
+    const item = await fileSystemContentStorage.retrieve(id, { start: 0, end: 4 })
+    expect(item).toBeDefined()
+    expect(item!.size).toBe(5)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('Hello'))
+  })
+
+  it(`When content is stored compressed (gzip only), then a range retrieve returns undefined`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+
+    // The original uncompressed file was deleted, and range requests skip gzip
+    const item = await fileSystemContentStorage.retrieve(id, { start: 0, end: 9 })
+    expect(item).toBeUndefined()
+  })
+
   it(`When content is stored, then we can check file info`, async function () {
     await fileSystemContentStorage.storeStream(id, bufferToStream(content))
     await fileSystemContentStorage.storeStream(id2, bufferToStream(content2))

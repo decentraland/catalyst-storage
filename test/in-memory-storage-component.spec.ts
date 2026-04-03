@@ -86,6 +86,43 @@ describe('storage mock', () => {
     expect(retrievedContent?.encoding).toBeUndefined()
   })
 
+  it(`When content is stored, then a range can be retrieved`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+
+    const item = await storage.retrieve(id, { start: 0, end: 4 })
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('Hello'))
+    expect(item!.size).toBe(5)
+  })
+
+  it(`When content is stored, then a range in the middle can be retrieved`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+
+    const item = await storage.retrieve(id, { start: 7, end: 11 })
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('World'))
+    expect(item!.size).toBe(5)
+  })
+
+  it(`When a range with end beyond file size is requested, then it clamps to file size`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+
+    const item = await storage.retrieve(id, { start: 7, end: 999 })
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('World!'))
+    expect(item!.size).toBe(6)
+  })
+
+  it(`When a range with start > end is requested, then it throws a RangeError`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await expect(storage.retrieve(id, { start: 5, end: 2 })).rejects.toThrow(RangeError)
+  })
+
+  it(`When a range with negative start is requested, then it throws a RangeError`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await expect(storage.retrieve(id, { start: -1, end: 2 })).rejects.toThrow(RangeError)
+  })
+
   async function retrieveAndExpectStoredContentToBe(idToRetrieve: string, expectedContent: Buffer) {
     const retrievedContent = await storage.retrieve(idToRetrieve)
     expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(expectedContent)
