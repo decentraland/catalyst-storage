@@ -86,6 +86,21 @@ describe('storage mock', () => {
     expect(retrievedContent?.encoding).toBeUndefined()
   })
 
+  it(`When a range is requested on a non-existent key, then it returns undefined`, async () => {
+    const item = await storage.retrieve('non-existent', { start: 0, end: 4 })
+    expect(item).toBeUndefined()
+  })
+
+  it(`When a single-byte range is requested, then it returns that byte`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+
+    const item = await storage.retrieve(id, { start: 4, end: 4 })
+    expect(item).toBeDefined()
+    expect(item!.size).toBe(1)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('o'))
+  })
+
   it(`When content is stored, then a range can be retrieved`, async () => {
     const data = Buffer.from('Hello, World!')
     await storage.storeStream(id, bufferToStream(data))

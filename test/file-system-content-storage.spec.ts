@@ -173,6 +173,21 @@ describe('fileSystemContentStorage', () => {
     await expect(fileSystemContentStorage.retrieve(id, { start: -1, end: 2 })).rejects.toThrow(RangeError)
   })
 
+  it(`When a range is requested on a non-existent file, then it returns undefined`, async () => {
+    const item = await fileSystemContentStorage.retrieve('non-existent-id', { start: 0, end: 4 })
+    expect(item).toBeUndefined()
+  })
+
+  it(`When a single-byte range is requested, then it returns that byte`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await fileSystemContentStorage.storeStream(id, bufferToStream(data))
+
+    const item = await fileSystemContentStorage.retrieve(id, { start: 4, end: 4 })
+    expect(item).toBeDefined()
+    expect(item!.size).toBe(1)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('o'))
+  })
+
   it(`When content is stored with bad compression ratio, then a range can be retrieved from the uncompressed file`, async () => {
     await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from('Hello, World!')))
 
@@ -226,15 +241,37 @@ describe('fileSystemContentStorage', () => {
     expect(await fs.existPath(filePath + '.gzip')).toBeFalsy()
   })
 
+  it(`When concurrent range requests hit the same gzip-only file, then only one decompression occurs`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+
+    const [item1, item2] = await Promise.all([
+      fileSystemContentStorage.retrieve(id, { start: 0, end: 9 }),
+      fileSystemContentStorage.retrieve(id, { start: 50, end: 59 })
+    ])
+
+    expect(item1).toBeDefined()
+    expect(item2).toBeDefined()
+    expect(await streamToBuffer(await item1!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
+    expect(await streamToBuffer(await item2!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
+    expect(await fs.existPath(filePath)).toBeTruthy()
+  })
+
   describe('decompression cache eviction', () => {
+    beforeEach(() => {
+      jest.useFakeTimers()
+    })
+
+    afterEach(() => {
+      jest.useRealTimers()
+    })
+
     it(`When the cache TTL expires, then the cached uncompressed file is cleaned up`, async () => {
-      const shortTTL = 50 // 50ms
-      const shortEviction = 30 // 30ms
       const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-cache-'))
       const storage = await createFolderBasedFileSystemContentStorage(
         { fs, logs: await createLogComponent({}) },
         tmpDir,
-        { decompressCacheTTL: shortTTL, decompressCacheEvictionInterval: shortEviction }
+        { decompressCacheTTL: 60000, decompressCacheEvictionInterval: 30000 }
       )
       await storage.start?.({} as any)
       const cachedFilePath = path.join(tmpDir, '9584', id)
@@ -245,8 +282,11 @@ describe('fileSystemContentStorage', () => {
         await storage.retrieve(id, { start: 0, end: 9 })
         expect(await fs.existPath(cachedFilePath)).toBeTruthy()
 
-        // Wait for TTL + eviction interval to trigger cleanup
-        await new Promise((r) => setTimeout(r, shortTTL + shortEviction + 50))
+        // Advance past TTL + eviction interval
+        jest.advanceTimersByTime(60000 + 30000)
+        // Allow the async eviction to complete
+        await Promise.resolve()
+        await Promise.resolve()
 
         expect(await fs.existPath(cachedFilePath)).toBeFalsy()
         expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()
@@ -261,7 +301,7 @@ describe('fileSystemContentStorage', () => {
       const storage = await createFolderBasedFileSystemContentStorage(
         { fs, logs: await createLogComponent({}) },
         tmpDir,
-        { decompressCacheMaxSize: 150, decompressCacheEvictionInterval: 30 }
+        { decompressCacheMaxSize: 150, decompressCacheEvictionInterval: 30000 }
       )
       await storage.start?.({} as any)
       const cachedFilePath1 = path.join(tmpDir, '9584', id)
@@ -277,21 +317,50 @@ describe('fileSystemContentStorage', () => {
         await storage.retrieve(id, { start: 0, end: 9 })
         expect(await fs.existPath(cachedFilePath1)).toBeTruthy()
 
-        // Small delay so id2 has a newer lastAccess
-        await new Promise((r) => setTimeout(r, 10))
+        // Advance time so id2 has a newer lastAccess
+        jest.advanceTimersByTime(1000)
 
         // Trigger cache for second file — total cache now exceeds 150 bytes
         await storage.retrieve(id2, { start: 0, end: 9 })
         expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
 
-        // Wait for eviction interval to run
-        await new Promise((r) => setTimeout(r, 80))
+        // Advance past eviction interval
+        jest.advanceTimersByTime(30000)
+        await Promise.resolve()
+        await Promise.resolve()
 
         // LRU file (id, accessed first) should be evicted, id2 should remain
         expect(await fs.existPath(cachedFilePath1)).toBeFalsy()
         expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
       } finally {
         await storage.stop?.()
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    it(`When stop() is called, then expired cached files are evicted`, async () => {
+      const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-cache-'))
+      const storage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        tmpDir,
+        { decompressCacheTTL: 60000, decompressCacheEvictionInterval: 999999 }
+      )
+      const cachedFilePath = path.join(tmpDir, '9584', id)
+
+      try {
+        const data = Buffer.from(new Uint8Array(100).fill(0))
+        await storage.storeStreamAndCompress(id, bufferToStream(data))
+        await storage.retrieve(id, { start: 0, end: 9 })
+        expect(await fs.existPath(cachedFilePath)).toBeTruthy()
+
+        // Advance past TTL (but eviction interval is very long, so timer won't fire)
+        jest.advanceTimersByTime(60001)
+
+        // stop() should run a final eviction pass
+        await storage.stop?.()
+        expect(await fs.existPath(cachedFilePath)).toBeFalsy()
+        expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()
+      } finally {
         rmSync(tmpDir, { recursive: true, force: true })
       }
     })

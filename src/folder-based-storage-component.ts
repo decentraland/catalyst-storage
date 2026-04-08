@@ -50,6 +50,9 @@ export async function createFolderBasedFileSystemContentStorage(
   const decompressCache = new Map<string, { size: number; lastAccess: number }>()
   let totalCacheSize = 0
 
+  // Concurrency guard: prevents multiple simultaneous decompressions of the same file
+  const inflightDecompressions = new Map<string, Promise<void>>()
+
   async function evictCache() {
     const now = Date.now()
 
@@ -177,15 +180,27 @@ export async function createFolderBasedFileSystemContentStorage(
             throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
           }
 
-          // Decompress to disk
           const uncompressedPath = await getFilePath(id)
-          const decompressed = await streamToBuffer(await gzipItem.asStream())
-          await pipe(Readable.from(decompressed), components.fs.createWriteStream(uncompressedPath))
 
-          // Track in cache
-          const size = decompressed.length
-          decompressCache.set(uncompressedPath, { size, lastAccess: Date.now() })
-          totalCacheSize += size
+          // Wait for any in-flight decompression of the same file, or start one
+          if (inflightDecompressions.has(uncompressedPath)) {
+            await inflightDecompressions.get(uncompressedPath)
+          } else {
+            const decompressPromise = (async () => {
+              const decompressed = await streamToBuffer(await gzipItem.asStream())
+              await pipe(Readable.from(decompressed), components.fs.createWriteStream(uncompressedPath))
+
+              const size = decompressed.length
+              decompressCache.set(uncompressedPath, { size, lastAccess: Date.now() })
+              totalCacheSize += size
+            })()
+            inflightDecompressions.set(uncompressedPath, decompressPromise)
+            try {
+              await decompressPromise
+            } finally {
+              inflightDecompressions.delete(uncompressedPath)
+            }
+          }
 
           // Serve range from the cached uncompressed file
           contentItem = await retrieveWithEncoding(id, null, range)
