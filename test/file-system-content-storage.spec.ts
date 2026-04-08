@@ -191,6 +191,101 @@ describe('fileSystemContentStorage', () => {
     expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
   })
 
+  it(`When a gzip-only file is range-requested, then the uncompressed file is cached to disk`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+
+    expect(await fs.existPath(filePath)).toBeFalsy()
+    await fileSystemContentStorage.retrieve(id, { start: 0, end: 9 })
+    expect(await fs.existPath(filePath)).toBeTruthy()
+  })
+
+  it(`When a gzip-only file is range-requested twice, then the second request reads from the cached file`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+
+    const item1 = await fileSystemContentStorage.retrieve(id, { start: 0, end: 9 })
+    expect(await streamToBuffer(await item1!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
+
+    const item2 = await fileSystemContentStorage.retrieve(id, { start: 50, end: 59 })
+    expect(item2).toBeDefined()
+    expect(item2!.size).toBe(10)
+    expect(await streamToBuffer(await item2!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
+  })
+
+  it(`When a cached file is deleted via storage.delete(), then it is removed from the cache`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+
+    await fileSystemContentStorage.retrieve(id, { start: 0, end: 9 })
+    expect(await fs.existPath(filePath)).toBeTruthy()
+
+    await fileSystemContentStorage.delete([id])
+    expect(await fs.existPath(filePath)).toBeFalsy()
+    expect(await fs.existPath(filePath + '.gzip')).toBeFalsy()
+  })
+
+  describe('decompression cache eviction', () => {
+    it(`When the cache TTL expires, then the cached uncompressed file is cleaned up`, async () => {
+      const shortTTL = 50 // 50ms
+      const shortEviction = 30 // 30ms
+      const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-cache-'))
+      const storage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        tmpDir,
+        { decompressCacheTTL: shortTTL, decompressCacheEvictionInterval: shortEviction }
+      )
+      const cachedFilePath = path.join(tmpDir, '9584', id)
+
+      const data = Buffer.from(new Uint8Array(100).fill(0))
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+      await storage.retrieve(id, { start: 0, end: 9 })
+      expect(await fs.existPath(cachedFilePath)).toBeTruthy()
+
+      // Wait for TTL + eviction interval to trigger cleanup
+      await new Promise((r) => setTimeout(r, shortTTL + shortEviction + 50))
+
+      expect(await fs.existPath(cachedFilePath)).toBeFalsy()
+      expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()
+      rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it(`When the cache exceeds max size, then LRU files are evicted`, async () => {
+      const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-cache-'))
+      const storage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        tmpDir,
+        { decompressCacheMaxSize: 150, decompressCacheEvictionInterval: 30 }
+      )
+      const cachedFilePath1 = path.join(tmpDir, '9584', id)
+      const cachedFilePath2 = path.join(tmpDir, 'ea6c', id2)
+
+      // Store two 100-byte files as gzip-only
+      const data = Buffer.from(new Uint8Array(100).fill(0))
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+      await storage.storeStreamAndCompress(id2, bufferToStream(Buffer.from(new Uint8Array(100).fill(1))))
+
+      // Trigger cache for first file
+      await storage.retrieve(id, { start: 0, end: 9 })
+      expect(await fs.existPath(cachedFilePath1)).toBeTruthy()
+
+      // Small delay so id2 has a newer lastAccess
+      await new Promise((r) => setTimeout(r, 10))
+
+      // Trigger cache for second file — total cache now exceeds 150 bytes
+      await storage.retrieve(id2, { start: 0, end: 9 })
+      expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
+
+      // Wait for eviction interval to run
+      await new Promise((r) => setTimeout(r, 80))
+
+      // LRU file (id, accessed first) should be evicted, id2 should remain
+      expect(await fs.existPath(cachedFilePath1)).toBeFalsy()
+      expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
+      rmSync(tmpDir, { recursive: true, force: true })
+    })
+  })
+
   it(`When content is stored, then we can check file info`, async function () {
     await fileSystemContentStorage.storeStream(id, bufferToStream(content))
     await fileSystemContentStorage.storeStream(id2, bufferToStream(content2))

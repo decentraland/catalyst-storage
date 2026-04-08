@@ -14,7 +14,7 @@ import { createLogComponent } from '@well-known-components/logger'
 import { FileSystemUtils as fsu } from './file-system-utils'
 import AWSMock from 'mock-aws-s3'
 
-const options: (undefined | FolderStorageOptions)[] = [
+const options: (undefined | Partial<FolderStorageOptions>)[] = [
   undefined,
   { disablePrefixHash: true },
   { disablePrefixHash: false }

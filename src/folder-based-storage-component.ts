@@ -3,15 +3,25 @@ import path from 'path'
 import { pipeline, Readable } from 'stream'
 import { promisify } from 'util'
 import { AppComponents, ContentItem, FileInfo, IContentStorageComponent } from './types'
-import { SimpleContentItem } from './content-item'
+import { SimpleContentItem, streamToBuffer } from './content-item'
 import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
+
+const ONE_HOUR_IN_MS = 60 * 60 * 1000
+const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
+const ONE_GB_IN_BYTES = 1024 * 1024 * 1024
 
 /** @public */
 export type FolderStorageOptions = {
   /// by default FALSE, disables the sha1 prefix for all files. @see getFilePath
   disablePrefixHash: boolean
+  /** TTL in milliseconds for cached decompressed files. Default: 1 hour. */
+  decompressCacheTTL: number
+  /** Max total size in bytes for cached decompressed files. Default: 1GB. */
+  decompressCacheMaxSize: number
+  /** How often to run the eviction check in milliseconds. Default: 5 minutes. */
+  decompressCacheEvictionInterval: number
 }
 
 /**
@@ -32,6 +42,40 @@ export async function createFolderBasedFileSystemContentStorage(
   await components.fs.mkdir(root, { recursive: true })
 
   const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
+  const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
+  const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? ONE_GB_IN_BYTES
+  const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
+
+  // LRU cache tracker for decompressed gzip files written to disk
+  const decompressCache = new Map<string, { size: number; lastAccess: number }>()
+  let totalCacheSize = 0
+
+  async function evictCache() {
+    const now = Date.now()
+
+    // TTL eviction
+    for (const [filePath, entry] of decompressCache) {
+      if (now - entry.lastAccess > CACHE_TTL) {
+        await noFailUnlink(filePath)
+        totalCacheSize -= entry.size
+        decompressCache.delete(filePath)
+      }
+    }
+
+    // Size eviction (LRU)
+    if (totalCacheSize > CACHE_MAX_SIZE) {
+      const sorted = [...decompressCache.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess)
+      for (const [filePath, entry] of sorted) {
+        if (totalCacheSize <= CACHE_MAX_SIZE) break
+        await noFailUnlink(filePath)
+        totalCacheSize -= entry.size
+        decompressCache.delete(filePath)
+      }
+    }
+  }
+
+  const evictionTimer = setInterval(evictCache, CACHE_EVICTION_INTERVAL)
+  evictionTimer.unref()
 
   async function getFilePath(id: string): Promise<string> {
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
@@ -98,51 +142,54 @@ export async function createFolderBasedFileSystemContentStorage(
     await pipe(stream, components.fs.createWriteStream(await getFilePath(id)))
   }
 
+  function removeCacheEntry(filePath: string) {
+    const entry = decompressCache.get(filePath)
+    if (entry) {
+      totalCacheSize -= entry.size
+      decompressCache.delete(filePath)
+    }
+  }
+
+  function touchCacheEntry(filePath: string) {
+    const entry = decompressCache.get(filePath)
+    if (entry) {
+      entry.lastAccess = Date.now()
+    }
+  }
+
   const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
     try {
       let contentItem: ContentItem | undefined = undefined
       if (!range) contentItem = await retrieveWithEncoding(id, 'gzip')
-      if (!contentItem) contentItem = await retrieveWithEncoding(id, null, range)
+      if (!contentItem) {
+        contentItem = await retrieveWithEncoding(id, null, range)
+        if (contentItem && range) {
+          // Update last access if this file is in the cache
+          touchCacheEntry(await getFilePath(id))
+        }
+      }
 
       // If range was requested but uncompressed file doesn't exist, fall back to
-      // decompressing the gzip file and extracting only the requested range.
-      // We stream-decompress, skip bytes before range.start, and collect bytes
-      // until range.end — only the range portion is buffered in memory.
+      // decompressing the gzip file, writing it to disk as a cache, and serving the range.
       if (!contentItem && range) {
         const gzipItem = await retrieveWithEncoding(id, 'gzip')
         if (gzipItem) {
           if (range.start < 0 || range.start > range.end) {
             throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
           }
-          const decompressedStream = await gzipItem.asStream()
-          const chunks: Buffer[] = []
-          let offset = 0
 
-          await new Promise<void>((resolve, reject) => {
-            decompressedStream.on('error', reject)
-            decompressedStream.on('data', (chunk: Buffer) => {
-              const chunkStart = offset
-              const chunkEnd = offset + chunk.length - 1
-              offset += chunk.length
+          // Decompress to disk
+          const uncompressedPath = await getFilePath(id)
+          const decompressed = await streamToBuffer(await gzipItem.asStream())
+          await pipe(Readable.from(decompressed), components.fs.createWriteStream(uncompressedPath))
 
-              if (chunkEnd < range.start) return // before range, skip
-              if (chunkStart > range.end) {
-                decompressedStream.destroy() // past range, stop
-                return
-              }
+          // Track in cache
+          const size = decompressed.length
+          decompressCache.set(uncompressedPath, { size, lastAccess: Date.now() })
+          totalCacheSize += size
 
-              const sliceStart = Math.max(0, range.start - chunkStart)
-              const sliceEnd = Math.min(chunk.length, range.end - chunkStart + 1)
-              chunks.push(chunk.subarray(sliceStart, sliceEnd))
-            })
-            decompressedStream.on('end', resolve)
-            decompressedStream.on('close', resolve)
-          })
-
-          const result = Buffer.concat(chunks)
-          if (result.length > 0) {
-            return SimpleContentItem.fromBuffer(result)
-          }
+          // Serve range from the cached uncompressed file
+          contentItem = await retrieveWithEncoding(id, null, range)
         }
       }
 
@@ -204,8 +251,10 @@ export async function createFolderBasedFileSystemContentStorage(
     },
     async delete(ids: string[]): Promise<void> {
       for (const id of ids) {
-        await noFailUnlink(await getFilePath(id))
-        await noFailUnlink((await getFilePath(id)) + '.gzip')
+        const filePath = await getFilePath(id)
+        removeCacheEntry(filePath)
+        await noFailUnlink(filePath)
+        await noFailUnlink(filePath + '.gzip')
       }
     },
     async existMultiple(cids: string[]): Promise<Map<string, boolean>> {
