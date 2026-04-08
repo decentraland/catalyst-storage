@@ -30,7 +30,8 @@ describe('fileSystemContentStorage', () => {
     filePath2 = path.join(tmpRootDir, 'ea6c', id2)
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    await fileSystemContentStorage.stop?.()
     rmSync(tmpRootDir, { recursive: true, force: false })
   })
 
@@ -235,19 +236,24 @@ describe('fileSystemContentStorage', () => {
         tmpDir,
         { decompressCacheTTL: shortTTL, decompressCacheEvictionInterval: shortEviction }
       )
+      await storage.start?.({} as any)
       const cachedFilePath = path.join(tmpDir, '9584', id)
 
-      const data = Buffer.from(new Uint8Array(100).fill(0))
-      await storage.storeStreamAndCompress(id, bufferToStream(data))
-      await storage.retrieve(id, { start: 0, end: 9 })
-      expect(await fs.existPath(cachedFilePath)).toBeTruthy()
+      try {
+        const data = Buffer.from(new Uint8Array(100).fill(0))
+        await storage.storeStreamAndCompress(id, bufferToStream(data))
+        await storage.retrieve(id, { start: 0, end: 9 })
+        expect(await fs.existPath(cachedFilePath)).toBeTruthy()
 
-      // Wait for TTL + eviction interval to trigger cleanup
-      await new Promise((r) => setTimeout(r, shortTTL + shortEviction + 50))
+        // Wait for TTL + eviction interval to trigger cleanup
+        await new Promise((r) => setTimeout(r, shortTTL + shortEviction + 50))
 
-      expect(await fs.existPath(cachedFilePath)).toBeFalsy()
-      expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()
-      rmSync(tmpDir, { recursive: true, force: true })
+        expect(await fs.existPath(cachedFilePath)).toBeFalsy()
+        expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()
+      } finally {
+        await storage.stop?.()
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
     })
 
     it(`When the cache exceeds max size, then LRU files are evicted`, async () => {
@@ -257,32 +263,37 @@ describe('fileSystemContentStorage', () => {
         tmpDir,
         { decompressCacheMaxSize: 150, decompressCacheEvictionInterval: 30 }
       )
+      await storage.start?.({} as any)
       const cachedFilePath1 = path.join(tmpDir, '9584', id)
       const cachedFilePath2 = path.join(tmpDir, 'ea6c', id2)
 
-      // Store two 100-byte files as gzip-only
-      const data = Buffer.from(new Uint8Array(100).fill(0))
-      await storage.storeStreamAndCompress(id, bufferToStream(data))
-      await storage.storeStreamAndCompress(id2, bufferToStream(Buffer.from(new Uint8Array(100).fill(1))))
+      try {
+        // Store two 100-byte files as gzip-only
+        const data = Buffer.from(new Uint8Array(100).fill(0))
+        await storage.storeStreamAndCompress(id, bufferToStream(data))
+        await storage.storeStreamAndCompress(id2, bufferToStream(Buffer.from(new Uint8Array(100).fill(1))))
 
-      // Trigger cache for first file
-      await storage.retrieve(id, { start: 0, end: 9 })
-      expect(await fs.existPath(cachedFilePath1)).toBeTruthy()
+        // Trigger cache for first file
+        await storage.retrieve(id, { start: 0, end: 9 })
+        expect(await fs.existPath(cachedFilePath1)).toBeTruthy()
 
-      // Small delay so id2 has a newer lastAccess
-      await new Promise((r) => setTimeout(r, 10))
+        // Small delay so id2 has a newer lastAccess
+        await new Promise((r) => setTimeout(r, 10))
 
-      // Trigger cache for second file — total cache now exceeds 150 bytes
-      await storage.retrieve(id2, { start: 0, end: 9 })
-      expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
+        // Trigger cache for second file — total cache now exceeds 150 bytes
+        await storage.retrieve(id2, { start: 0, end: 9 })
+        expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
 
-      // Wait for eviction interval to run
-      await new Promise((r) => setTimeout(r, 80))
+        // Wait for eviction interval to run
+        await new Promise((r) => setTimeout(r, 80))
 
-      // LRU file (id, accessed first) should be evicted, id2 should remain
-      expect(await fs.existPath(cachedFilePath1)).toBeFalsy()
-      expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
-      rmSync(tmpDir, { recursive: true, force: true })
+        // LRU file (id, accessed first) should be evicted, id2 should remain
+        expect(await fs.existPath(cachedFilePath1)).toBeFalsy()
+        expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
+      } finally {
+        await storage.stop?.()
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
     })
   })
 

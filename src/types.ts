@@ -1,6 +1,6 @@
 import { Readable } from 'stream'
 import { IFileSystemComponent } from './fs/types'
-import { IConfigComponent, ILoggerComponent } from '@well-known-components/interfaces'
+import { IBaseComponent, IConfigComponent, ILoggerComponent } from '@well-known-components/interfaces'
 /**
  * @public
  */
@@ -13,7 +13,7 @@ export type AppComponents = {
 /**
  * @public
  */
-export type IContentStorageComponent = {
+export type IContentStorageComponent = IBaseComponent & {
   storeStream(fileId: string, content: Readable): Promise<void>
   storeStreamAndCompress(fileId: string, content: Readable): Promise<void>
   delete(fileIds: string[]): Promise<void>

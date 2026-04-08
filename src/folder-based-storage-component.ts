@@ -74,8 +74,7 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  const evictionTimer = setInterval(evictCache, CACHE_EVICTION_INTERVAL)
-  evictionTimer.unref()
+  let evictionTimer: ReturnType<typeof setInterval> | undefined
 
   async function getFilePath(id: string): Promise<string> {
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
@@ -236,6 +235,17 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   return {
+    async start(_startOptions: any) {
+      evictionTimer = setInterval(evictCache, CACHE_EVICTION_INTERVAL)
+      evictionTimer.unref()
+    },
+    async stop() {
+      if (evictionTimer) {
+        clearInterval(evictionTimer)
+        evictionTimer = undefined
+      }
+      await evictCache()
+    },
     storeStream,
     retrieve,
     exist,
