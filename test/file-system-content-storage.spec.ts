@@ -181,13 +181,14 @@ describe('fileSystemContentStorage', () => {
     expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('Hello'))
   })
 
-  it(`When content is stored compressed (gzip only), then a range retrieve returns undefined`, async () => {
+  it(`When content is stored compressed (gzip only), then a range retrieve decompresses and serves the range`, async () => {
     const data = Buffer.from(new Uint8Array(100).fill(0))
     await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
 
-    // The original uncompressed file was deleted, and range requests skip gzip
     const item = await fileSystemContentStorage.retrieve(id, { start: 0, end: 9 })
-    expect(item).toBeUndefined()
+    expect(item).toBeDefined()
+    expect(item!.size).toBe(10)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
   })
 
   it(`When content is stored, then we can check file info`, async function () {

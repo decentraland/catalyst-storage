@@ -103,6 +103,49 @@ export async function createFolderBasedFileSystemContentStorage(
       let contentItem: ContentItem | undefined = undefined
       if (!range) contentItem = await retrieveWithEncoding(id, 'gzip')
       if (!contentItem) contentItem = await retrieveWithEncoding(id, null, range)
+
+      // If range was requested but uncompressed file doesn't exist, fall back to
+      // decompressing the gzip file and extracting only the requested range.
+      // We stream-decompress, skip bytes before range.start, and collect bytes
+      // until range.end — only the range portion is buffered in memory.
+      if (!contentItem && range) {
+        const gzipItem = await retrieveWithEncoding(id, 'gzip')
+        if (gzipItem) {
+          if (range.start < 0 || range.start > range.end) {
+            throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
+          }
+          const decompressedStream = await gzipItem.asStream()
+          const chunks: Buffer[] = []
+          let offset = 0
+
+          await new Promise<void>((resolve, reject) => {
+            decompressedStream.on('error', reject)
+            decompressedStream.on('data', (chunk: Buffer) => {
+              const chunkStart = offset
+              const chunkEnd = offset + chunk.length - 1
+              offset += chunk.length
+
+              if (chunkEnd < range.start) return // before range, skip
+              if (chunkStart > range.end) {
+                decompressedStream.destroy() // past range, stop
+                return
+              }
+
+              const sliceStart = Math.max(0, range.start - chunkStart)
+              const sliceEnd = Math.min(chunk.length, range.end - chunkStart + 1)
+              chunks.push(chunk.subarray(sliceStart, sliceEnd))
+            })
+            decompressedStream.on('end', resolve)
+            decompressedStream.on('close', resolve)
+          })
+
+          const result = Buffer.concat(chunks)
+          if (result.length > 0) {
+            return SimpleContentItem.fromBuffer(result)
+          }
+        }
+      }
+
       return contentItem
     } catch (error: any) {
       if (error instanceof RangeError) throw error
