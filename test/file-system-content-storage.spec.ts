@@ -376,12 +376,12 @@ describe('fileSystemContentStorage', () => {
       }
     })
 
-    it(`When stop() is called, then expired cached files are evicted`, async () => {
+    it(`When stop() is called, then all cached files are evicted regardless of TTL`, async () => {
       const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-cache-'))
       const storage = await createFolderBasedFileSystemContentStorage(
         { fs, logs: await createLogComponent({}) },
         tmpDir,
-        { decompressCacheTTL: 60000, decompressCacheEvictionInterval: 999999 }
+        { decompressCacheTTL: 999999, decompressCacheEvictionInterval: 999999 }
       )
       const cachedFilePath = path.join(tmpDir, '9584', id)
 
@@ -391,10 +391,7 @@ describe('fileSystemContentStorage', () => {
         await storage.retrieve(id, { start: 0, end: 9 })
         expect(await fs.existPath(cachedFilePath)).toBeTruthy()
 
-        // Advance past TTL (but eviction interval is very long, so timer won't fire)
-        jest.advanceTimersByTime(60001)
-
-        // stop() should run a final eviction pass
+        // stop() should evict all cached files even though TTL hasn't expired
         await storage.stop?.()
         expect(await fs.existPath(cachedFilePath)).toBeFalsy()
         expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()

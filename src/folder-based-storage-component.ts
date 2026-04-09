@@ -191,7 +191,13 @@ export async function createFolderBasedFileSystemContentStorage(
           if (!decompressPromise) {
             decompressPromise = (async () => {
               const decompressed = await streamToBuffer(await gzipItem.asStream())
-              await pipe(Readable.from(decompressed), components.fs.createWriteStream(uncompressedPath))
+              try {
+                await pipe(Readable.from(decompressed), components.fs.createWriteStream(uncompressedPath))
+              } catch (err) {
+                // Remove partial file to prevent serving corrupt data
+                await noFailUnlink(uncompressedPath)
+                throw err
+              }
 
               const size = decompressed.length
               decompressCache.set(uncompressedPath, { size, lastAccess: Date.now() })
@@ -266,7 +272,12 @@ export async function createFolderBasedFileSystemContentStorage(
         clearInterval(evictionTimer)
         evictionTimer = undefined
       }
-      await evictCache()
+      // Evict all cached files on shutdown to prevent disk leaks across restarts
+      for (const [filePath, entry] of decompressCache) {
+        await noFailUnlink(filePath)
+        totalCacheSize -= entry.size
+        decompressCache.delete(filePath)
+      }
     },
     storeStream,
     retrieve,
