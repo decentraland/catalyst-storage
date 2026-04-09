@@ -295,7 +295,7 @@ export async function createFolderBasedFileSystemContentStorage(
     retrieve,
     exist,
     async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
-      removeCacheEntry(await getFilePath(id))
+      await removeCacheEntry(await getFilePath(id))
       await storeStream(id, stream)
       if (await compressContentFile(await getFilePath(id))) {
         // try to remove original file if present
@@ -308,7 +308,7 @@ export async function createFolderBasedFileSystemContentStorage(
     async delete(ids: string[]): Promise<void> {
       for (const id of ids) {
         const filePath = await getFilePath(id)
-        removeCacheEntry(filePath)
+        await removeCacheEntry(filePath)
         await noFailUnlink(filePath)
         await noFailUnlink(filePath + '.gzip')
       }
