@@ -112,7 +112,7 @@ export async function createS3BasedFileSystemContentStorage(
 
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
 
-      const clampedEnd = range && obj.ContentLength != null ? Math.min(range.end, obj.ContentLength - 1) : range?.end
+      const clampedEnd = range && obj.ContentLength !== undefined && obj.ContentLength !== null ? Math.min(range.end, obj.ContentLength - 1) : range?.end
 
       if (range && clampedEnd !== undefined && range.start > clampedEnd) {
         throw new RangeError(`Range start ${range.start} exceeds file size ${obj.ContentLength}`)
