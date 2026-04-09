@@ -34,6 +34,9 @@ export function createInMemoryStorage(): IContentStorageComponent {
           throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
         }
         const clampedEnd = Math.min(range.end, content.length - 1)
+        if (range.start > clampedEnd) {
+          throw new RangeError(`Range start ${range.start} exceeds content size ${content.length}`)
+        }
         return SimpleContentItem.fromBuffer(content.subarray(range.start, clampedEnd + 1))
       }
       return SimpleContentItem.fromBuffer(content)

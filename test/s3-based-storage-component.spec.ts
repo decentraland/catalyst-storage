@@ -169,6 +169,11 @@ describe('S3 Storage', () => {
     await expect(storage.retrieve(id, { start: -1, end: 2 })).rejects.toThrow(RangeError)
   })
 
+  it(`When a range with start past end of file is requested, then it throws a RangeError`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await expect(storage.retrieve(id, { start: 10, end: 20 })).rejects.toThrow(RangeError)
+  })
+
   async function retrieveAndExpectStoredContentToBe(idToRetrieve: string, expectedContent: Buffer) {
     const retrievedContent = await storage.retrieve(idToRetrieve)
     expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(expectedContent)

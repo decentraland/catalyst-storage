@@ -119,6 +119,9 @@ export async function createFolderBasedFileSystemContentStorage(
           throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
         }
         const clampedEnd = Math.min(range.end, stat.size - 1)
+        if (range.start > clampedEnd) {
+          throw new RangeError(`Range start ${range.start} exceeds file size ${stat.size}`)
+        }
         return new SimpleContentItem(
           async () => components.fs.createReadStream(filePath, { start: range.start, end: clampedEnd }),
           clampedEnd - range.start + 1,
@@ -183,10 +186,10 @@ export async function createFolderBasedFileSystemContentStorage(
           const uncompressedPath = await getFilePath(id)
 
           // Wait for any in-flight decompression of the same file, or start one
-          if (inflightDecompressions.has(uncompressedPath)) {
-            await inflightDecompressions.get(uncompressedPath)
-          } else {
-            const decompressPromise = (async () => {
+          let decompressPromise = inflightDecompressions.get(uncompressedPath)
+          const isOwner = !decompressPromise
+          if (!decompressPromise) {
+            decompressPromise = (async () => {
               const decompressed = await streamToBuffer(await gzipItem.asStream())
               await pipe(Readable.from(decompressed), components.fs.createWriteStream(uncompressedPath))
 
@@ -195,11 +198,11 @@ export async function createFolderBasedFileSystemContentStorage(
               totalCacheSize += size
             })()
             inflightDecompressions.set(uncompressedPath, decompressPromise)
-            try {
-              await decompressPromise
-            } finally {
-              inflightDecompressions.delete(uncompressedPath)
-            }
+          }
+          try {
+            await decompressPromise
+          } finally {
+            if (isOwner) inflightDecompressions.delete(uncompressedPath)
           }
 
           // Serve range from the cached uncompressed file
@@ -225,7 +228,11 @@ export async function createFolderBasedFileSystemContentStorage(
       if (entry.isDirectory()) {
         yield* allFileIdsRec(path.resolve(folder, entry.name), prefix)
       } else if (!prefix || entry.name.startsWith(prefix)) {
-        yield entry.name.replace(/\.gzip/, '')
+        const baseName = entry.name.replace(/\.gzip$/, '')
+        // Skip cached uncompressed files when the .gzip version also exists
+        if (baseName !== entry.name || !(await components.fs.existPath(path.resolve(folder, baseName + '.gzip')))) {
+          yield baseName
+        }
       }
     }
   }
@@ -265,6 +272,7 @@ export async function createFolderBasedFileSystemContentStorage(
     retrieve,
     exist,
     async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
+      removeCacheEntry(await getFilePath(id))
       await storeStream(id, stream)
       if (await compressContentFile(await getFilePath(id))) {
         // try to remove original file if present

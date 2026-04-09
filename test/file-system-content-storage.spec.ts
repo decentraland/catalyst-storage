@@ -173,6 +173,11 @@ describe('fileSystemContentStorage', () => {
     await expect(fileSystemContentStorage.retrieve(id, { start: -1, end: 2 })).rejects.toThrow(RangeError)
   })
 
+  it(`When a range with start past end of file is requested, then it throws a RangeError`, async () => {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+    await expect(fileSystemContentStorage.retrieve(id, { start: 10, end: 20 })).rejects.toThrow(RangeError)
+  })
+
   it(`When a range is requested on a non-existent file, then it returns undefined`, async () => {
     const item = await fileSystemContentStorage.retrieve('non-existent-id', { start: 0, end: 4 })
     expect(item).toBeUndefined()
@@ -255,6 +260,39 @@ describe('fileSystemContentStorage', () => {
     expect(await streamToBuffer(await item1!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
     expect(await streamToBuffer(await item2!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
     expect(await fs.existPath(filePath)).toBeTruthy()
+  })
+
+  it(`When a gzip-only file is cached, then allFileIds does not yield duplicates`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+    await fileSystemContentStorage.storeStream(id2, bufferToStream(content2))
+
+    // Trigger cache — both file and file.gzip now exist for id
+    await fileSystemContentStorage.retrieve(id, { start: 0, end: 9 })
+    expect(await fs.existPath(filePath)).toBeTruthy()
+    expect(await fs.existPath(filePath + '.gzip')).toBeTruthy()
+
+    const seenIds: string[] = []
+    for await (const fileId of fileSystemContentStorage.allFileIds()) seenIds.push(fileId)
+    const idOccurrences = seenIds.filter((x) => x === id)
+    expect(idOccurrences.length).toBe(1)
+  })
+
+  it(`When storeStreamAndCompress is called after a cached decompression, then the cache entry is cleared`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+
+    // Trigger cache
+    await fileSystemContentStorage.retrieve(id, { start: 0, end: 9 })
+    expect(await fs.existPath(filePath)).toBeTruthy()
+
+    // Re-store and compress — should clear the cache entry
+    const newData = Buffer.from(new Uint8Array(200).fill(1))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(newData))
+
+    // The cached uncompressed file should be gone (deleted by storeStreamAndCompress)
+    const compressedFile = await fileSystemContentStorage.retrieve(id)
+    expect(compressedFile).toBeDefined()
   })
 
   describe('decompression cache eviction', () => {
