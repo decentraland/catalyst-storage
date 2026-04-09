@@ -59,8 +59,9 @@ export async function createFolderBasedFileSystemContentStorage(
     // TTL eviction
     for (const [filePath, entry] of decompressCache) {
       if (now - entry.lastAccess > CACHE_TTL) {
-        await noFailUnlink(filePath)
-        totalCacheSize -= entry.size
+        if (await noFailUnlink(filePath)) {
+          totalCacheSize -= entry.size
+        }
         decompressCache.delete(filePath)
       }
     }
@@ -70,8 +71,9 @@ export async function createFolderBasedFileSystemContentStorage(
       const sorted = [...decompressCache.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess)
       for (const [filePath, entry] of sorted) {
         if (totalCacheSize <= CACHE_MAX_SIZE) break
-        await noFailUnlink(filePath)
-        totalCacheSize -= entry.size
+        if (await noFailUnlink(filePath)) {
+          totalCacheSize -= entry.size
+        }
         decompressCache.delete(filePath)
       }
     }
@@ -135,22 +137,31 @@ export async function createFolderBasedFileSystemContentStorage(
     return undefined
   }
 
-  const noFailUnlink = async (path: string) => {
+  const noFailUnlink = async (path: string): Promise<boolean> => {
     try {
       await components.fs.unlink(path)
+      return true
     } catch (error) {
-      // Ignore these errors
+      return false
     }
   }
 
   const storeStream = async (id: string, stream: Readable): Promise<void> => {
-    await pipe(stream, components.fs.createWriteStream(await getFilePath(id)))
+    const filePath = await getFilePath(id)
+    try {
+      await pipe(stream, components.fs.createWriteStream(filePath))
+    } catch (err) {
+      await noFailUnlink(filePath)
+      throw err
+    }
   }
 
-  function removeCacheEntry(filePath: string) {
+  async function removeCacheEntry(filePath: string) {
     const entry = decompressCache.get(filePath)
     if (entry) {
-      totalCacheSize -= entry.size
+      if (await noFailUnlink(filePath)) {
+        totalCacheSize -= entry.size
+      }
       decompressCache.delete(filePath)
     }
   }
@@ -274,8 +285,9 @@ export async function createFolderBasedFileSystemContentStorage(
       }
       // Evict all cached files on shutdown to prevent disk leaks across restarts
       for (const [filePath, entry] of decompressCache) {
-        await noFailUnlink(filePath)
-        totalCacheSize -= entry.size
+        if (await noFailUnlink(filePath)) {
+          totalCacheSize -= entry.size
+        }
         decompressCache.delete(filePath)
       }
     },
