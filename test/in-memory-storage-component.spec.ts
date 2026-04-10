@@ -173,8 +173,8 @@ describe('storage mock', () => {
 
     const exists = await storage.fileInfoMultiple([id])
 
-    expect(exists.get(id)).toEqual({ encoding: null, size: 3 })
-    expect(await storage.fileInfo(id)).toEqual({ encoding: null, size: 3 })
+    expect(exists.get(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
+    expect(await storage.fileInfo(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
   })
 
   it(`When multiple files exist, then fileInfoMultiple returns correct results for existing and non-existing keys`, async () => {
@@ -182,8 +182,17 @@ describe('storage mock', () => {
     await storage.storeStream(id2, bufferToStream(content2))
 
     const result = await storage.fileInfoMultiple([id, id2, 'non-existent'])
-    expect(result.get(id)).toEqual({ encoding: null, size: 3 })
-    expect(result.get(id2)).toEqual({ encoding: null, size: 3 })
+    expect(result.get(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
+    expect(result.get(id2)).toEqual({ encoding: null, size: 3, contentSize: 3 })
     expect(result.get('non-existent')).toBeUndefined()
+  })
+
+  it(`When content is stored, then fileInfo returns contentSize equal to size`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+
+    const info = await storage.fileInfo(id)
+    expect(info).toBeDefined()
+    expect(info!.contentSize).toBe(info!.size)
+    expect(info!.contentSize).toBe(3)
   })
 })

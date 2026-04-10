@@ -3,7 +3,7 @@ import path from 'path'
 import { pipeline, Readable } from 'stream'
 import { promisify } from 'util'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
-import { SimpleContentItem } from './content-item'
+import { SimpleContentItem, streamToBuffer } from './content-item'
 import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
@@ -257,6 +257,23 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  async function readGzipOriginalSize(filePath: string, gzipSize: number): Promise<number | null> {
+    // The gzip format (RFC 1952) stores the original uncompressed size in its
+    // trailer — the last 4 bytes (ISIZE field, uint32 little-endian).
+    // This works for files < 4GB (ISIZE is mod 2^32).
+    if (gzipSize < 8) return null // Too small to be a valid gzip file
+    try {
+      const stream = components.fs.createReadStream(filePath, {
+        start: gzipSize - 4,
+        end: gzipSize - 1
+      })
+      const buffer = await streamToBuffer(stream)
+      return buffer.readUInt32LE(0)
+    } catch {
+      return null
+    }
+  }
+
   async function fileInfo(id: string): Promise<FileInfo | undefined> {
     const possibleEncondings = ['gzip', null]
     const baseFilePath = await getFilePath(id)
@@ -266,9 +283,18 @@ export async function createFolderBasedFileSystemContentStorage(
       const filePath = baseFilePath + extension
       if (await components.fs.existPath(filePath)) {
         const stat = await components.fs.stat(filePath)
+        if (encoding === 'gzip') {
+          const contentSize = await readGzipOriginalSize(filePath, stat.size)
+          return {
+            size: stat.size,
+            encoding,
+            contentSize
+          }
+        }
         return {
           size: stat.size,
-          encoding
+          encoding,
+          contentSize: stat.size
         }
       }
     }

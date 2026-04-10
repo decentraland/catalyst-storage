@@ -204,8 +204,8 @@ describe('S3 Storage', () => {
 
     const exists = await storage.fileInfoMultiple([id])
 
-    expect(exists.get(id)).toEqual({ encoding: null, size: 3 })
-    expect(await storage.fileInfo(id)).toEqual({ encoding: null, size: 3 })
+    expect(exists.get(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
+    expect(await storage.fileInfo(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
 
     expect(await storage.fileInfo('non-existent-id')).toBeUndefined()
   })
@@ -215,8 +215,8 @@ describe('S3 Storage', () => {
     await storage.storeStream(id2, bufferToStream(content2))
 
     const result = await storage.fileInfoMultiple([id, id2, 'non-existent'])
-    expect(result.get(id)).toEqual({ encoding: null, size: 3 })
-    expect(result.get(id2)).toEqual({ encoding: null, size: 3 })
+    expect(result.get(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
+    expect(result.get(id2)).toEqual({ encoding: null, size: 3, contentSize: 3 })
     expect(result.get('non-existent')).toBeUndefined()
   })
 })
@@ -235,7 +235,7 @@ describe('S3 Storage edge cases', () => {
     const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
 
     const info = await storage.fileInfo('empty-file')
-    expect(info).toEqual({ encoding: null, size: 0 })
+    expect(info).toEqual({ encoding: null, size: 0, contentSize: 0 })
   })
 
   it(`When headObject returns no ContentLength, then a range retrieve returns null size`, async () => {

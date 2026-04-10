@@ -495,6 +495,25 @@ describe('fileSystemContentStorage', () => {
     expect(info!.size).toBeLessThan(100)
   })
 
+  it(`When content is stored compressed (gzip only), then fileInfo returns the correct contentSize from the gzip trailer`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+
+    const info = await fileSystemContentStorage.fileInfo(id)
+    expect(info).toBeDefined()
+    expect(info!.encoding).toBe('gzip')
+    expect(info!.contentSize).toBe(100)
+  })
+
+  it(`When content is stored uncompressed, then fileInfo returns contentSize equal to size`, async () => {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+
+    const info = await fileSystemContentStorage.fileInfo(id)
+    expect(info).toBeDefined()
+    expect(info!.contentSize).toBe(info!.size)
+    expect(info!.contentSize).toBe(3)
+  })
+
   it(`When a cached file is accessed via range, then its lastAccess is updated and it survives LRU eviction`, async () => {
     jest.useFakeTimers()
     const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-touch-'))
@@ -561,10 +580,10 @@ describe('fileSystemContentStorage', () => {
 
     const exists = await fileSystemContentStorage.fileInfoMultiple([id, id2])
 
-    expect(exists.get(id)).toEqual({ encoding: null, size: 3 })
-    expect(exists.get(id2)).toEqual({ encoding: null, size: 3 })
-    expect(await fileSystemContentStorage.fileInfo(id)).toEqual({ encoding: null, size: 3 })
-    expect(await fileSystemContentStorage.fileInfo(id2)).toEqual({ encoding: null, size: 3 })
+    expect(exists.get(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
+    expect(exists.get(id2)).toEqual({ encoding: null, size: 3, contentSize: 3 })
+    expect(await fileSystemContentStorage.fileInfo(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
+    expect(await fileSystemContentStorage.fileInfo(id2)).toEqual({ encoding: null, size: 3, contentSize: 3 })
     expect(await fileSystemContentStorage.fileInfo('non-existent-id')).toBeUndefined()
   })
 })

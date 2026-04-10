@@ -9,11 +9,12 @@ export class SimpleContentItem implements ContentItem {
   constructor(
     private streamCreator: () => Promise<Readable>,
     public size: number | null,
-    public encoding: string | null
+    public encoding: string | null,
+    public contentSize: number | null = size
   ) {}
 
   static fromBuffer(buffer: Uint8Array): SimpleContentItem {
-    return new SimpleContentItem(async () => bufferToStream(buffer), buffer.length, null)
+    return new SimpleContentItem(async () => bufferToStream(buffer), buffer.length, null, buffer.length)
   }
 
   /**
