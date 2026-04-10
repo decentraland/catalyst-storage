@@ -176,4 +176,14 @@ describe('storage mock', () => {
     expect(exists.get(id)).toEqual({ encoding: null, size: 3 })
     expect(await storage.fileInfo(id)).toEqual({ encoding: null, size: 3 })
   })
+
+  it(`When multiple files exist, then fileInfoMultiple returns correct results for existing and non-existing keys`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await storage.storeStream(id2, bufferToStream(content2))
+
+    const result = await storage.fileInfoMultiple([id, id2, 'non-existent'])
+    expect(result.get(id)).toEqual({ encoding: null, size: 3 })
+    expect(result.get(id2)).toEqual({ encoding: null, size: 3 })
+    expect(result.get('non-existent')).toBeUndefined()
+  })
 })

@@ -159,13 +159,15 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  async function removeCacheEntry(filePath: string) {
+  async function removeCacheEntry(filePath: string): Promise<boolean> {
     const entry = decompressCache.get(filePath)
     if (entry) {
       await noFailUnlink(filePath)
       totalCacheSize -= entry.size
       decompressCache.delete(filePath)
+      return true
     }
+    return false
   }
 
   function touchCacheEntry(filePath: string) {
@@ -191,14 +193,14 @@ export async function createFolderBasedFileSystemContentStorage(
       // If range was requested but uncompressed file doesn't exist, fall back to
       // decompressing the gzip file, writing it to disk as a cache, and serving the range.
       if (!contentItem && range) {
-        const gzipItem = await retrieveWithEncoding(id, 'gzip')
-        if (gzipItem) {
-          const uncompressedPath = await getFilePath(id)
+        const uncompressedPath = await getFilePath(id)
 
-          // Wait for any in-flight decompression of the same file, or start one
-          let decompressPromise = inflightDecompressions.get(uncompressedPath)
-          const isOwner = !decompressPromise
-          if (!decompressPromise) {
+        // Wait for any in-flight decompression of the same file, or start one
+        let decompressPromise = inflightDecompressions.get(uncompressedPath)
+        const isOwner = !decompressPromise
+        if (!decompressPromise) {
+          const gzipItem = await retrieveWithEncoding(id, 'gzip')
+          if (gzipItem) {
             decompressPromise = (async () => {
               try {
                 await pipe(await gzipItem.asStream(), components.fs.createWriteStream(uncompressedPath))
@@ -214,6 +216,8 @@ export async function createFolderBasedFileSystemContentStorage(
             })()
             inflightDecompressions.set(uncompressedPath, decompressPromise)
           }
+        }
+        if (decompressPromise) {
           try {
             await decompressPromise
           } finally {
@@ -234,7 +238,8 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   async function exist(id: string): Promise<boolean> {
-    return !!(await retrieve(id))
+    const filePath = await getFilePath(id)
+    return (await components.fs.existPath(filePath + '.gzip')) || (await components.fs.existPath(filePath))
   }
 
   const allFileIdsRec = async function* (folder: string, prefix?: string): AsyncIterable<string> {
@@ -281,6 +286,8 @@ export async function createFolderBasedFileSystemContentStorage(
         clearInterval(evictionTimer)
         evictionTimer = undefined
       }
+      // Wait for any inflight decompressions to finish before cleaning up
+      await Promise.allSettled(inflightDecompressions.values())
       // Evict all cached files on shutdown to prevent disk leaks across restarts
       for (const [filePath, entry] of decompressCache) {
         await noFailUnlink(filePath)
@@ -292,21 +299,24 @@ export async function createFolderBasedFileSystemContentStorage(
     retrieve,
     exist,
     async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
-      await removeCacheEntry(await getFilePath(id))
+      const filePath = await getFilePath(id)
+      await removeCacheEntry(filePath)
       await storeStream(id, stream)
-      if (await compressContentFile(await getFilePath(id))) {
+      if (await compressContentFile(filePath)) {
         // try to remove original file if present
         const contentItem = await retrieve(id)
         if (contentItem?.encoding) {
-          await noFailUnlink(await getFilePath(id))
+          await noFailUnlink(filePath)
         }
       }
     },
     async delete(ids: string[]): Promise<void> {
       for (const id of ids) {
         const filePath = await getFilePath(id)
-        await removeCacheEntry(filePath)
-        await noFailUnlink(filePath)
+        const wasCached = await removeCacheEntry(filePath)
+        if (!wasCached) {
+          await noFailUnlink(filePath)
+        }
         await noFailUnlink(filePath + '.gzip')
       }
     },

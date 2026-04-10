@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from 'fs'
+import { createHash } from 'crypto'
+import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
 import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
@@ -371,6 +372,41 @@ describe('fileSystemContentStorage', () => {
       }
     })
 
+    it(`When the cache is evicted by TTL, then a subsequent range request re-decompresses successfully`, async () => {
+      const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-cache-'))
+      const storage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        tmpDir,
+        { decompressCacheTTL: 60000, decompressCacheEvictionInterval: 30000 }
+      )
+      await storage.start?.({} as any)
+      const cachedFilePath = path.join(tmpDir, '9584', id)
+
+      try {
+        const data = Buffer.from(new Uint8Array(100).fill(0))
+        await storage.storeStreamAndCompress(id, bufferToStream(data))
+
+        // First range request — triggers decompression and cache
+        const item1 = await storage.retrieve(id, { start: 0, end: 9 })
+        expect(item1).toBeDefined()
+        expect(await fs.existPath(cachedFilePath)).toBeTruthy()
+
+        // Advance past TTL + eviction interval to evict
+        await jest.advanceTimersByTimeAsync(60000 + 30000)
+        expect(await fs.existPath(cachedFilePath)).toBeFalsy()
+
+        // Second range request — should re-decompress and serve correctly
+        const item2 = await storage.retrieve(id, { start: 50, end: 59 })
+        expect(item2).toBeDefined()
+        expect(item2!.size).toBe(10)
+        expect(await streamToBuffer(await item2!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
+        expect(await fs.existPath(cachedFilePath)).toBeTruthy()
+      } finally {
+        await storage.stop?.()
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
     it(`When stop() is called, then all cached files are evicted regardless of TTL`, async () => {
       const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-cache-'))
       const storage = await createFolderBasedFileSystemContentStorage(
@@ -394,6 +430,129 @@ describe('fileSystemContentStorage', () => {
         rmSync(tmpDir, { recursive: true, force: true })
       }
     })
+  })
+
+  it(`When decompression fails due to a corrupt gzip file, then the partial file is cleaned up and retrieve returns undefined`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-corrupt-'))
+    const storage = await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, tmpDir)
+    const corruptId = 'corrupt-file'
+    // sha1('corrupt-file') = first 4 chars
+    const hash = createHash('sha1').update(corruptId).digest('hex').substring(0, 4)
+    const gzipPath = path.join(tmpDir, hash, corruptId + '.gzip')
+    const uncompressedPath = path.join(tmpDir, hash, corruptId)
+
+    try {
+      // Write garbage data as a .gzip file to simulate corruption
+      await fs.mkdir(path.join(tmpDir, hash), { recursive: true })
+      await nodeFs.writeFile(gzipPath, Buffer.from('this is not valid gzip data'))
+
+      // Range request should trigger decompression which fails
+      const item = await storage.retrieve(corruptId, { start: 0, end: 4 })
+      expect(item).toBeUndefined()
+
+      // The partial uncompressed file should have been cleaned up
+      expect(await fs.existPath(uncompressedPath)).toBeFalsy()
+    } finally {
+      await storage.stop?.()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it(`When content is stored compressed (gzip only), then exist returns true`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+    // Verify only .gzip exists on disk
+    expect(await fs.existPath(filePath)).toBeFalsy()
+    expect(await fs.existPath(filePath + '.gzip')).toBeTruthy()
+
+    expect(await fileSystemContentStorage.exist(id)).toBe(true)
+  })
+
+  it(`When content does not exist, then exist returns false`, async () => {
+    expect(await fileSystemContentStorage.exist('non-existent-id')).toBe(false)
+  })
+
+  it(`When multiple content is stored, then existMultiple returns correct results`, async () => {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id2, bufferToStream(data))
+
+    const result = await fileSystemContentStorage.existMultiple([id, id2, 'non-existent'])
+    expect(result.get(id)).toBe(true)
+    expect(result.get(id2)).toBe(true)
+    expect(result.get('non-existent')).toBe(false)
+  })
+
+  it(`When content is stored compressed (gzip only), then fileInfo returns compressed encoding and size`, async () => {
+    const data = Buffer.from(new Uint8Array(100).fill(0))
+    await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
+
+    const info = await fileSystemContentStorage.fileInfo(id)
+    expect(info).toBeDefined()
+    expect(info!.encoding).toBe('gzip')
+    expect(info!.size).toBeDefined()
+    expect(info!.size).toBeGreaterThan(0)
+    expect(info!.size).toBeLessThan(100)
+  })
+
+  it(`When a cached file is accessed via range, then its lastAccess is updated and it survives LRU eviction`, async () => {
+    jest.useFakeTimers()
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-touch-'))
+    const storage = await createFolderBasedFileSystemContentStorage(
+      { fs, logs: await createLogComponent({}) },
+      tmpDir,
+      { decompressCacheMaxSize: 150, decompressCacheEvictionInterval: 30000 }
+    )
+    await storage.start?.({} as any)
+    const cachedFilePath1 = path.join(tmpDir, '9584', id)
+    const cachedFilePath2 = path.join(tmpDir, 'ea6c', id2)
+
+    try {
+      const data = Buffer.from(new Uint8Array(100).fill(0))
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+      await storage.storeStreamAndCompress(id2, bufferToStream(Buffer.from(new Uint8Array(100).fill(1))))
+
+      // Trigger cache for both files
+      await storage.retrieve(id, { start: 0, end: 9 })
+      jest.advanceTimersByTime(1000)
+      await storage.retrieve(id2, { start: 0, end: 9 })
+
+      // Now touch id (the older one) so it becomes most-recently-accessed
+      jest.advanceTimersByTime(1000)
+      await storage.retrieve(id, { start: 0, end: 9 })
+
+      // Advance past eviction interval
+      await jest.advanceTimersByTimeAsync(30000)
+
+      // id2 (least recently accessed) should be evicted, id should remain
+      expect(await fs.existPath(cachedFilePath1)).toBeTruthy()
+      expect(await fs.existPath(cachedFilePath2)).toBeFalsy()
+    } finally {
+      await storage.stop?.()
+      rmSync(tmpDir, { recursive: true, force: true })
+      jest.useRealTimers()
+    }
+  })
+
+  it(`When start() is not called, then range requests and caching still work`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-nostart-'))
+    const storage = await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, tmpDir)
+    // Intentionally do NOT call storage.start()
+    const cachedFilePath = path.join(tmpDir, '9584', id)
+
+    try {
+      const data = Buffer.from(new Uint8Array(100).fill(0))
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+
+      const item = await storage.retrieve(id, { start: 0, end: 9 })
+      expect(item).toBeDefined()
+      expect(item!.size).toBe(10)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from(new Uint8Array(10).fill(0)))
+      expect(await fs.existPath(cachedFilePath)).toBeTruthy()
+    } finally {
+      await storage.stop?.()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
   })
 
   it(`When content is stored, then we can check file info`, async function () {

@@ -209,4 +209,49 @@ describe('S3 Storage', () => {
 
     expect(await storage.fileInfo('non-existent-id')).toBeUndefined()
   })
+
+  it(`When multiple files exist, then fileInfoMultiple returns correct results for existing and non-existing keys`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await storage.storeStream(id2, bufferToStream(content2))
+
+    const result = await storage.fileInfoMultiple([id, id2, 'non-existent'])
+    expect(result.get(id)).toEqual({ encoding: null, size: 3 })
+    expect(result.get(id2)).toEqual({ encoding: null, size: 3 })
+    expect(result.get('non-existent')).toBeUndefined()
+  })
+})
+
+describe('S3 Storage edge cases', () => {
+  it(`When a file has ContentLength 0, then fileInfo returns size 0 instead of null`, async () => {
+    const headObjectResponse = { ETag: '"abc"', ContentLength: 0, ContentEncoding: undefined }
+    const mockS3 = {
+      headObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve(headObjectResponse) }),
+      upload: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      getObject: jest.fn().mockReturnValue({ createReadStream: () => bufferToStream(Buffer.alloc(0)) }),
+      deleteObjects: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      listObjectsV2: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Contents: [], IsTruncated: false }) })
+    }
+    const logs = await createLogComponent({})
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
+
+    const info = await storage.fileInfo('empty-file')
+    expect(info).toEqual({ encoding: null, size: 0 })
+  })
+
+  it(`When headObject returns no ContentLength, then a range retrieve returns null size`, async () => {
+    const headObjectResponse = { ETag: '"abc"', ContentEncoding: undefined }
+    const mockS3 = {
+      headObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve(headObjectResponse) }),
+      upload: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      getObject: jest.fn().mockReturnValue({ createReadStream: () => bufferToStream(Buffer.from('Hello')) }),
+      deleteObjects: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      listObjectsV2: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Contents: [], IsTruncated: false }) })
+    }
+    const logs = await createLogComponent({})
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
+
+    const item = await storage.retrieve('some-file', { start: 0, end: 4 })
+    expect(item).toBeDefined()
+    expect(item!.size).toBeNull()
+  })
 })

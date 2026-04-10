@@ -109,10 +109,8 @@ export async function createS3BasedFileSystemContentStorage(
     try {
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
 
-      const clampedEnd =
-        range && obj.ContentLength !== undefined && obj.ContentLength !== null
-          ? clampRange(range, obj.ContentLength)
-          : range?.end
+      const size = obj.ContentLength ?? null
+      const clampedEnd = range && size !== null ? clampRange(range, size) : undefined
 
       return new SimpleContentItem(
         async () =>
@@ -120,10 +118,10 @@ export async function createS3BasedFileSystemContentStorage(
             .getObject({
               Bucket,
               Key: getKey(id),
-              Range: range ? `bytes=${range.start}-${clampedEnd}` : undefined
+              Range: range ? `bytes=${range.start}-${clampedEnd ?? range.end}` : undefined
             })
             .createReadStream(),
-        range && clampedEnd !== undefined ? clampedEnd - range.start + 1 : obj.ContentLength ?? null,
+        range ? (clampedEnd !== undefined ? clampedEnd - range.start + 1 : null) : size,
         obj.ContentEncoding || null
       )
     } catch (error: any) {
@@ -182,7 +180,7 @@ export async function createS3BasedFileSystemContentStorage(
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
       return {
         encoding: obj.ContentEncoding || null,
-        size: obj.ContentLength || null
+        size: obj.ContentLength ?? null
       }
     } catch {
       return undefined
