@@ -1,5 +1,5 @@
 import { Readable } from 'stream'
-import { ContentItem, FileInfo, IContentStorageComponent } from './types'
+import { clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
 
 /**
@@ -26,9 +26,15 @@ export function createInMemoryStorage(): IContentStorageComponent {
     async delete(ids: string[]): Promise<void> {
       ids.forEach((id) => storage.delete(id))
     },
-    async retrieve(fileId: string): Promise<ContentItem | undefined> {
+    async retrieve(fileId: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
+      if (range) validateRange(range)
       const content = storage.get(fileId)
-      return content ? SimpleContentItem.fromBuffer(content) : undefined
+      if (!content) return undefined
+      if (range) {
+        const clampedEnd = clampRange(range, content.length)
+        return SimpleContentItem.fromBuffer(content.subarray(range.start, clampedEnd + 1))
+      }
+      return SimpleContentItem.fromBuffer(content)
     },
     async existMultiple(fileIds: string[]): Promise<Map<string, boolean>> {
       return new Map(fileIds.map((fileId) => [fileId, storage.has(fileId)]))

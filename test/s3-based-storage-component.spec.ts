@@ -115,6 +115,65 @@ describe('S3 Storage', () => {
     expect(retrievedContent?.encoding).toBeUndefined()
   })
 
+  // Note: mock-aws-s3 does not support the Range parameter, so stream content
+  // assertions are skipped. These tests verify our size calculation and validation logic.
+
+  it(`When a range is requested on a non-existent key, then it returns undefined`, async () => {
+    const item = await storage.retrieve('non-existent', { start: 0, end: 4 })
+    expect(item).toBeUndefined()
+  })
+
+  it(`When a single-byte range is requested, then it returns correct size`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+
+    const item = await storage.retrieve(id, { start: 4, end: 4 })
+    expect(item).toBeDefined()
+    expect(item!.size).toBe(1)
+  })
+
+  it(`When content is stored, then a range retrieve returns correct size`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+
+    const item = await storage.retrieve(id, { start: 0, end: 4 })
+    expect(item).toBeDefined()
+    expect(item!.size).toBe(5)
+  })
+
+  it(`When content is stored, then a range in the middle returns correct size`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+
+    const item = await storage.retrieve(id, { start: 7, end: 11 })
+    expect(item).toBeDefined()
+    expect(item!.size).toBe(5)
+  })
+
+  it(`When a range with end beyond file size is requested, then it clamps to file size`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+
+    const item = await storage.retrieve(id, { start: 7, end: 999 })
+    expect(item).toBeDefined()
+    expect(item!.size).toBe(6)
+  })
+
+  it(`When a range with start > end is requested, then it throws a RangeError`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await expect(storage.retrieve(id, { start: 5, end: 2 })).rejects.toThrow(RangeError)
+  })
+
+  it(`When a range with negative start is requested, then it throws a RangeError`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await expect(storage.retrieve(id, { start: -1, end: 2 })).rejects.toThrow(RangeError)
+  })
+
+  it(`When a range with start past end of file is requested, then it throws a RangeError`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await expect(storage.retrieve(id, { start: 10, end: 20 })).rejects.toThrow(RangeError)
+  })
+
   async function retrieveAndExpectStoredContentToBe(idToRetrieve: string, expectedContent: Buffer) {
     const retrievedContent = await storage.retrieve(idToRetrieve)
     expect(await streamToBuffer(await retrievedContent!.asStream())).toEqual(expectedContent)
@@ -149,5 +208,50 @@ describe('S3 Storage', () => {
     expect(await storage.fileInfo(id)).toEqual({ encoding: null, size: 3 })
 
     expect(await storage.fileInfo('non-existent-id')).toBeUndefined()
+  })
+
+  it(`When multiple files exist, then fileInfoMultiple returns correct results for existing and non-existing keys`, async () => {
+    await storage.storeStream(id, bufferToStream(content))
+    await storage.storeStream(id2, bufferToStream(content2))
+
+    const result = await storage.fileInfoMultiple([id, id2, 'non-existent'])
+    expect(result.get(id)).toEqual({ encoding: null, size: 3 })
+    expect(result.get(id2)).toEqual({ encoding: null, size: 3 })
+    expect(result.get('non-existent')).toBeUndefined()
+  })
+})
+
+describe('S3 Storage edge cases', () => {
+  it(`When a file has ContentLength 0, then fileInfo returns size 0 instead of null`, async () => {
+    const headObjectResponse = { ETag: '"abc"', ContentLength: 0, ContentEncoding: undefined }
+    const mockS3 = {
+      headObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve(headObjectResponse) }),
+      upload: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      getObject: jest.fn().mockReturnValue({ createReadStream: () => bufferToStream(Buffer.alloc(0)) }),
+      deleteObjects: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      listObjectsV2: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Contents: [], IsTruncated: false }) })
+    }
+    const logs = await createLogComponent({})
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
+
+    const info = await storage.fileInfo('empty-file')
+    expect(info).toEqual({ encoding: null, size: 0 })
+  })
+
+  it(`When headObject returns no ContentLength, then a range retrieve returns null size`, async () => {
+    const headObjectResponse = { ETag: '"abc"', ContentEncoding: undefined }
+    const mockS3 = {
+      headObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve(headObjectResponse) }),
+      upload: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      getObject: jest.fn().mockReturnValue({ createReadStream: () => bufferToStream(Buffer.from('Hello')) }),
+      deleteObjects: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      listObjectsV2: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Contents: [], IsTruncated: false }) })
+    }
+    const logs = await createLogComponent({})
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
+
+    const item = await storage.retrieve('some-file', { start: 0, end: 4 })
+    expect(item).toBeDefined()
+    expect(item!.size).toBeNull()
   })
 })

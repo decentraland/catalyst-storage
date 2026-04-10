@@ -1,6 +1,6 @@
 import { S3 } from 'aws-sdk'
 import { Readable } from 'stream'
-import { AppComponents, ContentItem, FileInfo, IContentStorageComponent } from './types'
+import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem } from './content-item'
 import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
 import { fromBuffer } from 'file-type'
@@ -104,16 +104,28 @@ export async function createS3BasedFileSystemContentStorage(
       .promise()
   }
 
-  async function retrieve(id: string): Promise<ContentItem | undefined> {
+  async function retrieve(id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
+    if (range) validateRange(range)
     try {
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
 
+      const size = obj.ContentLength ?? null
+      const clampedEnd = range && size !== null ? clampRange(range, size) : undefined
+
       return new SimpleContentItem(
-        async () => s3.getObject({ Bucket, Key: getKey(id) }).createReadStream(),
-        obj.ContentLength || null,
+        async () =>
+          s3
+            .getObject({
+              Bucket,
+              Key: getKey(id),
+              Range: range ? `bytes=${range.start}-${clampedEnd ?? range.end}` : undefined
+            })
+            .createReadStream(),
+        range ? (clampedEnd !== undefined ? clampedEnd - range.start + 1 : null) : size,
         obj.ContentEncoding || null
       )
     } catch (error: any) {
+      if (error instanceof RangeError) throw error
       if (error.code !== 'NotFound') {
         logger.error(error)
       }
@@ -168,7 +180,7 @@ export async function createS3BasedFileSystemContentStorage(
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
       return {
         encoding: obj.ContentEncoding || null,
-        size: obj.ContentLength || null
+        size: obj.ContentLength ?? null
       }
     } catch {
       return undefined
