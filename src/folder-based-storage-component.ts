@@ -10,7 +10,7 @@ const pipe = promisify(pipeline)
 
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
-const ONE_GB_IN_BYTES = 1024 * 1024 * 1024
+const FIVE_GB_IN_BYTES = 5 * 1024 * 1024 * 1024
 
 /** @public */
 export type FolderStorageOptions = {
@@ -18,7 +18,7 @@ export type FolderStorageOptions = {
   disablePrefixHash: boolean
   /** TTL in milliseconds for cached decompressed files. Default: 1 hour. */
   decompressCacheTTL?: number
-  /** Max total size in bytes for cached decompressed files. Default: 1GB. */
+  /** Max total size in bytes for cached decompressed files. Default: 5GB. */
   decompressCacheMaxSize?: number
   /** How often to run the eviction check in milliseconds. Default: 5 minutes. */
   decompressCacheEvictionInterval?: number
@@ -43,7 +43,7 @@ export async function createFolderBasedFileSystemContentStorage(
 
   const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
-  const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? ONE_GB_IN_BYTES
+  const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
 
   // LRU cache tracker for decompressed gzip files written to disk
