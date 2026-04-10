@@ -3,14 +3,14 @@ import path from 'path'
 import { pipeline, Readable } from 'stream'
 import { promisify } from 'util'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
-import { SimpleContentItem } from './content-item'
+import { SimpleContentItem, streamToBuffer } from './content-item'
 import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
 
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
-const ONE_GB_IN_BYTES = 1024 * 1024 * 1024
+const FIVE_GB_IN_BYTES = 5 * 1024 * 1024 * 1024
 
 /** @public */
 export type FolderStorageOptions = {
@@ -18,7 +18,7 @@ export type FolderStorageOptions = {
   disablePrefixHash: boolean
   /** TTL in milliseconds for cached decompressed files. Default: 1 hour. */
   decompressCacheTTL?: number
-  /** Max total size in bytes for cached decompressed files. Default: 1GB. */
+  /** Max total size in bytes for cached decompressed files. Default: 5GB. */
   decompressCacheMaxSize?: number
   /** How often to run the eviction check in milliseconds. Default: 5 minutes. */
   decompressCacheEvictionInterval?: number
@@ -43,7 +43,7 @@ export async function createFolderBasedFileSystemContentStorage(
 
   const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
-  const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? ONE_GB_IN_BYTES
+  const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
 
   // LRU cache tracker for decompressed gzip files written to disk
@@ -257,6 +257,23 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  async function readGzipOriginalSize(filePath: string, gzipSize: number): Promise<number | null> {
+    // The gzip format (RFC 1952) stores the original uncompressed size in its
+    // trailer — the last 4 bytes (ISIZE field, uint32 little-endian).
+    // This works for files < 4GB (ISIZE is mod 2^32).
+    if (gzipSize < 8) return null // Too small to be a valid gzip file
+    try {
+      const stream = components.fs.createReadStream(filePath, {
+        start: gzipSize - 4,
+        end: gzipSize - 1
+      })
+      const buffer = await streamToBuffer(stream)
+      return buffer.readUInt32LE(0)
+    } catch {
+      return null
+    }
+  }
+
   async function fileInfo(id: string): Promise<FileInfo | undefined> {
     const possibleEncondings = ['gzip', null]
     const baseFilePath = await getFilePath(id)
@@ -266,9 +283,18 @@ export async function createFolderBasedFileSystemContentStorage(
       const filePath = baseFilePath + extension
       if (await components.fs.existPath(filePath)) {
         const stat = await components.fs.stat(filePath)
+        if (encoding === 'gzip') {
+          const contentSize = await readGzipOriginalSize(filePath, stat.size)
+          return {
+            size: stat.size,
+            encoding,
+            contentSize
+          }
+        }
         return {
           size: stat.size,
-          encoding
+          encoding,
+          contentSize: stat.size
         }
       }
     }

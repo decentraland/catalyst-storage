@@ -178,9 +178,11 @@ export async function createS3BasedFileSystemContentStorage(
   async function fileInfo(id: string): Promise<FileInfo | undefined> {
     try {
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
+      const size = obj.ContentLength ?? null
       return {
         encoding: obj.ContentEncoding || null,
-        size: obj.ContentLength ?? null
+        size,
+        contentSize: obj.ContentEncoding ? null : size
       }
     } catch {
       return undefined

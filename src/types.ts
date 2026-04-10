@@ -31,6 +31,8 @@ export type IContentStorageComponent = IBaseComponent & {
 export type FileInfo = {
   encoding: string | null
   size: number | null
+  /** Logical content size (uncompressed). Same as size when encoding is null. Null if unknown. */
+  contentSize: number | null
 }
 
 /**
