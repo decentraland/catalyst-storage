@@ -2,7 +2,7 @@ import { createHash } from 'crypto'
 import path from 'path'
 import { pipeline, Readable } from 'stream'
 import { promisify } from 'util'
-import { AppComponents, ContentItem, FileInfo, IContentStorageComponent } from './types'
+import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
 import { compressContentFile } from './extras/compression'
 
@@ -117,13 +117,7 @@ export async function createFolderBasedFileSystemContentStorage(
       const stat = await components.fs.stat(filePath)
 
       if (range) {
-        if (range.start < 0 || range.start > range.end) {
-          throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
-        }
-        const clampedEnd = Math.min(range.end, stat.size - 1)
-        if (range.start > clampedEnd) {
-          throw new RangeError(`Range start ${range.start} exceeds file size ${stat.size}`)
-        }
+        const clampedEnd = clampRange(range, stat.size)
         return new SimpleContentItem(
           async () => components.fs.createReadStream(filePath, { start: range.start, end: clampedEnd }),
           clampedEnd - range.start + 1,
@@ -190,9 +184,7 @@ export async function createFolderBasedFileSystemContentStorage(
       if (!contentItem && range) {
         const gzipItem = await retrieveWithEncoding(id, 'gzip')
         if (gzipItem) {
-          if (range.start < 0 || range.start > range.end) {
-            throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
-          }
+          validateRange(range)
 
           const uncompressedPath = await getFilePath(id)
 

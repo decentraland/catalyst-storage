@@ -36,6 +36,28 @@ export type FileInfo = {
 /**
  * @public
  */
+/**
+ * Validates that a range is well-formed (start >= 0 and start <= end).
+ */
+export function validateRange(range: { start: number; end: number }): void {
+  if (range.start < 0 || range.start > range.end) {
+    throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
+  }
+}
+
+/**
+ * Clamps range.end to the file size and validates that start is within bounds.
+ * Returns the clamped end value.
+ */
+export function clampRange(range: { start: number; end: number }, size: number): number {
+  validateRange(range)
+  const clampedEnd = Math.min(range.end, size - 1)
+  if (range.start > clampedEnd) {
+    throw new RangeError(`Range start ${range.start} exceeds size ${size}`)
+  }
+  return clampedEnd
+}
+
 export type ContentItem = FileInfo & {
   /**
    * Gets the readable stream, uncompressed if necessary.

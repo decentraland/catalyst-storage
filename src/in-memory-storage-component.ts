@@ -1,5 +1,5 @@
 import { Readable } from 'stream'
-import { ContentItem, FileInfo, IContentStorageComponent } from './types'
+import { clampRange, ContentItem, FileInfo, IContentStorageComponent } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
 
 /**
@@ -30,13 +30,7 @@ export function createInMemoryStorage(): IContentStorageComponent {
       const content = storage.get(fileId)
       if (!content) return undefined
       if (range) {
-        if (range.start < 0 || range.start > range.end) {
-          throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
-        }
-        const clampedEnd = Math.min(range.end, content.length - 1)
-        if (range.start > clampedEnd) {
-          throw new RangeError(`Range start ${range.start} exceeds content size ${content.length}`)
-        }
+        const clampedEnd = clampRange(range, content.length)
         return SimpleContentItem.fromBuffer(content.subarray(range.start, clampedEnd + 1))
       }
       return SimpleContentItem.fromBuffer(content)

@@ -1,6 +1,6 @@
 import { S3 } from 'aws-sdk'
 import { Readable } from 'stream'
-import { AppComponents, ContentItem, FileInfo, IContentStorageComponent } from './types'
+import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem } from './content-item'
 import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
 import { fromBuffer } from 'file-type'
@@ -106,20 +106,14 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function retrieve(id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
     try {
-      if (range && (range.start < 0 || range.start > range.end)) {
-        throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
-      }
+      if (range) validateRange(range)
 
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
 
       const clampedEnd =
         range && obj.ContentLength !== undefined && obj.ContentLength !== null
-          ? Math.min(range.end, obj.ContentLength - 1)
+          ? clampRange(range, obj.ContentLength)
           : range?.end
-
-      if (range && clampedEnd !== undefined && range.start > clampedEnd) {
-        throw new RangeError(`Range start ${range.start} exceeds file size ${obj.ContentLength}`)
-      }
 
       return new SimpleContentItem(
         async () =>
