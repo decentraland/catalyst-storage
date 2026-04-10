@@ -105,9 +105,8 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   async function retrieve(id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
+    if (range) validateRange(range)
     try {
-      if (range) validateRange(range)
-
       const obj = await s3.headObject({ Bucket, Key: getKey(id) }).promise()
 
       const clampedEnd =
@@ -124,7 +123,7 @@ export async function createS3BasedFileSystemContentStorage(
               Range: range ? `bytes=${range.start}-${clampedEnd}` : undefined
             })
             .createReadStream(),
-        range && clampedEnd !== undefined ? clampedEnd - range.start + 1 : obj.ContentLength || null,
+        range && clampedEnd !== undefined ? clampedEnd - range.start + 1 : obj.ContentLength ?? null,
         obj.ContentEncoding || null
       )
     } catch (error: any) {

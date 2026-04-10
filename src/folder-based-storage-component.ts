@@ -3,7 +3,7 @@ import path from 'path'
 import { pipeline, Readable } from 'stream'
 import { promisify } from 'util'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
-import { SimpleContentItem, streamToBuffer } from './content-item'
+import { SimpleContentItem } from './content-item'
 import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
@@ -17,11 +17,11 @@ export type FolderStorageOptions = {
   /// by default FALSE, disables the sha1 prefix for all files. @see getFilePath
   disablePrefixHash: boolean
   /** TTL in milliseconds for cached decompressed files. Default: 1 hour. */
-  decompressCacheTTL: number
+  decompressCacheTTL?: number
   /** Max total size in bytes for cached decompressed files. Default: 1GB. */
-  decompressCacheMaxSize: number
+  decompressCacheMaxSize?: number
   /** How often to run the eviction check in milliseconds. Default: 5 minutes. */
-  decompressCacheEvictionInterval: number
+  decompressCacheEvictionInterval?: number
 }
 
 /**
@@ -53,15 +53,25 @@ export async function createFolderBasedFileSystemContentStorage(
   // Concurrency guard: prevents multiple simultaneous decompressions of the same file
   const inflightDecompressions = new Map<string, Promise<void>>()
 
+  let evicting = false
   async function evictCache() {
+    if (evicting) return
+    evicting = true
+    try {
+      await runEviction()
+    } finally {
+      evicting = false
+    }
+  }
+
+  async function runEviction() {
     const now = Date.now()
 
     // TTL eviction
     for (const [filePath, entry] of decompressCache) {
       if (now - entry.lastAccess > CACHE_TTL) {
-        if (await noFailUnlink(filePath)) {
-          totalCacheSize -= entry.size
-        }
+        await noFailUnlink(filePath)
+        totalCacheSize -= entry.size
         decompressCache.delete(filePath)
       }
     }
@@ -71,9 +81,8 @@ export async function createFolderBasedFileSystemContentStorage(
       const sorted = [...decompressCache.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess)
       for (const [filePath, entry] of sorted) {
         if (totalCacheSize <= CACHE_MAX_SIZE) break
-        if (await noFailUnlink(filePath)) {
-          totalCacheSize -= entry.size
-        }
+        await noFailUnlink(filePath)
+        totalCacheSize -= entry.size
         decompressCache.delete(filePath)
       }
     }
@@ -153,9 +162,8 @@ export async function createFolderBasedFileSystemContentStorage(
   async function removeCacheEntry(filePath: string) {
     const entry = decompressCache.get(filePath)
     if (entry) {
-      if (await noFailUnlink(filePath)) {
-        totalCacheSize -= entry.size
-      }
+      await noFailUnlink(filePath)
+      totalCacheSize -= entry.size
       decompressCache.delete(filePath)
     }
   }
@@ -168,6 +176,7 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
+    if (range) validateRange(range)
     try {
       let contentItem: ContentItem | undefined = undefined
       if (!range) contentItem = await retrieveWithEncoding(id, 'gzip')
@@ -184,8 +193,6 @@ export async function createFolderBasedFileSystemContentStorage(
       if (!contentItem && range) {
         const gzipItem = await retrieveWithEncoding(id, 'gzip')
         if (gzipItem) {
-          validateRange(range)
-
           const uncompressedPath = await getFilePath(id)
 
           // Wait for any in-flight decompression of the same file, or start one
@@ -193,18 +200,17 @@ export async function createFolderBasedFileSystemContentStorage(
           const isOwner = !decompressPromise
           if (!decompressPromise) {
             decompressPromise = (async () => {
-              const decompressed = await streamToBuffer(await gzipItem.asStream())
               try {
-                await pipe(Readable.from(decompressed), components.fs.createWriteStream(uncompressedPath))
+                await pipe(await gzipItem.asStream(), components.fs.createWriteStream(uncompressedPath))
               } catch (err) {
                 // Remove partial file to prevent serving corrupt data
                 await noFailUnlink(uncompressedPath)
                 throw err
               }
 
-              const size = decompressed.length
-              decompressCache.set(uncompressedPath, { size, lastAccess: Date.now() })
-              totalCacheSize += size
+              const stat = await components.fs.stat(uncompressedPath)
+              decompressCache.set(uncompressedPath, { size: stat.size, lastAccess: Date.now() })
+              totalCacheSize += stat.size
             })()
             inflightDecompressions.set(uncompressedPath, decompressPromise)
           }
@@ -277,9 +283,8 @@ export async function createFolderBasedFileSystemContentStorage(
       }
       // Evict all cached files on shutdown to prevent disk leaks across restarts
       for (const [filePath, entry] of decompressCache) {
-        if (await noFailUnlink(filePath)) {
-          totalCacheSize -= entry.size
-        }
+        await noFailUnlink(filePath)
+        totalCacheSize -= entry.size
         decompressCache.delete(filePath)
       }
     },

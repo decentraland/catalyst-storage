@@ -320,11 +320,8 @@ describe('fileSystemContentStorage', () => {
         await storage.retrieve(id, { start: 0, end: 9 })
         expect(await fs.existPath(cachedFilePath)).toBeTruthy()
 
-        // Advance past TTL + eviction interval
-        jest.advanceTimersByTime(60000 + 30000)
-        // Allow the async eviction to complete
-        await Promise.resolve()
-        await Promise.resolve()
+        // Advance past TTL + eviction interval and flush async work
+        await jest.advanceTimersByTimeAsync(60000 + 30000)
 
         expect(await fs.existPath(cachedFilePath)).toBeFalsy()
         expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()
@@ -362,10 +359,8 @@ describe('fileSystemContentStorage', () => {
         await storage.retrieve(id2, { start: 0, end: 9 })
         expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
 
-        // Advance past eviction interval
-        jest.advanceTimersByTime(30000)
-        await Promise.resolve()
-        await Promise.resolve()
+        // Advance past eviction interval and flush async work
+        await jest.advanceTimersByTimeAsync(30000)
 
         // LRU file (id, accessed first) should be evicted, id2 should remain
         expect(await fs.existPath(cachedFilePath1)).toBeFalsy()

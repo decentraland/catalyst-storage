@@ -1,5 +1,5 @@
 import { Readable } from 'stream'
-import { clampRange, ContentItem, FileInfo, IContentStorageComponent } from './types'
+import { clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
 
 /**
@@ -27,6 +27,7 @@ export function createInMemoryStorage(): IContentStorageComponent {
       ids.forEach((id) => storage.delete(id))
     },
     async retrieve(fileId: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
+      if (range) validateRange(range)
       const content = storage.get(fileId)
       if (!content) return undefined
       if (range) {
