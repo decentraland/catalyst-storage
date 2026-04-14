@@ -3,7 +3,9 @@ import { Readable } from 'stream'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem } from './content-item'
 import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
-import { fromBuffer } from 'file-type'
+// Workaround: TS "commonjs" transforms import() to require().
+// This indirection preserves the native import() needed for ESM-only packages.
+const _importDynamic = Function('modulePath', 'return import(modulePath)') as (modulePath: string) => Promise<any>
 
 /**
  * Helper function to convert a buffer to a readable stream.
@@ -31,16 +33,16 @@ async function streamToBuffer(stream: Readable): Promise<Buffer> {
 /**
  * Detects the MIME type from a buffer.
  * Uses only the first bytes of the buffer for detection.
- * file-type v15 only needs the first ~4100 bytes to detect any file type.
+ * file-type v21 only needs the first ~4100 bytes to detect any file type.
  */
 async function detectMimeTypeFromBuffer(buffer: Buffer | Uint8Array): Promise<string> {
-  // Use magic bytes from end of buffer to detect MIME type
   const maxBytesForDetection = 4100
   const bytesToUse = Math.min(maxBytesForDetection, buffer.length)
-  const detectionBuffer = Buffer.from(buffer.slice(0, bytesToUse))
+  const detectionBuffer = buffer.slice(0, bytesToUse)
 
   try {
-    const mime = await fromBuffer(detectionBuffer)
+    const { fileTypeFromBuffer } = await _importDynamic('file-type')
+    const mime = await fileTypeFromBuffer(detectionBuffer)
     return mime?.mime || 'application/octet-stream'
   } catch (error: any) {
     return 'application/octet-stream'
