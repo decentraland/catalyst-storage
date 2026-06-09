@@ -7,6 +7,8 @@ import {
 import { bufferToStream, streamToBuffer } from '../src'
 import { FileSystemUtils as fsu } from './file-system-utils'
 import AWSMock from 'mock-aws-s3'
+import { Readable } from 'stream'
+import { once } from 'events'
 import { createLogComponent } from '@well-known-components/logger'
 import { createConfigComponent } from '@well-known-components/env-config-provider'
 
@@ -50,6 +52,20 @@ describe('S3 Storage', () => {
     await storage.storeStream(id, bufferToStream(content))
 
     await retrieveAndExpectStoredContentToBe(id, content)
+  })
+
+  it(`When a large multi-chunk stream is stored, then the full content is preserved across the MIME-detection boundary`, async () => {
+    // Larger than the 4100-byte MIME-detection head, delivered in 1KB chunks so the head spans
+    // several chunks. Exercises the peek-and-restream path that avoids buffering the whole file.
+    const largeContent = Buffer.alloc(10000, 7)
+    const chunks: Buffer[] = []
+    for (let offset = 0; offset < largeContent.length; offset += 1000) {
+      chunks.push(largeContent.subarray(offset, offset + 1000))
+    }
+
+    await storage.storeStream('large-id', Readable.from(chunks))
+
+    await retrieveAndExpectStoredContentToBe('large-id', largeContent)
   })
 
   it(`When content is stored, then we can check if it exists`, async function () {
@@ -221,6 +237,57 @@ describe('S3 Storage', () => {
   })
 })
 
+describe('S3 Storage MIME type detection', () => {
+  let storage: IContentStorageComponent
+  let uploadSpy: jest.SpyInstance
+
+  // Each payload is padded well beyond the detection window so the test proves the type is
+  // detected from the head alone, without buffering the whole file.
+  const padding = Buffer.alloc(8192, 0)
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]),
+    padding
+  ])
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0]), padding])
+  const glb = Buffer.concat([Buffer.from('glTF'), Buffer.from([2, 0, 0, 0, 0x10, 0, 0, 0]), padding])
+  const gltfJson = Buffer.from(JSON.stringify({ asset: { version: '2.0' } }))
+
+  beforeEach(async () => {
+    const root = fsu.createTempDirectory()
+    AWSMock.config.basePath = path.join(root, 'buckets')
+    const s3 = new AWSMock.S3({ params: { Bucket: 'example' } })
+    uploadSpy = jest.spyOn(s3, 'upload')
+    const logs = await createLogComponent({})
+    storage = await createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: 'example' })
+  })
+
+  const uploadedContentType = (): string => uploadSpy.mock.calls[0][0].ContentType
+
+  it(`When a PNG larger than the detection window is stored, then it is uploaded as image/png`, async () => {
+    await storage.storeStream('png-id', bufferToStream(png))
+
+    expect(uploadedContentType()).toBe('image/png')
+  })
+
+  it(`When a JPEG larger than the detection window is stored, then it is uploaded as image/jpeg`, async () => {
+    await storage.storeStream('jpeg-id', bufferToStream(jpeg))
+
+    expect(uploadedContentType()).toBe('image/jpeg')
+  })
+
+  it(`When a binary glTF (GLB) larger than the detection window is stored, then it is uploaded as model/gltf-binary`, async () => {
+    await storage.storeStream('glb-id', bufferToStream(glb))
+
+    expect(uploadedContentType()).toBe('model/gltf-binary')
+  })
+
+  it(`When a text-based glTF (JSON) is stored, then it falls back to application/octet-stream`, async () => {
+    await storage.storeStream('gltf-id', bufferToStream(gltfJson))
+
+    expect(uploadedContentType()).toBe('application/octet-stream')
+  })
+})
+
 describe('S3 Storage edge cases', () => {
   it(`When a file has ContentLength 0, then fileInfo returns size 0 instead of null`, async () => {
     const headObjectResponse = { ETag: '"abc"', ContentLength: 0, ContentEncoding: undefined }
@@ -253,5 +320,26 @@ describe('S3 Storage edge cases', () => {
     const item = await storage.retrieve('some-file', { start: 0, end: 4 })
     expect(item).toBeDefined()
     expect(item!.size).toBeNull()
+  })
+
+  it(`When the upload fails, then the source stream is released`, async () => {
+    const mockS3 = {
+      headObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }),
+      upload: jest.fn().mockReturnValue({ promise: () => Promise.reject(new Error('upload failed')) }),
+      getObject: jest.fn(),
+      deleteObjects: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      listObjectsV2: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Contents: [], IsTruncated: false }) })
+    }
+    const logs = await createLogComponent({})
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
+
+    // Two chunks so the body still has unread data after the head is peeked.
+    const source = Readable.from([Buffer.alloc(5000, 1), Buffer.alloc(5000, 1)])
+    const closed = once(source, 'close')
+
+    await expect(storage.storeStream('fail-id', source)).rejects.toThrow('upload failed')
+    await closed
+
+    expect(source.destroyed).toBe(true)
   })
 })
