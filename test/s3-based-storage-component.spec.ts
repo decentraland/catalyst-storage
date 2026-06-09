@@ -8,6 +8,7 @@ import { bufferToStream, streamToBuffer } from '../src'
 import { FileSystemUtils as fsu } from './file-system-utils'
 import AWSMock from 'mock-aws-s3'
 import { Readable } from 'stream'
+import { once } from 'events'
 import { createLogComponent } from '@well-known-components/logger'
 import { createConfigComponent } from '@well-known-components/env-config-provider'
 
@@ -319,5 +320,26 @@ describe('S3 Storage edge cases', () => {
     const item = await storage.retrieve('some-file', { start: 0, end: 4 })
     expect(item).toBeDefined()
     expect(item!.size).toBeNull()
+  })
+
+  it(`When the upload fails, then the source stream is released`, async () => {
+    const mockS3 = {
+      headObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }),
+      upload: jest.fn().mockReturnValue({ promise: () => Promise.reject(new Error('upload failed')) }),
+      getObject: jest.fn(),
+      deleteObjects: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
+      listObjectsV2: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Contents: [], IsTruncated: false }) })
+    }
+    const logs = await createLogComponent({})
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
+
+    // Two chunks so the body still has unread data after the head is peeked.
+    const source = Readable.from([Buffer.alloc(5000, 1), Buffer.alloc(5000, 1)])
+    const closed = once(source, 'close')
+
+    await expect(storage.storeStream('fail-id', source)).rejects.toThrow('upload failed')
+    await closed
+
+    expect(source.destroyed).toBe(true)
   })
 })

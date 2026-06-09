@@ -10,10 +10,11 @@ const _importDynamic = Function('modulePath', 'return import(modulePath)') as (m
 const MIME_DETECTION_BYTES = 4100
 
 /**
- * Reads the first `byteCount` bytes from the stream for inspection, then returns those bytes
- * together with a Readable that re-emits them followed by the remainder of the original stream.
- * This lets us detect the MIME type from the head while streaming the body straight to S3, so
- * large files are never buffered in memory in full.
+ * Reads at least the first `byteCount` bytes from the stream for inspection (chunk-granular, so it
+ * may read a bit more — up to a whole chunk past the target), then returns those bytes together
+ * with a Readable that re-emits them followed by the remainder of the original stream. This lets us
+ * detect the MIME type from the head while streaming the body straight to S3, so large files are
+ * never buffered in memory in full.
  */
 async function peekHead(stream: Readable, byteCount: number): Promise<{ head: Buffer; body: Readable }> {
   const iterator = stream[Symbol.asyncIterator]()
@@ -36,13 +37,20 @@ async function peekHead(stream: Readable, byteCount: number): Promise<{ head: Bu
 
   const body = Readable.from(
     (async function* () {
-      yield head
-      if (!finished) {
-        let next = await iterator.next()
-        while (!next.done) {
-          yield Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value)
-          next = await iterator.next()
+      try {
+        yield head
+        if (!finished) {
+          let next = await iterator.next()
+          while (!next.done) {
+            yield Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value)
+            next = await iterator.next()
+          }
         }
+      } finally {
+        // Release the source stream whenever consumption stops — normal end, or early
+        // termination such as the body being destroyed after a failed upload — so its
+        // underlying resources (e.g. file descriptors) are not leaked.
+        await iterator.return?.()
       }
     })()
   )
@@ -115,14 +123,23 @@ export async function createS3BasedFileSystemContentStorage(
     const { head, body } = await peekHead(stream, MIME_DETECTION_BYTES)
     const mimeType = await detectMimeTypeFromBuffer(head)
 
-    await s3
-      .upload({
-        Bucket,
-        Key: getKey(id),
-        Body: body,
-        ContentType: mimeType
-      })
-      .promise()
+    try {
+      await s3
+        .upload({
+          Bucket,
+          Key: getKey(id),
+          Body: body,
+          ContentType: mimeType
+        })
+        .promise()
+    } catch (error) {
+      // Release the source stream if the upload stopped consuming the body (e.g. it failed before
+      // reading anything, so peekHead's generator never started and can't self-clean). Destroying
+      // the source releases its underlying resources (e.g. file descriptors). No-op if already
+      // ended/destroyed.
+      stream.destroy()
+      throw error
+    }
   }
 
   async function retrieve(id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
