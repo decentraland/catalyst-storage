@@ -236,6 +236,57 @@ describe('S3 Storage', () => {
   })
 })
 
+describe('S3 Storage MIME type detection', () => {
+  let storage: IContentStorageComponent
+  let uploadSpy: jest.SpyInstance
+
+  // Each payload is padded well beyond the detection window so the test proves the type is
+  // detected from the head alone, without buffering the whole file.
+  const padding = Buffer.alloc(8192, 0)
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]),
+    padding
+  ])
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0]), padding])
+  const glb = Buffer.concat([Buffer.from('glTF'), Buffer.from([2, 0, 0, 0, 0x10, 0, 0, 0]), padding])
+  const gltfJson = Buffer.from(JSON.stringify({ asset: { version: '2.0' } }))
+
+  beforeEach(async () => {
+    const root = fsu.createTempDirectory()
+    AWSMock.config.basePath = path.join(root, 'buckets')
+    const s3 = new AWSMock.S3({ params: { Bucket: 'example' } })
+    uploadSpy = jest.spyOn(s3, 'upload')
+    const logs = await createLogComponent({})
+    storage = await createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: 'example' })
+  })
+
+  const uploadedContentType = (): string => uploadSpy.mock.calls[0][0].ContentType
+
+  it(`When a PNG larger than the detection window is stored, then it is uploaded as image/png`, async () => {
+    await storage.storeStream('png-id', bufferToStream(png))
+
+    expect(uploadedContentType()).toBe('image/png')
+  })
+
+  it(`When a JPEG larger than the detection window is stored, then it is uploaded as image/jpeg`, async () => {
+    await storage.storeStream('jpeg-id', bufferToStream(jpeg))
+
+    expect(uploadedContentType()).toBe('image/jpeg')
+  })
+
+  it(`When a binary glTF (GLB) larger than the detection window is stored, then it is uploaded as model/gltf-binary`, async () => {
+    await storage.storeStream('glb-id', bufferToStream(glb))
+
+    expect(uploadedContentType()).toBe('model/gltf-binary')
+  })
+
+  it(`When a text-based glTF (JSON) is stored, then it falls back to application/octet-stream`, async () => {
+    await storage.storeStream('gltf-id', bufferToStream(gltfJson))
+
+    expect(uploadedContentType()).toBe('application/octet-stream')
+  })
+})
+
 describe('S3 Storage edge cases', () => {
   it(`When a file has ContentLength 0, then fileInfo returns size 0 instead of null`, async () => {
     const headObjectResponse = { ETag: '"abc"', ContentLength: 0, ContentEncoding: undefined }
