@@ -7,27 +7,47 @@ import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
 // This indirection preserves the native import() needed for ESM-only packages.
 const _importDynamic = Function('modulePath', 'return import(modulePath)') as (modulePath: string) => Promise<any>
 
-/**
- * Helper function to convert a buffer to a readable stream.
- */
-function bufferToStream(buffer: Buffer): Readable {
-  const stream = new Readable()
-  stream.push(buffer)
-  stream.push(null) // End of stream
-  return stream
-}
+const MIME_DETECTION_BYTES = 4100
 
 /**
- * Helper function to buffer a stream for MIME type detection and further usage.
+ * Reads the first `byteCount` bytes from the stream for inspection, then returns those bytes
+ * together with a Readable that re-emits them followed by the remainder of the original stream.
+ * This lets us detect the MIME type from the head while streaming the body straight to S3, so
+ * large files are never buffered in memory in full.
  */
-async function streamToBuffer(stream: Readable): Promise<Buffer> {
-  const chunks: Buffer[] = []
-  for await (const chunk of stream) {
-    // Ensure chunk is converted to Buffer (handles Uint8Array, Buffer, etc.)
-    const bufferChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    chunks.push(bufferChunk)
+async function peekHead(stream: Readable, byteCount: number): Promise<{ head: Buffer; body: Readable }> {
+  const iterator = stream[Symbol.asyncIterator]()
+  const headChunks: Buffer[] = []
+  let headLength = 0
+  let finished = false
+
+  while (headLength < byteCount) {
+    const next = await iterator.next()
+    if (next.done) {
+      finished = true
+      break
+    }
+    const chunk = Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value)
+    headChunks.push(chunk)
+    headLength += chunk.length
   }
-  return Buffer.concat(chunks)
+
+  const head = Buffer.concat(headChunks)
+
+  const body = Readable.from(
+    (async function* () {
+      yield head
+      if (!finished) {
+        let next = await iterator.next()
+        while (!next.done) {
+          yield Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value)
+          next = await iterator.next()
+        }
+      }
+    })()
+  )
+
+  return { head, body }
 }
 
 /**
@@ -89,18 +109,17 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   async function storeStream(id: string, stream: Readable): Promise<void> {
-    // Buffer the entire stream to detect MIME type and upload
-    const fullBuffer = await streamToBuffer(stream)
+    // Inspect only the head for MIME detection, then stream the body straight to S3 so large
+    // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
+    // upload, buffering only part-sized chunks rather than the whole file.
+    const { head, body } = await peekHead(stream, MIME_DETECTION_BYTES)
+    const mimeType = await detectMimeTypeFromBuffer(head)
 
-    // Detect MIME type from the buffer
-    const mimeType = await detectMimeTypeFromBuffer(fullBuffer)
-
-    // Upload to S3 using the buffered data
     await s3
       .upload({
         Bucket,
         Key: getKey(id),
-        Body: bufferToStream(fullBuffer),
+        Body: body,
         ContentType: mimeType
       })
       .promise()

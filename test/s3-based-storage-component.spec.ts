@@ -7,6 +7,7 @@ import {
 import { bufferToStream, streamToBuffer } from '../src'
 import { FileSystemUtils as fsu } from './file-system-utils'
 import AWSMock from 'mock-aws-s3'
+import { Readable } from 'stream'
 import { createLogComponent } from '@well-known-components/logger'
 import { createConfigComponent } from '@well-known-components/env-config-provider'
 
@@ -50,6 +51,20 @@ describe('S3 Storage', () => {
     await storage.storeStream(id, bufferToStream(content))
 
     await retrieveAndExpectStoredContentToBe(id, content)
+  })
+
+  it(`When a large multi-chunk stream is stored, then the full content is preserved across the MIME-detection boundary`, async () => {
+    // Larger than the 4100-byte MIME-detection head, delivered in 1KB chunks so the head spans
+    // several chunks. Exercises the peek-and-restream path that avoids buffering the whole file.
+    const largeContent = Buffer.alloc(10000, 7)
+    const chunks: Buffer[] = []
+    for (let offset = 0; offset < largeContent.length; offset += 1000) {
+      chunks.push(largeContent.subarray(offset, offset + 1000))
+    }
+
+    await storage.storeStream('large-id', Readable.from(chunks))
+
+    await retrieveAndExpectStoredContentToBe('large-id', largeContent)
   })
 
   it(`When content is stored, then we can check if it exists`, async function () {
