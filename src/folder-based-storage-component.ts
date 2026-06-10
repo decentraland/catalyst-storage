@@ -345,6 +345,10 @@ export async function createFolderBasedFileSystemContentStorage(
 
   return {
     async start(_startOptions: any) {
+      // Idempotent: clear any existing timer first so a repeated start() doesn't leak intervals.
+      if (evictionTimer) {
+        clearInterval(evictionTimer)
+      }
       evictionTimer = setInterval(evictCache, CACHE_EVICTION_INTERVAL)
       evictionTimer.unref()
     },
