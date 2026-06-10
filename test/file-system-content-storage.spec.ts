@@ -458,6 +458,35 @@ describe('fileSystemContentStorage', () => {
     }
   })
 
+  it(`When a gzip item inflates beyond the max decompressed size, then the range request is refused and no oversized file is written`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-bomb-'))
+    // Cap decompression at 50 bytes; the payload below inflates to 1000.
+    const storage = await createFolderBasedFileSystemContentStorage(
+      { fs, logs: await createLogComponent({}) },
+      tmpDir,
+      { decompressMaxFileSize: 50 }
+    )
+    const cachedFilePath = path.join(tmpDir, '9584', id)
+
+    try {
+      // 1000 zero bytes compress to a tiny gzip but inflate well past the 50-byte cap.
+      const data = Buffer.from(new Uint8Array(1000).fill(0))
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+      expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()
+
+      // The range request triggers decompression, which is aborted at the cap.
+      const item = await storage.retrieve(id, { start: 0, end: 9 })
+      expect(item).toBeUndefined()
+
+      // No oversized uncompressed cache file is left behind; the gzip is untouched.
+      expect(await fs.existPath(cachedFilePath)).toBeFalsy()
+      expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()
+    } finally {
+      await storage.stop?.()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
   it(`When content is stored compressed (gzip only), then exist returns true`, async () => {
     const data = Buffer.from(new Uint8Array(100).fill(0))
     await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
