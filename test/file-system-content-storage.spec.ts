@@ -2,7 +2,12 @@ import { createHash } from 'crypto'
 import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
+import {
+  createFolderBasedFileSystemContentStorage,
+  createFsComponent,
+  IContentStorageComponent,
+  IFileSystemComponent
+} from '../src'
 import { bufferToStream, streamToBuffer } from '../src'
 import { createLogComponent } from '@well-known-components/logger'
 
@@ -474,6 +479,57 @@ describe('fileSystemContentStorage', () => {
 
       // The partial uncompressed file should have been cleaned up
       expect(await fs.existPath(uncompressedPath)).toBeFalsy()
+    } finally {
+      await storage.stop?.()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it(`When many range requests race for the same cold gzip, then it is decompressed only once and all return correct data`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-race-'))
+    // Derive the shard the same way the storage does, rather than hardcoding the hash prefix.
+    const shard = createHash('sha1').update(id).digest('hex').substring(0, 4)
+    const cachedFilePath = path.join(tmpDir, shard, id)
+
+    // Wrap the fs component to count how many times the uncompressed cache file is written.
+    // Without deduplication, concurrent cold-cache range requests each decompress it, writing
+    // the file once per request (and double-counting its size against the cache budget).
+    const realFs = createFsComponent()
+    let decompressionWrites = 0
+    const spyFs: IFileSystemComponent = {
+      ...realFs,
+      createWriteStream: ((target: any, options?: any) => {
+        if (target === cachedFilePath) decompressionWrites++
+        return realFs.createWriteStream(target, options)
+      }) as typeof realFs.createWriteStream
+    }
+
+    const storage = await createFolderBasedFileSystemContentStorage(
+      { fs: spyFs, logs: await createLogComponent({}) },
+      tmpDir
+    )
+
+    try {
+      const data = Buffer.from('ABCDEFGH'.repeat(200)) // 1600 bytes, compressible
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+      expect(await realFs.existPath(cachedFilePath)).toBeFalsy() // cold uncompressed cache
+      decompressionWrites = 0 // count only the decompression phase
+
+      const range = { start: 100, end: 199 }
+      const expected = data.subarray(100, 200)
+
+      const results = await Promise.all(
+        Array.from({ length: 16 }, async () => {
+          const item = await storage.retrieve(id, range)
+          return streamToBuffer(await item!.asStream())
+        })
+      )
+
+      for (const buffer of results) {
+        expect(buffer).toEqual(expected)
+      }
+      // Deduplicated: the gzip is decompressed to the cache file exactly once.
+      expect(decompressionWrites).toBe(1)
     } finally {
       await storage.stop?.()
       rmSync(tmpDir, { recursive: true, force: true })
