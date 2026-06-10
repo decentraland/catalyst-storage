@@ -487,6 +487,109 @@ describe('fileSystemContentStorage', () => {
     }
   })
 
+  it(`When a gzip inflates to exactly the max decompressed size, then the range request succeeds`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-boundary-'))
+    const storage = await createFolderBasedFileSystemContentStorage(
+      { fs, logs: await createLogComponent({}) },
+      tmpDir,
+      { decompressMaxFileSize: 1000 }
+    )
+    const cachedFilePath = path.join(tmpDir, '9584', id)
+
+    try {
+      // Inflates to exactly 1000 bytes — at (not over) the cap, so it must be allowed.
+      const data = Buffer.from(new Uint8Array(1000).fill(0))
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+
+      const item = await storage.retrieve(id, { start: 0, end: 9 })
+      expect(item).toBeDefined()
+      expect(item!.size).toBe(10)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.alloc(10, 0))
+      // Decompression succeeded and was cached.
+      expect(await fs.existPath(cachedFilePath)).toBeTruthy()
+    } finally {
+      await storage.stop?.()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it(`When two range requests race for a gzip that exceeds the cap, then both are refused and nothing is left behind`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-bomb-race-'))
+    const storage = await createFolderBasedFileSystemContentStorage(
+      { fs, logs: await createLogComponent({}) },
+      tmpDir,
+      { decompressMaxFileSize: 50 }
+    )
+    const cachedFilePath = path.join(tmpDir, '9584', id)
+
+    try {
+      const data = Buffer.from(new Uint8Array(1000).fill(0))
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+
+      // Two simultaneous range requests exercise the inflight-decompression guard on the error path.
+      const [a, b] = await Promise.all([
+        storage.retrieve(id, { start: 0, end: 9 }),
+        storage.retrieve(id, { start: 0, end: 9 })
+      ])
+      expect(a).toBeUndefined()
+      expect(b).toBeUndefined()
+      expect(await fs.existPath(cachedFilePath)).toBeFalsy()
+
+      // The guard is not left stuck: a subsequent request is still cleanly refused.
+      expect(await storage.retrieve(id, { start: 0, end: 9 })).toBeUndefined()
+    } finally {
+      await storage.stop?.()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it(`When decompressMaxFileSize is unset, then it inherits decompressCacheMaxSize and allows files within it`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-default-ok-'))
+    const storage = await createFolderBasedFileSystemContentStorage(
+      { fs, logs: await createLogComponent({}) },
+      tmpDir,
+      { decompressCacheMaxSize: 2000 }
+    )
+    const cachedFilePath = path.join(tmpDir, '9584', id)
+
+    try {
+      // 1000 bytes is within the inherited 2000-byte limit, so it decompresses normally.
+      const data = Buffer.from(new Uint8Array(1000).fill(0))
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+
+      const item = await storage.retrieve(id, { start: 0, end: 9 })
+      expect(item).toBeDefined()
+      expect(item!.size).toBe(10)
+      expect(await fs.existPath(cachedFilePath)).toBeTruthy()
+    } finally {
+      await storage.stop?.()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it(`When decompressMaxFileSize is unset, then a file larger than decompressCacheMaxSize is refused`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-default-cap-'))
+    const storage = await createFolderBasedFileSystemContentStorage(
+      { fs, logs: await createLogComponent({}) },
+      tmpDir,
+      { decompressCacheMaxSize: 500 }
+    )
+    const cachedFilePath = path.join(tmpDir, '9584', id)
+
+    try {
+      // 1000 bytes exceeds the inherited 500-byte limit (proving the cap came from
+      // decompressCacheMaxSize, not the multi-GB fallback), so it is refused.
+      const data = Buffer.from(new Uint8Array(1000).fill(0))
+      await storage.storeStreamAndCompress(id, bufferToStream(data))
+
+      expect(await storage.retrieve(id, { start: 0, end: 9 })).toBeUndefined()
+      expect(await fs.existPath(cachedFilePath)).toBeFalsy()
+    } finally {
+      await storage.stop?.()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
   it(`When content is stored compressed (gzip only), then exist returns true`, async () => {
     const data = Buffer.from(new Uint8Array(100).fill(0))
     await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(data))
