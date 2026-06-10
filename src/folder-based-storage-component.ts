@@ -228,45 +228,49 @@ export async function createFolderBasedFileSystemContentStorage(
       if (!contentItem && range) {
         const uncompressedPath = await getFilePath(id)
 
-        // Wait for any in-flight decompression of the same file, or start one
+        // Deduplicate concurrent decompressions of the same file. The promise is created and
+        // registered synchronously — there is no `await` between the `get` and the `set` — so
+        // simultaneous callers share a single decompression. Otherwise both would pass the
+        // "not in flight" check, write the same cache file concurrently (corrupting it) and
+        // double-count its size against totalCacheSize.
         let decompressPromise = inflightDecompressions.get(uncompressedPath)
         const isOwner = !decompressPromise
         if (!decompressPromise) {
-          const gzipItem = await retrieveWithEncoding(id, 'gzip')
-          if (gzipItem) {
-            decompressPromise = (async () => {
-              try {
-                // Cap how much the gzip may inflate to so a decompression bomb cannot write an
-                // unbounded file to disk. The gzip trailer's declared size is attacker-controllable,
-                // so the limit is enforced on the actual inflated bytes, not a declared value.
-                await pipe(
-                  await gzipItem.asStream(),
-                  createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
-                  components.fs.createWriteStream(uncompressedPath)
-                )
-              } catch (err) {
-                // Remove partial file to prevent serving corrupt data (or a partially-written bomb)
-                await noFailUnlink(uncompressedPath)
-                throw err
-              }
+          decompressPromise = (async () => {
+            const gzipItem = await retrieveWithEncoding(id, 'gzip')
+            if (!gzipItem) {
+              return
+            }
+            try {
+              // Cap how much the gzip may inflate to so a decompression bomb cannot write an
+              // unbounded file to disk. The gzip trailer's declared size is attacker-controllable,
+              // so the limit is enforced on the actual inflated bytes, not a declared value.
+              await pipe(
+                await gzipItem.asStream(),
+                createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
+                components.fs.createWriteStream(uncompressedPath)
+              )
+            } catch (err) {
+              // Remove partial file to prevent serving corrupt data (or a partially-written bomb)
+              await noFailUnlink(uncompressedPath)
+              throw err
+            }
 
-              const stat = await components.fs.stat(uncompressedPath)
-              decompressCache.set(uncompressedPath, { size: stat.size, lastAccess: Date.now() })
-              totalCacheSize += stat.size
-            })()
-            inflightDecompressions.set(uncompressedPath, decompressPromise)
-          }
+            const stat = await components.fs.stat(uncompressedPath)
+            decompressCache.set(uncompressedPath, { size: stat.size, lastAccess: Date.now() })
+            totalCacheSize += stat.size
+          })()
+          inflightDecompressions.set(uncompressedPath, decompressPromise)
         }
-        if (decompressPromise) {
-          try {
-            await decompressPromise
-          } finally {
-            if (isOwner) inflightDecompressions.delete(uncompressedPath)
-          }
 
-          // Serve range from the cached uncompressed file
-          contentItem = await retrieveWithEncoding(id, null, range)
+        try {
+          await decompressPromise
+        } finally {
+          if (isOwner) inflightDecompressions.delete(uncompressedPath)
         }
+
+        // Serve range from the cached uncompressed file (undefined if the gzip didn't exist)
+        contentItem = await retrieveWithEncoding(id, null, range)
       }
 
       return contentItem
