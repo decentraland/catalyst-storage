@@ -720,4 +720,70 @@ describe('fileSystemContentStorage', () => {
     expect(await fileSystemContentStorage.fileInfo(id2)).toEqual({ encoding: null, size: 3, contentSize: 3 })
     expect(await fileSystemContentStorage.fileInfo('non-existent-id')).toBeUndefined()
   })
+
+  describe('path containment', () => {
+    it(`When an id escapes the root via a sibling-prefix path, then it is rejected and nothing is written outside the root`, async () => {
+      // disablePrefixHash makes the root itself the containment dir, which is where the
+      // sibling-prefix bypass would escape (e.g. "/data/contents" vs "/data/contents-evil").
+      const root = mkdtempSync(path.join(os.tmpdir(), 'cs-traversal-'))
+      const storage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        root,
+        { disablePrefixHash: true }
+      )
+      // A sibling directory sharing the root's name prefix: ".../<rootBasename>X".
+      const siblingDir = path.join(path.dirname(root), path.basename(root) + 'X')
+      const escapingId = path.join('..', path.basename(root) + 'X', 'escaped')
+
+      try {
+        await expect(storage.storeStream(escapingId, bufferToStream(Buffer.from('x')))).rejects.toThrow(
+          /outside of the root/
+        )
+        await expect(storage.exist(escapingId)).rejects.toThrow(/outside of the root/)
+        expect(await fs.existPath(siblingDir)).toBeFalsy()
+      } finally {
+        await storage.stop?.()
+        rmSync(root, { recursive: true, force: true })
+        rmSync(siblingDir, { recursive: true, force: true })
+      }
+    })
+
+    it(`When an id traverses above the root, then it is rejected`, async () => {
+      const root = mkdtempSync(path.join(os.tmpdir(), 'cs-traversal-'))
+      const storage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        root,
+        { disablePrefixHash: true }
+      )
+
+      try {
+        await expect(storage.storeStream('../../../tmp/escaped', bufferToStream(Buffer.from('x')))).rejects.toThrow(
+          /outside of the root/
+        )
+      } finally {
+        await storage.stop?.()
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+
+    it(`When a normal id is used, then it is stored and retrieved within the root`, async () => {
+      const root = mkdtempSync(path.join(os.tmpdir(), 'cs-traversal-'))
+      const storage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        root,
+        { disablePrefixHash: true }
+      )
+
+      try {
+        await storage.storeStream('normal-id', bufferToStream(Buffer.from('hello')))
+        const item = await storage.retrieve('normal-id')
+        expect(item).toBeDefined()
+        expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('hello'))
+        expect(await fs.existPath(path.join(root, 'normal-id'))).toBeTruthy()
+      } finally {
+        await storage.stop?.()
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+  })
 })
