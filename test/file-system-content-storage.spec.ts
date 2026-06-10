@@ -465,7 +465,9 @@ describe('fileSystemContentStorage', () => {
 
   it(`When many range requests race for the same cold gzip, then it is decompressed only once and all return correct data`, async () => {
     const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-race-'))
-    const cachedFilePath = path.join(tmpDir, '9584', id)
+    // Derive the shard the same way the storage does, rather than hardcoding the hash prefix.
+    const shard = createHash('sha1').update(id).digest('hex').substring(0, 4)
+    const cachedFilePath = path.join(tmpDir, shard, id)
 
     // Wrap the fs component to count how many times the uncompressed cache file is written.
     // Without deduplication, concurrent cold-cache range requests each decompress it, writing
