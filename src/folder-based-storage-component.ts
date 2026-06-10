@@ -130,7 +130,11 @@ export async function createFolderBasedFileSystemContentStorage(
     // recursively creates the directory structure if needed
     const dirname = path.dirname(finalPath)
 
-    if (!finalPath.startsWith(directoryPath)) {
+    // Containment check. We compare against `directoryPath + path.sep` (not a bare `startsWith`)
+    // so a sibling directory that merely shares the prefix — e.g. id "../<root>-evil/x" resolving
+    // to "<root>-evil" — cannot pass: "/data/contents-evil".startsWith("/data/contents") is true,
+    // but it is outside "/data/contents/".
+    if (finalPath !== directoryPath && !finalPath.startsWith(directoryPath + path.sep)) {
       throw new Error('Cannot manipulate files outside of the root storage folder')
     }
 
@@ -295,6 +299,9 @@ export async function createFolderBasedFileSystemContentStorage(
     // The gzip format (RFC 1952) stores the original uncompressed size in its
     // trailer — the last 4 bytes (ISIZE field, uint32 little-endian).
     // This works for files < 4GB (ISIZE is mod 2^32).
+    // SECURITY: the trailer is part of the stored (possibly attacker-controlled) file, so this is
+    // only a hint — it is never used to bound decompression (see createSizeLimitTransform) and
+    // callers must not trust it for allocation or limits.
     if (gzipSize < 8) return null // Too small to be a valid gzip file
     try {
       const stream = components.fs.createReadStream(filePath, {
