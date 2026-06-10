@@ -597,17 +597,19 @@ describe('fileSystemContentStorage', () => {
     }
   })
 
-  it(`When decompressMaxFileSize is unset, then it inherits decompressCacheMaxSize and allows files within it`, async () => {
-    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-default-ok-'))
+  it(`When decompressMaxFileSize is unset, then the per-file cap is its own default, independent of decompressCacheMaxSize`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-default-cap-'))
+    // Cache budget far below the per-file default (256MB). A 1000-byte file is larger than the
+    // cache budget but well under the per-file cap, so it must still decompress — proving the
+    // per-file cap is no longer inherited from decompressCacheMaxSize.
     const storage = await createFolderBasedFileSystemContentStorage(
       { fs, logs: await createLogComponent({}) },
       tmpDir,
-      { decompressCacheMaxSize: 2000 }
+      { decompressCacheMaxSize: 500 }
     )
     const cachedFilePath = path.join(tmpDir, '9584', id)
 
     try {
-      // 1000 bytes is within the inherited 2000-byte limit, so it decompresses normally.
       const data = Buffer.from(new Uint8Array(1000).fill(0))
       await storage.storeStreamAndCompress(id, bufferToStream(data))
 
@@ -621,18 +623,18 @@ describe('fileSystemContentStorage', () => {
     }
   })
 
-  it(`When decompressMaxFileSize is unset, then a file larger than decompressCacheMaxSize is refused`, async () => {
-    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-default-cap-'))
+  it(`When decompressMaxFileSize is explicitly set, then it overrides the default and caps decompression`, async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-explicit-cap-'))
+    // A small explicit per-file cap (50 bytes) still applies even with a large cache budget,
+    // confirming the override path is unaffected by the new default.
     const storage = await createFolderBasedFileSystemContentStorage(
       { fs, logs: await createLogComponent({}) },
       tmpDir,
-      { decompressCacheMaxSize: 500 }
+      { decompressCacheMaxSize: 5 * 1024 * 1024 * 1024, decompressMaxFileSize: 50 }
     )
     const cachedFilePath = path.join(tmpDir, '9584', id)
 
     try {
-      // 1000 bytes exceeds the inherited 500-byte limit (proving the cap came from
-      // decompressCacheMaxSize, not the multi-GB fallback), so it is refused.
       const data = Buffer.from(new Uint8Array(1000).fill(0))
       await storage.storeStreamAndCompress(id, bufferToStream(data))
 
