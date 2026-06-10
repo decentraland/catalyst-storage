@@ -31,7 +31,13 @@ export type IContentStorageComponent = IBaseComponent & {
 export type FileInfo = {
   encoding: string | null
   size: number | null
-  /** Logical content size (uncompressed). Same as size when encoding is null. Null if unknown. */
+  /**
+   * Logical content size (uncompressed). Same as size when encoding is null. Null if unknown.
+   *
+   * SECURITY: for gzip-encoded content this is read from the gzip ISIZE trailer, which is part of
+   * the stored (potentially attacker-controlled) file and is only accurate mod 2^32. Treat it as a
+   * hint for display only — never rely on it for buffer allocation or size-limit enforcement.
+   */
   contentSize: number | null
 }
 
