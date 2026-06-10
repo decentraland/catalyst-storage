@@ -343,3 +343,56 @@ describe('S3 Storage edge cases', () => {
     expect(source.destroyed).toBe(true)
   })
 })
+
+describe('S3 Storage retrieve error logging', () => {
+  function createSpyLogs() {
+    const logger = { log: jest.fn(), debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+    return { logs: { getLogger: () => logger }, logger }
+  }
+
+  async function retrieveWithHeadError(headError: any) {
+    const { logs, logger } = createSpyLogs()
+    const mockS3 = {
+      headObject: jest.fn().mockReturnValue({ promise: () => Promise.reject(headError) }),
+      getObject: jest.fn(),
+      upload: jest.fn(),
+      deleteObjects: jest.fn(),
+      listObjectsV2: jest.fn()
+    }
+    const storage = await createS3BasedFileSystemContentStorage({ logs } as any, mockS3 as any, { Bucket: 'test' })
+    const result = await storage.retrieve('some-key')
+    return { result, logger }
+  }
+
+  it(`When headObject returns 403 Forbidden, then it warns with the key and does not error`, async () => {
+    const { result, logger } = await retrieveWithHeadError(
+      Object.assign(new Error(), { code: 'Forbidden', statusCode: 403 })
+    )
+
+    expect(result).toBeUndefined()
+    expect(logger.error).not.toHaveBeenCalled()
+    expect(logger.warn).toHaveBeenCalledTimes(1)
+    expect(logger.warn.mock.calls[0][1]).toMatchObject({ key: 'some-key', statusCode: 403 })
+  })
+
+  it(`When headObject returns NotFound, then it logs nothing and returns undefined`, async () => {
+    const { result, logger } = await retrieveWithHeadError(
+      Object.assign(new Error(), { code: 'NotFound', statusCode: 404 })
+    )
+
+    expect(result).toBeUndefined()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(logger.error).not.toHaveBeenCalled()
+  })
+
+  it(`When headObject fails with a non-403 error, then it logs an error with the key`, async () => {
+    const { result, logger } = await retrieveWithHeadError(
+      Object.assign(new Error('boom'), { code: 'InternalError', statusCode: 500 })
+    )
+
+    expect(result).toBeUndefined()
+    expect(logger.warn).not.toHaveBeenCalled()
+    expect(logger.error).toHaveBeenCalledTimes(1)
+    expect(logger.error.mock.calls[0][1]).toMatchObject({ key: 'some-key', code: 'InternalError' })
+  })
+})

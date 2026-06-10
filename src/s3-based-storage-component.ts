@@ -164,8 +164,23 @@ export async function createS3BasedFileSystemContentStorage(
       )
     } catch (error: any) {
       if (error instanceof RangeError) throw error
+      // A missing object returns NotFound (404) when the principal has s3:ListBucket; there is
+      // nothing to serve, so fall through and return undefined.
       if (error.code !== 'NotFound') {
-        logger.error(error)
+        const logContext = { key: getKey(id), code: error.code, statusCode: error.statusCode }
+        if (error.statusCode === 403) {
+          // S3 returns 403 (with an empty body, hence a null message on HEAD) instead of 404 for a
+          // missing key when the principal lacks s3:ListBucket. It can also be a genuine access
+          // denial. Surface it as an actionable warning rather than a bare, message-less error.
+          logger.warn(
+            'S3 returned 403 Forbidden retrieving content; returning not-found. If the object is simply missing, grant the principal s3:ListBucket so missing keys return 404; otherwise check the object/bucket permissions.',
+            logContext
+          )
+        } else {
+          logger.error(`Failed to retrieve content from S3: ${error.message || error.code || 'unknown error'}`, {
+            ...logContext
+          })
+        }
       }
     }
     return undefined
