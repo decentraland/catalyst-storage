@@ -379,7 +379,7 @@ export async function createFolderBasedFileSystemContentStorage(
       const filePath = await getFilePath(id)
       await removeCacheEntry(filePath)
       await storeStream(id, stream)
-      if (await compressContentFile(filePath)) {
+      if (await compressContentFile(filePath, logger)) {
         // try to remove original file if present
         const contentItem = await retrieve(id)
         if (contentItem?.encoding) {
