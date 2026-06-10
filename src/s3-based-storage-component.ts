@@ -177,9 +177,10 @@ export async function createS3BasedFileSystemContentStorage(
             logContext
           )
         } else {
-          logger.error(`Failed to retrieve content from S3: ${error.message || error.code || 'unknown error'}`, {
-            ...logContext
-          })
+          logger.error(
+            `Failed to retrieve content from S3: ${error.message || error.code || 'unknown error'}`,
+            logContext
+          )
         }
       }
     }
