@@ -11,6 +11,7 @@ const pipe = promisify(pipeline)
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
 const FIVE_GB_IN_BYTES = 5 * 1024 * 1024 * 1024
+const TWO_HUNDRED_FIFTY_SIX_MB_IN_BYTES = 256 * 1024 * 1024
 
 /** @public */
 export type FolderStorageOptions = {
@@ -25,8 +26,9 @@ export type FolderStorageOptions = {
   /**
    * Max size in bytes a single gzip item may inflate to when serving a range request. Inflation is
    * aborted past this limit, preventing a decompression bomb from writing an unbounded amount to
-   * disk. Defaults to `decompressCacheMaxSize` (a file larger than the whole cache could never be
-   * cached anyway).
+   * disk. Defaults to 256MB — comfortably above any realistic single compressible content file
+   * while keeping a malicious gzip's footprint small (and far below the whole-cache budget). Raise
+   * it only if legitimate gzipped content can be larger.
    */
   decompressMaxFileSize?: number
 }
@@ -71,7 +73,7 @@ export async function createFolderBasedFileSystemContentStorage(
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
   const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
-  const MAX_DECOMPRESSED_SIZE = options?.decompressMaxFileSize ?? CACHE_MAX_SIZE
+  const MAX_DECOMPRESSED_SIZE = options?.decompressMaxFileSize ?? TWO_HUNDRED_FIFTY_SIX_MB_IN_BYTES
 
   // LRU cache tracker for decompressed gzip files written to disk
   const decompressCache = new Map<string, { size: number; lastAccess: number }>()
