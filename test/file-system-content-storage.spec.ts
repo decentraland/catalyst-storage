@@ -305,6 +305,28 @@ describe('fileSystemContentStorage', () => {
       jest.useRealTimers()
     })
 
+    it(`When start is called more than once, then it does not schedule a second eviction timer`, async () => {
+      const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-start-'))
+      const storage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        tmpDir,
+        { decompressCacheEvictionInterval: 30000 }
+      )
+
+      try {
+        await storage.start?.({} as any)
+        const timersAfterFirstStart = jest.getTimerCount()
+
+        await storage.start?.({} as any)
+
+        // The repeated start replaces the timer rather than leaking an extra one.
+        expect(jest.getTimerCount()).toBe(timersAfterFirstStart)
+      } finally {
+        await storage.stop?.()
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
     it(`When the cache TTL expires, then the cached uncompressed file is cleaned up`, async () => {
       const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-cache-'))
       const storage = await createFolderBasedFileSystemContentStorage(
