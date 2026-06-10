@@ -1,6 +1,6 @@
 import { createHash } from 'crypto'
 import path from 'path'
-import { pipeline, Readable } from 'stream'
+import { pipeline, Readable, Transform } from 'stream'
 import { promisify } from 'util'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
@@ -22,6 +22,32 @@ export type FolderStorageOptions = {
   decompressCacheMaxSize?: number
   /** How often to run the eviction check in milliseconds. Default: 5 minutes. */
   decompressCacheEvictionInterval?: number
+  /**
+   * Max size in bytes a single gzip item may inflate to when serving a range request. Inflation is
+   * aborted past this limit, preventing a decompression bomb from writing an unbounded amount to
+   * disk. Defaults to `decompressCacheMaxSize` (a file larger than the whole cache could never be
+   * cached anyway).
+   */
+  decompressMaxFileSize?: number
+}
+
+/**
+ * A Transform that passes bytes through unchanged but errors once more than `maxBytes` have flowed
+ * through it. Used to cap how much a gzip item may inflate to, so a decompression bomb cannot write
+ * an unbounded amount of data to disk.
+ */
+function createSizeLimitTransform(maxBytes: number): Transform {
+  let total = 0
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      total += chunk.length
+      if (total > maxBytes) {
+        callback(new Error(`Decompressed size exceeds the maximum allowed of ${maxBytes} bytes`))
+        return
+      }
+      callback(null, chunk)
+    }
+  })
 }
 
 /**
@@ -45,6 +71,7 @@ export async function createFolderBasedFileSystemContentStorage(
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
   const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
+  const MAX_DECOMPRESSED_SIZE = options?.decompressMaxFileSize ?? CACHE_MAX_SIZE
 
   // LRU cache tracker for decompressed gzip files written to disk
   const decompressCache = new Map<string, { size: number; lastAccess: number }>()
@@ -203,9 +230,16 @@ export async function createFolderBasedFileSystemContentStorage(
           if (gzipItem) {
             decompressPromise = (async () => {
               try {
-                await pipe(await gzipItem.asStream(), components.fs.createWriteStream(uncompressedPath))
+                // Cap how much the gzip may inflate to so a decompression bomb cannot write an
+                // unbounded file to disk. The gzip trailer's declared size is attacker-controllable,
+                // so the limit is enforced on the actual inflated bytes, not a declared value.
+                await pipe(
+                  await gzipItem.asStream(),
+                  createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
+                  components.fs.createWriteStream(uncompressedPath)
+                )
               } catch (err) {
-                // Remove partial file to prevent serving corrupt data
+                // Remove partial file to prevent serving corrupt data (or a partially-written bomb)
                 await noFailUnlink(uncompressedPath)
                 throw err
               }
