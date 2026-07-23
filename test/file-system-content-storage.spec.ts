@@ -14,6 +14,16 @@ import { createLogComponent } from '@well-known-components/logger'
 
 describe('fileSystemContentStorage', () => {
   const fs = createFsComponent()
+
+  // The eviction runs real (threadpool) unlinks that jest's fake timers do not await, so asserting
+  // existPath immediately after advanceTimersByTimeAsync races the I/O and flakes under load. Each
+  // awaited existPath forces a real event-loop turn, so polling lets the pending unlink complete.
+  // Bounded: if the file is never removed, the caller's assertion still fails.
+  async function waitUntilRemoved(filePath: string, attempts = 200): Promise<void> {
+    for (let i = 0; i < attempts; i++) {
+      if (!(await fs.existPath(filePath))) return
+    }
+  }
   let tmpRootDir: string
   let fileSystemContentStorage: IContentStorageComponent
 
@@ -349,8 +359,9 @@ describe('fileSystemContentStorage', () => {
         await storage.retrieve(id, { start: 0, end: 9 })
         expect(await fs.existPath(cachedFilePath)).toBeTruthy()
 
-        // Advance past TTL + eviction interval and flush async work
+        // Advance past TTL + eviction interval, then wait out the eviction's real unlink I/O
         await jest.advanceTimersByTimeAsync(60000 + 30000)
+        await waitUntilRemoved(cachedFilePath)
 
         expect(await fs.existPath(cachedFilePath)).toBeFalsy()
         expect(await fs.existPath(cachedFilePath + '.gzip')).toBeTruthy()
@@ -388,8 +399,9 @@ describe('fileSystemContentStorage', () => {
         await storage.retrieve(id2, { start: 0, end: 9 })
         expect(await fs.existPath(cachedFilePath2)).toBeTruthy()
 
-        // Advance past eviction interval and flush async work
+        // Advance past eviction interval, then wait out the eviction's real unlink I/O
         await jest.advanceTimersByTimeAsync(30000)
+        await waitUntilRemoved(cachedFilePath1)
 
         // LRU file (id, accessed first) should be evicted, id2 should remain
         expect(await fs.existPath(cachedFilePath1)).toBeFalsy()
@@ -419,8 +431,9 @@ describe('fileSystemContentStorage', () => {
         expect(item1).toBeDefined()
         expect(await fs.existPath(cachedFilePath)).toBeTruthy()
 
-        // Advance past TTL + eviction interval to evict
+        // Advance past TTL + eviction interval to evict, then wait out the real unlink I/O
         await jest.advanceTimersByTimeAsync(60000 + 30000)
+        await waitUntilRemoved(cachedFilePath)
         expect(await fs.existPath(cachedFilePath)).toBeFalsy()
 
         // Second range request — should re-decompress and serve correctly
@@ -480,6 +493,8 @@ describe('fileSystemContentStorage', () => {
 
       // The partial uncompressed file should have been cleaned up
       expect(await fs.existPath(uncompressedPath)).toBeFalsy()
+      // The staged temp file used by the decompression should also be gone
+      expect(await nodeFs.readdir(path.join(tmpDir, '.tmp-writes'))).toEqual([])
     } finally {
       await storage.stop?.()
       rmSync(tmpDir, { recursive: true, force: true })
@@ -492,17 +507,18 @@ describe('fileSystemContentStorage', () => {
     const shard = createHash('sha1').update(id).digest('hex').substring(0, 4)
     const cachedFilePath = path.join(tmpDir, shard, id)
 
-    // Wrap the fs component to count how many times the uncompressed cache file is written.
-    // Without deduplication, concurrent cold-cache range requests each decompress it, writing
-    // the file once per request (and double-counting its size against the cache budget).
+    // Wrap the fs component to count how many times the uncompressed cache file lands at its
+    // canonical path (decompression stages in the temp dir and renames into place). Without
+    // deduplication, concurrent cold-cache range requests each decompress it, renaming the file
+    // once per request (and double-counting its size against the cache budget).
     const realFs = createFsComponent()
     let decompressionWrites = 0
     const spyFs: IFileSystemComponent = {
       ...realFs,
-      createWriteStream: ((target: any, options?: any) => {
-        if (target === cachedFilePath) decompressionWrites++
-        return realFs.createWriteStream(target, options)
-      }) as typeof realFs.createWriteStream
+      rename: (async (from: any, to: any) => {
+        if (to === cachedFilePath) decompressionWrites++
+        return realFs.rename!(from, to)
+      }) as typeof realFs.rename
     }
 
     const storage = await createFolderBasedFileSystemContentStorage(
@@ -753,8 +769,9 @@ describe('fileSystemContentStorage', () => {
       jest.advanceTimersByTime(1000)
       await storage.retrieve(id, { start: 0, end: 9 })
 
-      // Advance past eviction interval
+      // Advance past eviction interval, then wait out the eviction's real unlink I/O
       await jest.advanceTimersByTimeAsync(30000)
+      await waitUntilRemoved(cachedFilePath2)
 
       // id2 (least recently accessed) should be evicted, id should remain
       expect(await fs.existPath(cachedFilePath1)).toBeTruthy()
@@ -840,6 +857,23 @@ describe('fileSystemContentStorage', () => {
         const tempDir = path.join(tmpRootDir, '.tmp-writes')
         const entries = (await fs.existPath(tempDir)) ? await nodeFs.readdir(tempDir) : []
         expect(entries).toEqual([])
+      })
+    })
+
+    describe('when content is stored with compression', () => {
+      beforeEach(async () => {
+        await fileSystemContentStorage.storeStreamAndCompress(
+          id,
+          bufferToStream(Buffer.from(new Uint8Array(100).fill(0)))
+        )
+      })
+
+      it('should place the gzip at its canonical path', async () => {
+        expect(await fs.existPath(filePath + '.gzip')).toBe(true)
+      })
+
+      it('should leave no staging residue in the reserved temp directory', async () => {
+        expect(await nodeFs.readdir(path.join(tmpRootDir, '.tmp-writes'))).toEqual([])
       })
     })
 
@@ -939,6 +973,20 @@ describe('fileSystemContentStorage', () => {
       it('should retrieve the stored content', async () => {
         const item = await storageWithoutRename.retrieve(id)
         expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+
+      it('should compress in place and serve the gzip via the fallback', async () => {
+        const compressible = Buffer.from(new Uint8Array(100).fill(0))
+        await storageWithoutRename.storeStreamAndCompress(id2, bufferToStream(compressible))
+        const item = await storageWithoutRename.retrieve(id2)
+        expect(item?.encoding).toBe('gzip')
+      })
+
+      it('should serve a range through the in-place decompression fallback', async () => {
+        const compressible = Buffer.from(new Uint8Array(100).fill(0))
+        await storageWithoutRename.storeStreamAndCompress(id2, bufferToStream(compressible))
+        const item = await storageWithoutRename.retrieve(id2, { start: 0, end: 9 })
+        expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.alloc(10, 0))
       })
     })
   })

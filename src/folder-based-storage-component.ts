@@ -279,6 +279,12 @@ export async function createFolderBasedFileSystemContentStorage(
             if (!gzipItem) {
               return
             }
+            // Stage the inflation in the temp dir when rename is available, so a process killed
+            // mid-decompress can never leave a partial file at the canonical uncompressed path —
+            // a later range request would silently serve its truncated bytes as valid content.
+            // Without rename (legacy custom fs adapter) fall back to writing in place.
+            const { rename } = components.fs
+            const writePath = rename ? path.join(tempDir, randomBytes(16).toString('hex')) : uncompressedPath
             try {
               // Cap how much the gzip may inflate to so a decompression bomb cannot write an
               // unbounded file to disk. The gzip trailer's declared size is attacker-controllable,
@@ -286,11 +292,14 @@ export async function createFolderBasedFileSystemContentStorage(
               await pipe(
                 await gzipItem.asStream(),
                 createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
-                components.fs.createWriteStream(uncompressedPath)
+                components.fs.createWriteStream(writePath)
               )
+              if (rename) {
+                await rename(writePath, uncompressedPath)
+              }
             } catch (err) {
               // Remove partial file to prevent serving corrupt data (or a partially-written bomb)
-              await noFailUnlink(uncompressedPath)
+              await noFailUnlink(writePath)
               throw err
             }
 
@@ -328,8 +337,10 @@ export async function createFolderBasedFileSystemContentStorage(
     const dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
     for await (const entry of dirEntries) {
       if (entry.isDirectory()) {
-        // Never descend into the reserved temp-write dir: its files are staging artifacts, not content.
-        if (entry.name === TEMP_DIR_NAME) continue
+        // The reserved temp-write dir only exists directly under the storage root; skip it there and
+        // only there, so a deeper same-named directory (reachable via a slash-containing id) is not
+        // silently hidden from enumeration.
+        if (folder === root && entry.name === TEMP_DIR_NAME) continue
         yield* allFileIdsRec(path.resolve(folder, entry.name), prefix)
       } else if (!prefix || entry.name.startsWith(prefix)) {
         const baseName = entry.name.replace(/\.gzip$/, '')
@@ -444,7 +455,25 @@ export async function createFolderBasedFileSystemContentStorage(
       const filePath = await getFilePath(id)
       await removeCacheEntry(filePath)
       await storeStream(id, stream)
-      if (await compressContentFile(filePath, logger)) {
+      // Stage the .gzip in the temp dir and rename it into place, mirroring storeStream: a process
+      // killed mid-compression must not leave a partial .gzip at the canonical path, because
+      // `retrieve()` prefers the gzip encoding and would serve the truncated file as valid content.
+      // Without rename (legacy custom fs adapter) fall back to compressing in place, as before.
+      const { rename } = components.fs
+      const stagedGzipPath = rename ? path.join(tempDir, randomBytes(16).toString('hex')) : undefined
+      let compressed: boolean
+      try {
+        compressed = await compressContentFile(filePath, logger, stagedGzipPath)
+        if (compressed && rename && stagedGzipPath) {
+          await rename(stagedGzipPath, filePath + '.gzip')
+        }
+      } catch (err) {
+        // compressContentFile already removed its own (possibly partial) output; this only covers a
+        // failed rename, whose staged file would otherwise linger until the next startup sweep.
+        if (stagedGzipPath) await noFailUnlink(stagedGzipPath)
+        throw err
+      }
+      if (compressed) {
         // try to remove original file if present
         const contentItem = await retrieve(id)
         if (contentItem?.encoding) {
