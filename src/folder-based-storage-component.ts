@@ -9,8 +9,11 @@ import { compressContentFile } from './extras/compression'
 const pipe = promisify(pipeline)
 
 // Suffix for the transient file an atomic `storeStream` writes to before renaming it into place.
-// It is filtered out of `allFileIds` so a crash-orphaned temp is never mistaken for stored content.
 const TEMP_FILE_SUFFIX = '.tmp'
+
+// Matches only the temp files storeStream creates (`<id>.<32-hex>.tmp`) — used to filter them out of
+// `allFileIds` and sweep crash-orphaned ones at start, without ever matching a real id ending in `.tmp`.
+const TEMP_FILE_PATTERN = /\.[0-9a-f]{32}\.tmp$/
 
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
@@ -122,6 +125,9 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   let evictionTimer: ReturnType<typeof setInterval> | undefined
+  // Tracks the detached startup temp-file sweep so `stop()` can await it (rather than leaving a
+  // promise dangling past shutdown).
+  let tempFileSweep: Promise<void> = Promise.resolve()
 
   async function getFilePath(id: string): Promise<string> {
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
@@ -189,10 +195,12 @@ export async function createFolderBasedFileSystemContentStorage(
   const storeStream = async (id: string, stream: Readable): Promise<void> => {
     const filePath = await getFilePath(id)
     // Write to a temp file in the same directory, then atomically rename it into place. A direct
-    // write to the final path leaves a truncated/zero-byte file if the process is killed mid-write
-    // (OOM, eviction, power loss); since `exist()` only checks for the path, that partial file is
+    // write to the final path leaves a truncated/zero-byte file if the process dies mid-write
+    // (OOM-kill, eviction, crash); since `exist()` only checks for the path, that partial file is
     // then treated as a valid cached copy and never re-fetched. `rename` within a filesystem is
-    // atomic, so a reader always sees either the previous file or the fully-written new one.
+    // atomic, so a reader always sees either the previous file or the fully-written new one. (The
+    // data is not fsync'd before the rename, so a power loss can still lose it — content is
+    // content-addressed and simply re-downloaded, so durability past process death isn't needed.)
     const tempPath = `${filePath}.${randomBytes(16).toString('hex')}${TEMP_FILE_SUFFIX}`
     try {
       await pipe(stream, components.fs.createWriteStream(tempPath))
@@ -304,7 +312,7 @@ export async function createFolderBasedFileSystemContentStorage(
     for await (const entry of dirEntries) {
       if (entry.isDirectory()) {
         yield* allFileIdsRec(path.resolve(folder, entry.name), prefix)
-      } else if (entry.name.endsWith(TEMP_FILE_SUFFIX)) {
+      } else if (TEMP_FILE_PATTERN.test(entry.name)) {
         // In-flight (or crash-orphaned) atomic-write temp file — not addressable content, skip it.
         continue
       } else if (!prefix || entry.name.startsWith(prefix)) {
@@ -365,6 +373,27 @@ export async function createFolderBasedFileSystemContentStorage(
     return undefined
   }
 
+  // Removes temp files left behind by a `storeStream` that was interrupted in a previous run. Walks
+  // the sharded tree once; best-effort, so a missing/racing directory or a failed unlink is ignored.
+  const sweepOrphanedTempFiles = async (folder: string): Promise<number> => {
+    let removed = 0
+    let dirEntries
+    try {
+      dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
+    } catch {
+      return removed
+    }
+    for await (const entry of dirEntries) {
+      const entryPath = path.resolve(folder, entry.name)
+      if (entry.isDirectory()) {
+        removed += await sweepOrphanedTempFiles(entryPath)
+      } else if (TEMP_FILE_PATTERN.test(entry.name)) {
+        if (await noFailUnlink(entryPath)) removed++
+      }
+    }
+    return removed
+  }
+
   return {
     async start(_startOptions: any) {
       // Idempotent: clear any existing timer first so a repeated start() doesn't leak intervals.
@@ -373,14 +402,21 @@ export async function createFolderBasedFileSystemContentStorage(
       }
       evictionTimer = setInterval(evictCache, CACHE_EVICTION_INTERVAL)
       evictionTimer.unref()
+      // Detached best-effort cleanup of temp files orphaned by an interrupted write in a prior run.
+      // Runs in the background so it never delays startup; `stop()` awaits it once, at shutdown.
+      tempFileSweep = sweepOrphanedTempFiles(root)
+        .then((removed) => {
+          if (removed > 0) logger.info(`Removed ${removed} orphaned temp file(s) at startup`)
+        })
+        .catch((error) => logger.warn(`Orphaned temp-file sweep failed: ${error}`))
     },
     async stop() {
       if (evictionTimer) {
         clearInterval(evictionTimer)
         evictionTimer = undefined
       }
-      // Wait for any inflight decompressions to finish before cleaning up
-      await Promise.allSettled(inflightDecompressions.values())
+      // Wait for the startup temp-file sweep and any inflight decompressions before cleaning up
+      await Promise.allSettled([tempFileSweep, ...inflightDecompressions.values()])
       // Evict all cached files on shutdown to prevent disk leaks across restarts
       for (const [filePath, entry] of decompressCache) {
         await noFailUnlink(filePath)

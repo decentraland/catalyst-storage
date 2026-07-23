@@ -866,6 +866,53 @@ describe('fileSystemContentStorage', () => {
         expect(seenIds.some((fileId) => fileId.endsWith('.tmp'))).toBe(false)
       })
     })
+
+    describe('when start runs with an orphaned temp file present', () => {
+      let orphanPath: string
+
+      beforeEach(async () => {
+        await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+        orphanPath = path.join(path.dirname(filePath), `${id}.deadbeefdeadbeefdeadbeefdeadbeef.tmp`)
+        await nodeFs.writeFile(orphanPath, Buffer.from(''))
+        await fileSystemContentStorage.start?.({} as any)
+        // stop() awaits the background sweep, so it has completed by the time we assert.
+        await fileSystemContentStorage.stop?.()
+      })
+
+      it('should remove the orphaned temp file', async () => {
+        expect(await fs.existPath(orphanPath)).toBe(false)
+      })
+
+      it('should keep the real content file', async () => {
+        expect(await fs.existPath(filePath)).toBe(true)
+      })
+    })
+
+    describe('when an id legitimately ends in .tmp', () => {
+      const tmpLikeId = 'legittmpfile.tmp'
+      let tmpLikeFilePath: string
+
+      beforeEach(async () => {
+        tmpLikeFilePath = path.join(
+          tmpRootDir,
+          createHash('sha1').update(tmpLikeId).digest('hex').substring(0, 4),
+          tmpLikeId
+        )
+        await fileSystemContentStorage.storeStream(tmpLikeId, bufferToStream(content))
+        await fileSystemContentStorage.start?.({} as any)
+        await fileSystemContentStorage.stop?.()
+      })
+
+      it('should not sweep it away as a temp file', async () => {
+        expect(await fs.existPath(tmpLikeFilePath)).toBe(true)
+      })
+
+      it('should still enumerate it in allFileIds', async () => {
+        const seenIds: string[] = []
+        for await (const fileId of fileSystemContentStorage.allFileIds()) seenIds.push(fileId)
+        expect(seenIds).toContain(tmpLikeId)
+      })
+    })
   })
 
   describe('path containment', () => {
