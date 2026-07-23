@@ -474,6 +474,45 @@ describe('fileSystemContentStorage', () => {
         rmSync(tmpDir, { recursive: true, force: true })
       }
     })
+
+    describe('when a cached path is promoted to primary content before the eviction fires', () => {
+      let promotedStorage: IContentStorageComponent
+      let promotedRoot: string
+      let cachedFilePath: string
+
+      beforeEach(async () => {
+        promotedRoot = mkdtempSync(path.join(os.tmpdir(), 'content-storage-promoted-'))
+        promotedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          promotedRoot,
+          { decompressCacheTTL: 60000, decompressCacheEvictionInterval: 30000 }
+        )
+        await promotedStorage.start?.({} as any)
+        cachedFilePath = path.join(promotedRoot, '9584', id)
+        // Cache the decompressed file, then overwrite the id with plain (incompressible) content:
+        // the canonical path now holds primary content, not a re-derivable cache.
+        await promotedStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(0))))
+        await promotedStorage.retrieve(id, { start: 0, end: 9 })
+        await promotedStorage.storeStream(id, bufferToStream(content))
+        // Fire the eviction well past the TTL — it must not unlink the promoted file.
+        await jest.advanceTimersByTimeAsync(60000 + 30000)
+        await jest.advanceTimersByTimeAsync(30000)
+      })
+
+      afterEach(async () => {
+        await promotedStorage.stop?.()
+        rmSync(promotedRoot, { recursive: true, force: true })
+      })
+
+      it('should not delete the promoted primary file', async () => {
+        expect(await fs.existPath(cachedFilePath)).toBe(true)
+      })
+
+      it('should keep serving the promoted bytes', async () => {
+        const item = await promotedStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+    })
   })
 
   it(`When decompression fails due to a corrupt gzip file, then the partial file is cleaned up and retrieve returns undefined`, async () => {
@@ -899,6 +938,78 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when a gzip-backed id is overwritten with a plain storeStream', () => {
+      beforeEach(async () => {
+        await fileSystemContentStorage.storeStreamAndCompress(
+          id,
+          bufferToStream(Buffer.from(new Uint8Array(100).fill(0)))
+        )
+        await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+      })
+
+      it('should serve the newly stored bytes, not the stale gzip', async () => {
+        const item = await fileSystemContentStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+
+      it('should remove the stale gzip of the previous version', async () => {
+        expect(await fs.existPath(filePath + '.gzip')).toBe(false)
+      })
+    })
+
+    describe('when a custom tempDirectoryName is configured in flat mode', () => {
+      let customStorage: IContentStorageComponent
+      let customRoot: string
+
+      beforeEach(async () => {
+        customRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-custom-temp-'))
+        customStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          customRoot,
+          { disablePrefixHash: true, tempDirectoryName: '.staging' }
+        )
+      })
+
+      afterEach(async () => {
+        await customStorage.stop?.()
+        rmSync(customRoot, { recursive: true, force: true })
+      })
+
+      it('should stage into the custom directory and store content normally', async () => {
+        await customStorage.storeStream(id, bufferToStream(content))
+        const item = await customStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+
+      it('should reject ids under the custom reserved name', async () => {
+        await expect(customStorage.storeStream('.staging/foo', bufferToStream(content))).rejects.toThrow(
+          /reserved temp-write/
+        )
+      })
+
+      it('should leave the default reserved name addressable as a content id', async () => {
+        await customStorage.storeStream('.tmp-writes', bufferToStream(content))
+        const item = await customStorage.retrieve('.tmp-writes')
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+    })
+
+    describe('when the tempDirectoryName is not a single path segment', () => {
+      it('should reject creating the storage', async () => {
+        const badRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-bad-temp-'))
+        try {
+          await expect(
+            createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, badRoot, {
+              disablePrefixHash: false,
+              tempDirectoryName: 'a/b'
+            })
+          ).rejects.toThrow(/single path segment/)
+        } finally {
+          rmSync(badRoot, { recursive: true, force: true })
+        }
+      })
+    })
+
     describe('when the startup sweep runs with a file staged by this boot present', () => {
       let ownPrefixedPath: string
       let foreignPath: string
@@ -1018,6 +1129,63 @@ describe('fileSystemContentStorage', () => {
 
       it('should serve the range from the new content', () => {
         expect(rangeResult).toEqual(content.subarray(0, 3))
+      })
+    })
+
+    describe('when content is overwritten with compressible bytes while a range decompression is in flight', () => {
+      let overwriteStorage: IContentStorageComponent
+      let newContent: Buffer
+      let rangeResult: Buffer | undefined
+
+      beforeEach(async () => {
+        const realFs = createFsComponent()
+        const gzipPath = filePath + '.gzip'
+        // Gate the FIRST read of the canonical gzip so the decompression stays in flight while the
+        // id is overwritten underneath it; the retry's read of the NEW gzip passes through.
+        let releaseGzipRead: () => void = () => undefined
+        const gzipReadGate = new Promise<void>((res) => (releaseGzipRead = res))
+        let gzipReadStarted: () => void = () => undefined
+        const gzipReadStartedPromise = new Promise<void>((res) => (gzipReadStarted = res))
+        let holdNextGzipRead = true
+        const gatedFs: IFileSystemComponent = {
+          ...realFs,
+          createReadStream: ((target: any, opts?: any) => {
+            const real = realFs.createReadStream(target, opts)
+            if (String(target) !== gzipPath || !holdNextGzipRead) return real
+            holdNextGzipRead = false
+            const gated = new PassThrough()
+            gzipReadStarted()
+            void gzipReadGate.then(() => real.pipe(gated))
+            return gated
+          }) as typeof realFs.createReadStream
+        }
+        overwriteStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: gatedFs, logs: await createLogComponent({}) },
+          tmpRootDir
+        )
+        newContent = Buffer.from(new Uint8Array(100).fill(9))
+        await overwriteStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(7))))
+        const rangePromise = overwriteStorage.retrieve(id, { start: 0, end: 2 })
+        await gzipReadStartedPromise
+        // The overwrite is also compressible, so the new version ends up gzip-only: the discarded
+        // old decompression leaves no uncompressed file and the range must retry against the new gzip.
+        await overwriteStorage.storeStreamAndCompress(id, bufferToStream(newContent))
+        releaseGzipRead()
+        const item = await rangePromise
+        rangeResult = item ? await streamToBuffer(await item.asStream()) : undefined
+      })
+
+      afterEach(async () => {
+        await overwriteStorage.stop?.()
+      })
+
+      it('should serve the range from the new content via the retry instead of returning undefined', () => {
+        expect(rangeResult).toEqual(newContent.subarray(0, 3))
+      })
+
+      it('should serve the whole new content on a later retrieve', async () => {
+        const item = await overwriteStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(newContent)
       })
     })
 

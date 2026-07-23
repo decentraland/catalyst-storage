@@ -14,6 +14,12 @@ const pipe = promisify(pipeline)
 // addressable id. Skipped by `allFileIds` and cleaned at startup. Its name is therefore reserved.
 const TEMP_DIR_NAME = '.tmp-writes'
 
+// Matches exactly the names newTempPath generates (`<16-hex bootId>-<32-hex random>`). The startup
+// sweep deletes ONLY files of this shape: anything else under the reserved dir is not ours to
+// remove — in flat (disablePrefixHash) mode a deployment that predates the reservation may hold
+// legitimate content there, and deleting unrecognized files would turn an upgrade into data loss.
+const STAGED_FILE_NAME = /^[0-9a-f]{16}-[0-9a-f]{32}$/
+
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
 const FIVE_GB_IN_BYTES = 5 * 1024 * 1024 * 1024
@@ -37,6 +43,14 @@ export type FolderStorageOptions = {
    * it only if legitimate gzipped content can be larger.
    */
   decompressMaxFileSize?: number
+  /**
+   * Name of the reserved directory (directly under the storage root) where atomic writes stage
+   * their temp files. The name is reserved: ids resolving into it are rejected. Configurable so a
+   * flat-mode (disablePrefixHash) deployment that already holds content under the default name can
+   * pick a different reserved name instead of migrating that content. Must be a single path
+   * segment. Default: '.tmp-writes'.
+   */
+  tempDirectoryName?: string
 }
 
 /**
@@ -76,7 +90,11 @@ export async function createFolderBasedFileSystemContentStorage(
   await components.fs.mkdir(root, { recursive: true })
 
   // Created up front so storeStream can stage into it without a per-write mkdir.
-  const tempDir = path.join(root, TEMP_DIR_NAME)
+  const tempDirName = options?.tempDirectoryName ?? TEMP_DIR_NAME
+  if (tempDirName === '' || tempDirName === '.' || tempDirName === '..' || /[/\\]/.test(tempDirName)) {
+    throw new Error(`tempDirectoryName must be a single path segment, got: ${JSON.stringify(tempDirName)}`)
+  }
+  const tempDir = path.join(root, tempDirName)
   await components.fs.mkdir(tempDir, { recursive: true })
 
   // Staged files are prefixed with a per-boot random id so the startup sweep can tell leftovers
@@ -86,6 +104,24 @@ export async function createFolderBasedFileSystemContentStorage(
   const newTempPath = (): string => path.join(tempDir, `${bootId}-${randomBytes(16).toString('hex')}`)
 
   const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
+
+  // In flat mode the root is the content namespace, so a deployment that predates the reservation
+  // may hold content ids under the reserved directory. Such files are preserved (the sweep only
+  // removes staged-shape names) but are not addressable while the reservation holds — surface them
+  // loudly so the operator can migrate them or pick a different tempDirectoryName.
+  if (!USE_HASH_PREFIX) {
+    try {
+      const preExisting = (await components.fs.readdir(tempDir)).filter((entry) => !STAGED_FILE_NAME.test(entry))
+      if (preExisting.length > 0) {
+        logger.warn(
+          `Found ${preExisting.length} unrecognized file(s) under the reserved temp directory '${tempDirName}'. ` +
+            `They are preserved on disk but not addressable as content ids; migrate them out or configure a different tempDirectoryName.`
+        )
+      }
+    } catch {
+      // best-effort advisory only
+    }
+  }
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
   const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
@@ -127,6 +163,31 @@ export async function createFolderBasedFileSystemContentStorage(
     if (token) token.invalidated = true
   }
 
+  // A compression stage (storeStreamAndCompress) produces a gzip of the raw bytes it committed; if
+  // another store or a delete lands on the same path before the gzip commit, that gzip belongs to
+  // replaced bytes and must be discarded — and the raw file must not be unlinked, since it may now
+  // be someone else's newer primary content. Registered at raw-commit time, marked by any later
+  // committer, unregistered when the compression stage ends. Bounded by in-flight compressions.
+  const inflightCompressionTokens = new Map<string, Set<{ stale: boolean }>>()
+  function registerCompressionToken(filePath: string): { stale: boolean } {
+    const token = { stale: false }
+    const tokens = inflightCompressionTokens.get(filePath) ?? new Set()
+    tokens.add(token)
+    inflightCompressionTokens.set(filePath, tokens)
+    return token
+  }
+  function unregisterCompressionToken(filePath: string, token: { stale: boolean }): void {
+    const tokens = inflightCompressionTokens.get(filePath)
+    if (!tokens) return
+    tokens.delete(token)
+    if (tokens.size === 0) inflightCompressionTokens.delete(filePath)
+  }
+  function markCompressionsStale(filePath: string): void {
+    for (const token of inflightCompressionTokens.get(filePath) ?? []) {
+      token.stale = true
+    }
+  }
+
   // Drops the cache-tracking entry WITHOUT unlinking the file. Used when the canonical path stops
   // being a derived cache and becomes primary content (a store landed there): a stale entry would
   // let TTL/size eviction delete the only copy of the new content.
@@ -149,15 +210,25 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  // Unlinks an evicted cache file under the path lock, re-checking the entry is still current: a
+  // store may have promoted the path to primary content (forgetting the entry) between the eviction
+  // scan and this delete — unlinking then would destroy the only copy of the new content.
+  async function evictCacheEntry(filePath: string, entry: { size: number; lastAccess: number }): Promise<void> {
+    await withPathLock(filePath, async () => {
+      if (decompressCache.get(filePath) !== entry) return
+      await noFailUnlink(filePath)
+      totalCacheSize -= entry.size
+      decompressCache.delete(filePath)
+    })
+  }
+
   async function runEviction() {
     const now = Date.now()
 
     // TTL eviction
     for (const [filePath, entry] of decompressCache) {
       if (now - entry.lastAccess > CACHE_TTL) {
-        await noFailUnlink(filePath)
-        totalCacheSize -= entry.size
-        decompressCache.delete(filePath)
+        await evictCacheEntry(filePath, entry)
       }
     }
 
@@ -166,9 +237,7 @@ export async function createFolderBasedFileSystemContentStorage(
       const sorted = [...decompressCache.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess)
       for (const [filePath, entry] of sorted) {
         if (totalCacheSize <= CACHE_MAX_SIZE) break
-        await noFailUnlink(filePath)
-        totalCacheSize -= entry.size
-        decompressCache.delete(filePath)
+        await evictCacheEntry(filePath, entry)
       }
     }
   }
@@ -258,8 +327,12 @@ export async function createFolderBasedFileSystemContentStorage(
       try {
         await withPathLock(filePath, async () => {
           await pipe(stream, components.fs.createWriteStream(filePath))
+          // The raw and its .gzip are one versioned object: a gzip left from a previous version
+          // would be preferred by retrieve() and serve stale bytes over the content just stored.
+          await noFailUnlink(filePath + '.gzip')
           forgetCacheEntry(filePath)
           invalidateInflightDecompression(filePath)
+          markCompressionsStale(filePath)
         })
       } catch (err) {
         await noFailUnlink(filePath)
@@ -280,10 +353,15 @@ export async function createFolderBasedFileSystemContentStorage(
       await pipe(stream, components.fs.createWriteStream(tempPath))
       await withPathLock(filePath, async () => {
         await rename(tempPath, filePath)
+        // The raw and its .gzip are one versioned object: a gzip left from a previous version would
+        // be preferred by retrieve() and serve stale bytes over the content just stored.
+        await noFailUnlink(filePath + '.gzip')
         // The canonical path now holds primary content: drop any stale decompress-cache tracking so
-        // eviction can never delete it, and tell an in-flight decompression its output is outdated.
+        // eviction can never delete it, tell an in-flight decompression its output is outdated, and
+        // tell an in-flight compression its staged gzip no longer matches the canonical bytes.
         forgetCacheEntry(filePath)
         invalidateInflightDecompression(filePath)
+        markCompressionsStale(filePath)
       })
     } catch (err) {
       // On a write error the temp file may be partial; on a rename error it still exists. Either way
@@ -326,7 +404,11 @@ export async function createFolderBasedFileSystemContentStorage(
 
       // If range was requested but uncompressed file doesn't exist, fall back to
       // decompressing the gzip file, writing it to disk as a cache, and serving the range.
-      if (!contentItem && range) {
+      // Two attempts: a decompression can be invalidated by a concurrent overwrite committing while
+      // it inflates (its stale output is correctly discarded), leaving this request with neither a
+      // cached file nor its result — the second attempt re-reads the id's current representation
+      // instead of returning a spurious undefined for a valid id.
+      for (let attempt = 0; attempt < 2 && !contentItem && range; attempt++) {
         const uncompressedPath = await getFilePath(id)
 
         // Deduplicate concurrent decompressions of the same file. The promise is created and
@@ -405,7 +487,8 @@ export async function createFolderBasedFileSystemContentStorage(
           if (isOwner) inflightDecompressions.delete(uncompressedPath)
         }
 
-        // Serve range from the cached uncompressed file (undefined if the gzip didn't exist)
+        // Serve range from the cached uncompressed file (undefined when the gzip didn't exist or
+        // the decompression was discarded; the loop then retries once)
         contentItem = await retrieveWithEncoding(id, null, range)
       }
 
@@ -429,7 +512,7 @@ export async function createFolderBasedFileSystemContentStorage(
         // The reserved temp-write dir only exists directly under the storage root; skip it there and
         // only there, so a deeper same-named directory (reachable via a slash-containing id) is not
         // silently hidden from enumeration.
-        if (folder === root && entry.name === TEMP_DIR_NAME) continue
+        if (folder === root && entry.name === tempDirName) continue
         yield* allFileIdsRec(path.resolve(folder, entry.name), prefix)
       } else if (!prefix || entry.name.startsWith(prefix)) {
         const baseName = entry.name.replace(/\.gzip$/, '')
@@ -489,13 +572,6 @@ export async function createFolderBasedFileSystemContentStorage(
     return undefined
   }
 
-  // Matches exactly the names newTempPath generates (`<16-hex bootId>-<32-hex random>`). The sweep
-  // deletes ONLY files of this shape: anything else under the reserved dir is not ours to remove —
-  // in flat (disablePrefixHash) mode a deployment that predates the reservation may hold legitimate
-  // content under `.tmp-writes/`, and deleting unrecognized files would turn an upgrade into data
-  // loss.
-  const STAGED_FILE_NAME = /^[0-9a-f]{16}-[0-9a-f]{32}$/
-
   // Removes temp files left behind by writes interrupted in a previous run. Staged filenames carry
   // this boot's random prefix, so a staged-shape file with a different prefix is by construction a
   // leftover of an earlier process — a write racing this sweep stages under the current bootId and
@@ -540,9 +616,7 @@ export async function createFolderBasedFileSystemContentStorage(
       await Promise.allSettled([tempFileSweep, ...inflightDecompressions.values()])
       // Evict all cached files on shutdown to prevent disk leaks across restarts
       for (const [filePath, entry] of decompressCache) {
-        await noFailUnlink(filePath)
-        totalCacheSize -= entry.size
-        decompressCache.delete(filePath)
+        await evictCacheEntry(filePath, entry)
       }
     },
     storeStream,
@@ -550,51 +624,77 @@ export async function createFolderBasedFileSystemContentStorage(
     exist,
     async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
       const filePath = await getFilePath(id)
-      await removeCacheEntry(filePath)
-      await storeStream(id, stream)
-      // Stage the .gzip in the temp dir and rename it into place, mirroring storeStream: a process
-      // killed mid-compression must not leave a partial .gzip at the canonical path, because
-      // `retrieve()` prefers the gzip encoding and would serve the truncated file as valid content.
-      // Without rename (legacy custom fs adapter) fall back to compressing in place, as before.
       const { rename } = components.fs
-      const stagedGzipPath = rename ? newTempPath() : undefined
-      let compressed = false
+      // Without rename (legacy custom fs adapter) fall back to the original in-place behavior: the
+      // in-place compression truncates/removes the old gzip itself, and none of it is crash-atomic.
+      if (!rename) {
+        await storeStream(id, stream)
+        if (await compressContentFile(filePath, logger)) {
+          // try to remove original file if present
+          const contentItem = await retrieve(id)
+          if (contentItem?.encoding) {
+            await noFailUnlink(filePath)
+          }
+        }
+        return
+      }
+      // The raw file and its .gzip are one versioned object, and retrieve() prefers the gzip. The
+      // overwrite therefore commits in two locked steps:
+      //   1. raw commit — rename the staged raw into place AND remove the previous version's gzip in
+      //      the same locked section, so no reader can ever pair the new raw with the old gzip and
+      //      no decompression of the old gzip can commit past this point.
+      //   2. gzip commit — after compressing (outside any lock), re-take the lock and, only if no
+      //      other store/delete landed in between (compression token still fresh), rename the staged
+      //      gzip into place and remove the now-redundant raw. If the token went stale, the staged
+      //      gzip belongs to replaced bytes: discard it and leave the newer content untouched.
+      // A process killed between the steps leaves the raw as the (fully valid) primary
+      // representation — never a partial file at a canonical path.
+      const tempPath = newTempPath()
+      let token: { stale: boolean }
       try {
-        compressed = await compressContentFile(filePath, logger, stagedGzipPath)
-        if (rename && stagedGzipPath) {
-          await withPathLock(filePath, async () => {
-            if (compressed) {
-              await rename(stagedGzipPath, filePath + '.gzip')
-            } else {
-              // Compression was staged, so the canonical .gzip was never truncated in place: a gzip
-              // from a previous version of this id could survive and retrieve() would prefer its
-              // stale bytes over the content just stored. Remove it when no fresh gzip is committed.
-              await noFailUnlink(filePath + '.gzip')
-            }
-            // A decompression started against the previous gzip may still be inflating (invalidate
-            // it) or may have already re-registered the canonical path as cache holding the previous
-            // version's bytes (remove that file+entry; the check is a no-op when no entry exists, so
-            // the freshly stored primary content is never touched).
-            invalidateInflightDecompression(filePath)
-            await removeCacheEntry(filePath)
-          })
-        }
-      } catch (err) {
-        // compressContentFile already removed its own (possibly partial) output; this covers a failed
-        // rename, whose staged file would otherwise linger until the next startup sweep, and clears a
-        // stale pre-existing canonical .gzip for the same reason as above.
-        if (stagedGzipPath) {
-          await noFailUnlink(stagedGzipPath)
+        await pipe(stream, components.fs.createWriteStream(tempPath))
+        token = await withPathLock(filePath, async () => {
+          await rename(tempPath, filePath)
           await noFailUnlink(filePath + '.gzip')
-        }
+          forgetCacheEntry(filePath)
+          invalidateInflightDecompression(filePath)
+          markCompressionsStale(filePath)
+          return registerCompressionToken(filePath)
+        })
+      } catch (err) {
+        await noFailUnlink(tempPath)
         throw err
       }
-      if (compressed) {
-        // try to remove original file if present
-        const contentItem = await retrieve(id)
-        if (contentItem?.encoding) {
-          await noFailUnlink(filePath)
+      try {
+        const stagedGzipPath = newTempPath()
+        try {
+          const compressed = await compressContentFile(filePath, logger, stagedGzipPath)
+          await withPathLock(filePath, async () => {
+            if (token.stale) {
+              // Another store or delete landed after our raw commit: the staged gzip compresses
+              // bytes that are no longer canonical. Discard it; the newer committer owns the path.
+              if (compressed) await noFailUnlink(stagedGzipPath)
+              return
+            }
+            if (!compressed) {
+              // Not beneficial: the raw stays primary; the old gzip was already removed at raw
+              // commit and compressContentFile removed its own staged output.
+              return
+            }
+            await rename(stagedGzipPath, filePath + '.gzip')
+            // The gzip is now the primary representation; the raw becomes redundant. Unlinking it
+            // under the same lock and token check guarantees it is still the exact version this
+            // gzip was produced from.
+            await noFailUnlink(filePath)
+          })
+        } catch (err) {
+          // compressContentFile already removed its own (possibly partial) staged output on error;
+          // this covers a failed rename, whose staged file would otherwise linger until the sweep.
+          await noFailUnlink(stagedGzipPath)
+          throw err
         }
+      } finally {
+        unregisterCompressionToken(filePath, token)
       }
     },
     async delete(ids: string[]): Promise<void> {
@@ -609,6 +709,7 @@ export async function createFolderBasedFileSystemContentStorage(
           }
           await noFailUnlink(filePath + '.gzip')
           invalidateInflightDecompression(filePath)
+          markCompressionsStale(filePath)
         })
       }
     },
