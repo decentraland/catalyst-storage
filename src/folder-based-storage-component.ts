@@ -1,4 +1,4 @@
-import { createHash } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import path from 'path'
 import { pipeline, Readable, Transform } from 'stream'
 import { promisify } from 'util'
@@ -7,6 +7,10 @@ import { SimpleContentItem, streamToBuffer } from './content-item'
 import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
+
+// Suffix for the transient file an atomic `storeStream` writes to before renaming it into place.
+// It is filtered out of `allFileIds` so a crash-orphaned temp is never mistaken for stored content.
+const TEMP_FILE_SUFFIX = '.tmp'
 
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
@@ -184,10 +188,19 @@ export async function createFolderBasedFileSystemContentStorage(
 
   const storeStream = async (id: string, stream: Readable): Promise<void> => {
     const filePath = await getFilePath(id)
+    // Write to a temp file in the same directory, then atomically rename it into place. A direct
+    // write to the final path leaves a truncated/zero-byte file if the process is killed mid-write
+    // (OOM, eviction, power loss); since `exist()` only checks for the path, that partial file is
+    // then treated as a valid cached copy and never re-fetched. `rename` within a filesystem is
+    // atomic, so a reader always sees either the previous file or the fully-written new one.
+    const tempPath = `${filePath}.${randomBytes(16).toString('hex')}${TEMP_FILE_SUFFIX}`
     try {
-      await pipe(stream, components.fs.createWriteStream(filePath))
+      await pipe(stream, components.fs.createWriteStream(tempPath))
+      await components.fs.rename(tempPath, filePath)
     } catch (err) {
-      await noFailUnlink(filePath)
+      // On a write error the temp file may be partial; on a rename error it still exists. Either way
+      // remove it so a failed store never leaves a stray file behind (the final path is untouched).
+      await noFailUnlink(tempPath)
       throw err
     }
   }
@@ -291,6 +304,9 @@ export async function createFolderBasedFileSystemContentStorage(
     for await (const entry of dirEntries) {
       if (entry.isDirectory()) {
         yield* allFileIdsRec(path.resolve(folder, entry.name), prefix)
+      } else if (entry.name.endsWith(TEMP_FILE_SUFFIX)) {
+        // In-flight (or crash-orphaned) atomic-write temp file — not addressable content, skip it.
+        continue
       } else if (!prefix || entry.name.startsWith(prefix)) {
         const baseName = entry.name.replace(/\.gzip$/, '')
         // Skip cached uncompressed files when the .gzip version also exists

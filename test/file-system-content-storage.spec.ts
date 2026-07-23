@@ -2,6 +2,7 @@ import { createHash } from 'crypto'
 import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
+import { Readable } from 'stream'
 import {
   createFolderBasedFileSystemContentStorage,
   createFsComponent,
@@ -797,6 +798,74 @@ describe('fileSystemContentStorage', () => {
     expect(await fileSystemContentStorage.fileInfo(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
     expect(await fileSystemContentStorage.fileInfo(id2)).toEqual({ encoding: null, size: 3, contentSize: 3 })
     expect(await fileSystemContentStorage.fileInfo('non-existent-id')).toBeUndefined()
+  })
+
+  describe('atomic storeStream', () => {
+    describe('when a store completes successfully', () => {
+      beforeEach(async () => {
+        await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+      })
+
+      it('should leave only the content file in the shard directory, with no temp file', async () => {
+        expect(await nodeFs.readdir(path.dirname(filePath))).toEqual([id])
+      })
+    })
+
+    describe('when the source stream errors mid-write', () => {
+      let thrownError: Error | undefined
+
+      beforeEach(async () => {
+        thrownError = undefined
+        const failingStream = new Readable({
+          read() {
+            this.destroy(new Error('stream boom'))
+          }
+        })
+        try {
+          await fileSystemContentStorage.storeStream(id, failingStream)
+        } catch (error: any) {
+          thrownError = error
+        }
+      })
+
+      it('should reject the store', () => {
+        expect(thrownError).toBeDefined()
+      })
+
+      it('should not create a file at the canonical content path', async () => {
+        expect(await fs.existPath(filePath)).toBe(false)
+      })
+
+      it('should not leave a temp file behind in the shard directory', async () => {
+        const shardDir = path.dirname(filePath)
+        const entries = (await fs.existPath(shardDir)) ? await nodeFs.readdir(shardDir) : []
+        expect(entries.filter((entry) => entry.endsWith('.tmp'))).toEqual([])
+      })
+    })
+
+    describe('when a temp file is orphaned in a shard by an interrupted write', () => {
+      let seenIds: string[]
+
+      beforeEach(async () => {
+        await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+        await nodeFs.writeFile(
+          path.join(path.dirname(filePath), `${id}.deadbeefdeadbeefdeadbeefdeadbeef.tmp`),
+          Buffer.from('')
+        )
+        seenIds = []
+        for await (const fileId of fileSystemContentStorage.allFileIds()) {
+          seenIds.push(fileId)
+        }
+      })
+
+      it('should still yield the stored content id', () => {
+        expect(seenIds).toContain(id)
+      })
+
+      it('should not yield the orphaned temp file', () => {
+        expect(seenIds.some((fileId) => fileId.endsWith('.tmp'))).toBe(false)
+      })
+    })
   })
 
   describe('path containment', () => {
