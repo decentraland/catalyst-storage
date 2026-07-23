@@ -913,6 +913,32 @@ describe('fileSystemContentStorage', () => {
         expect(seenIds).toContain(tmpLikeId)
       })
     })
+
+    describe('when the fs component does not provide rename', () => {
+      let storageWithoutRename: IContentStorageComponent
+
+      beforeEach(async () => {
+        const fsWithoutRename: IFileSystemComponent = { ...createFsComponent(), rename: undefined }
+        storageWithoutRename = await createFolderBasedFileSystemContentStorage(
+          { fs: fsWithoutRename, logs: await createLogComponent({}) },
+          tmpRootDir
+        )
+        await storageWithoutRename.storeStream(id, bufferToStream(content))
+      })
+
+      afterEach(async () => {
+        await storageWithoutRename.stop?.()
+      })
+
+      it('should still store the content via the direct-write fallback', async () => {
+        expect(await fs.existPath(filePath)).toBe(true)
+      })
+
+      it('should retrieve the stored content', async () => {
+        const item = await storageWithoutRename.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+    })
   })
 
   describe('path containment', () => {

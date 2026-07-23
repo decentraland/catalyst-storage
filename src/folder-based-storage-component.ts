@@ -194,6 +194,19 @@ export async function createFolderBasedFileSystemContentStorage(
 
   const storeStream = async (id: string, stream: Readable): Promise<void> => {
     const filePath = await getFilePath(id)
+    const { rename } = components.fs
+    // A custom fs adapter that predates the optional `rename` falls back to the original direct
+    // write. It isn't crash-atomic, but keeps the public IFileSystemComponent backward-compatible;
+    // the bundled createFsComponent provides rename and so takes the atomic path below.
+    if (!rename) {
+      try {
+        await pipe(stream, components.fs.createWriteStream(filePath))
+      } catch (err) {
+        await noFailUnlink(filePath)
+        throw err
+      }
+      return
+    }
     // Write to a temp file in the same directory, then atomically rename it into place. A direct
     // write to the final path leaves a truncated/zero-byte file if the process dies mid-write
     // (OOM-kill, eviction, crash); since `exist()` only checks for the path, that partial file is
@@ -204,7 +217,7 @@ export async function createFolderBasedFileSystemContentStorage(
     const tempPath = `${filePath}.${randomBytes(16).toString('hex')}${TEMP_FILE_SUFFIX}`
     try {
       await pipe(stream, components.fs.createWriteStream(tempPath))
-      await components.fs.rename(tempPath, filePath)
+      await rename(tempPath, filePath)
     } catch (err) {
       // On a write error the temp file may be partial; on a rename error it still exists. Either way
       // remove it so a failed store never leaves a stray file behind (the final path is untouched).
