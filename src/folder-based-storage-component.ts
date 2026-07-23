@@ -98,6 +98,46 @@ export async function createFolderBasedFileSystemContentStorage(
   // Concurrency guard: prevents multiple simultaneous decompressions of the same file
   const inflightDecompressions = new Map<string, Promise<void>>()
 
+  // Serializes commits (rename/write/unlink) on a canonical path so a store, a delete and a
+  // decompression can never interleave their final steps. Only the short commit sections take the
+  // lock — long-running pipes stay outside — and the map entry is removed once its chain drains.
+  const pathLocks = new Map<string, Promise<unknown>>()
+  function withPathLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+    const prev = pathLocks.get(filePath) ?? Promise.resolve()
+    const run = prev.then(fn, fn)
+    const guard = run.then(
+      () => undefined,
+      () => undefined
+    )
+    pathLocks.set(filePath, guard)
+    void guard.then(() => {
+      if (pathLocks.get(filePath) === guard) pathLocks.delete(filePath)
+    })
+    return run
+  }
+
+  // A decompression inflates whatever gzip existed when it started; if the id is overwritten or
+  // deleted before the decompression commits, its output is stale and must be discarded instead of
+  // clobbering the newer canonical file (or resurrecting a deleted one). The owner registers a token
+  // before opening the gzip; writers/deleters mark it inside their locked commit. Bounded by
+  // in-flight decompressions.
+  const inflightDecompressionTokens = new Map<string, { invalidated: boolean }>()
+  function invalidateInflightDecompression(filePath: string): void {
+    const token = inflightDecompressionTokens.get(filePath)
+    if (token) token.invalidated = true
+  }
+
+  // Drops the cache-tracking entry WITHOUT unlinking the file. Used when the canonical path stops
+  // being a derived cache and becomes primary content (a store landed there): a stale entry would
+  // let TTL/size eviction delete the only copy of the new content.
+  function forgetCacheEntry(filePath: string): void {
+    const entry = decompressCache.get(filePath)
+    if (entry) {
+      totalCacheSize -= entry.size
+      decompressCache.delete(filePath)
+    }
+  }
+
   let evicting = false
   async function evictCache() {
     if (evicting) return
@@ -216,7 +256,11 @@ export async function createFolderBasedFileSystemContentStorage(
     // the bundled createFsComponent provides rename and so takes the atomic path below.
     if (!rename) {
       try {
-        await pipe(stream, components.fs.createWriteStream(filePath))
+        await withPathLock(filePath, async () => {
+          await pipe(stream, components.fs.createWriteStream(filePath))
+          forgetCacheEntry(filePath)
+          invalidateInflightDecompression(filePath)
+        })
       } catch (err) {
         await noFailUnlink(filePath)
         throw err
@@ -234,7 +278,13 @@ export async function createFolderBasedFileSystemContentStorage(
     const tempPath = newTempPath()
     try {
       await pipe(stream, components.fs.createWriteStream(tempPath))
-      await rename(tempPath, filePath)
+      await withPathLock(filePath, async () => {
+        await rename(tempPath, filePath)
+        // The canonical path now holds primary content: drop any stale decompress-cache tracking so
+        // eviction can never delete it, and tell an in-flight decompression its output is outdated.
+        forgetCacheEntry(filePath)
+        invalidateInflightDecompression(filePath)
+      })
     } catch (err) {
       // On a write error the temp file may be partial; on a rename error it still exists. Either way
       // remove it so a failed store never leaves a stray file behind (the final path is untouched).
@@ -288,37 +338,63 @@ export async function createFolderBasedFileSystemContentStorage(
         const isOwner = !decompressPromise
         if (!decompressPromise) {
           decompressPromise = (async () => {
-            const gzipItem = await retrieveWithEncoding(id, 'gzip')
-            if (!gzipItem) {
-              return
-            }
-            // Stage the inflation in the temp dir when rename is available, so a process killed
-            // mid-decompress can never leave a partial file at the canonical uncompressed path —
-            // a later range request would silently serve its truncated bytes as valid content.
-            // Without rename (legacy custom fs adapter) fall back to writing in place.
-            const { rename } = components.fs
-            const writePath = rename ? newTempPath() : uncompressedPath
+            // Register the invalidation token BEFORE opening the gzip: any store/delete committing
+            // after this point marks it, so stale output is discarded; one committing before it means
+            // the gzip opened below is already the newest version.
+            const token = { invalidated: false }
+            inflightDecompressionTokens.set(uncompressedPath, token)
             try {
-              // Cap how much the gzip may inflate to so a decompression bomb cannot write an
-              // unbounded file to disk. The gzip trailer's declared size is attacker-controllable,
-              // so the limit is enforced on the actual inflated bytes, not a declared value.
-              await pipe(
-                await gzipItem.asStream(),
-                createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
-                components.fs.createWriteStream(writePath)
-              )
-              if (rename) {
-                await rename(writePath, uncompressedPath)
+              const gzipItem = await retrieveWithEncoding(id, 'gzip')
+              if (!gzipItem) {
+                return
               }
-            } catch (err) {
-              // Remove partial file to prevent serving corrupt data (or a partially-written bomb)
-              await noFailUnlink(writePath)
-              throw err
-            }
+              // Stage the inflation in the temp dir when rename is available, so a process killed
+              // mid-decompress can never leave a partial file at the canonical uncompressed path —
+              // a later range request would silently serve its truncated bytes as valid content.
+              // Without rename (legacy custom fs adapter) fall back to writing in place.
+              const { rename } = components.fs
+              const writePath = rename ? newTempPath() : uncompressedPath
+              try {
+                // Cap how much the gzip may inflate to so a decompression bomb cannot write an
+                // unbounded file to disk. The gzip trailer's declared size is attacker-controllable,
+                // so the limit is enforced on the actual inflated bytes, not a declared value.
+                await pipe(
+                  await gzipItem.asStream(),
+                  createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
+                  components.fs.createWriteStream(writePath)
+                )
+                if (rename) {
+                  // Commit under the path lock so this rename can never interleave with a store or
+                  // delete on the same canonical path; discard when the source gzip was replaced or
+                  // the id deleted while inflating.
+                  const committed = await withPathLock(uncompressedPath, async () => {
+                    if (token.invalidated) return false
+                    await rename(writePath, uncompressedPath)
+                    const stat = await components.fs.stat(uncompressedPath)
+                    decompressCache.set(uncompressedPath, { size: stat.size, lastAccess: Date.now() })
+                    totalCacheSize += stat.size
+                    return true
+                  })
+                  if (!committed) {
+                    await noFailUnlink(writePath)
+                  }
+                  return
+                }
+              } catch (err) {
+                // Remove partial file to prevent serving corrupt data (or a partially-written bomb)
+                await noFailUnlink(writePath)
+                throw err
+              }
 
-            const stat = await components.fs.stat(uncompressedPath)
-            decompressCache.set(uncompressedPath, { size: stat.size, lastAccess: Date.now() })
-            totalCacheSize += stat.size
+              // In-place (no rename) legacy path: register the cache entry as before.
+              const stat = await components.fs.stat(uncompressedPath)
+              decompressCache.set(uncompressedPath, { size: stat.size, lastAccess: Date.now() })
+              totalCacheSize += stat.size
+            } finally {
+              if (inflightDecompressionTokens.get(uncompressedPath) === token) {
+                inflightDecompressionTokens.delete(uncompressedPath)
+              }
+            }
           })()
           inflightDecompressions.set(uncompressedPath, decompressPromise)
         }
@@ -413,10 +489,17 @@ export async function createFolderBasedFileSystemContentStorage(
     return undefined
   }
 
+  // Matches exactly the names newTempPath generates (`<16-hex bootId>-<32-hex random>`). The sweep
+  // deletes ONLY files of this shape: anything else under the reserved dir is not ours to remove —
+  // in flat (disablePrefixHash) mode a deployment that predates the reservation may hold legitimate
+  // content under `.tmp-writes/`, and deleting unrecognized files would turn an upgrade into data
+  // loss.
+  const STAGED_FILE_NAME = /^[0-9a-f]{16}-[0-9a-f]{32}$/
+
   // Removes temp files left behind by writes interrupted in a previous run. Staged filenames carry
-  // this boot's random prefix, so anything with a different prefix is by construction a leftover of
-  // an earlier process — a write racing this sweep stages under the current bootId and is never
-  // touched. Best-effort: a missing dir or a failed unlink is ignored.
+  // this boot's random prefix, so a staged-shape file with a different prefix is by construction a
+  // leftover of an earlier process — a write racing this sweep stages under the current bootId and
+  // is never touched. Best-effort: a missing dir or a failed unlink is ignored.
   const sweepOrphanedTempFiles = async (): Promise<number> => {
     let entries: string[]
     try {
@@ -426,7 +509,7 @@ export async function createFolderBasedFileSystemContentStorage(
     }
     let removed = 0
     for (const entry of entries) {
-      if (entry.startsWith(`${bootId}-`)) continue
+      if (!STAGED_FILE_NAME.test(entry) || entry.startsWith(`${bootId}-`)) continue
       if (await noFailUnlink(path.join(tempDir, entry))) removed++
     }
     return removed
@@ -475,16 +558,26 @@ export async function createFolderBasedFileSystemContentStorage(
       // Without rename (legacy custom fs adapter) fall back to compressing in place, as before.
       const { rename } = components.fs
       const stagedGzipPath = rename ? newTempPath() : undefined
-      let compressed: boolean
+      let compressed = false
       try {
         compressed = await compressContentFile(filePath, logger, stagedGzipPath)
-        if (compressed && rename && stagedGzipPath) {
-          await rename(stagedGzipPath, filePath + '.gzip')
-        } else if (stagedGzipPath) {
-          // Compression was staged, so the canonical .gzip was never truncated in place: a gzip from
-          // a previous version of this id could survive and retrieve() would prefer its stale bytes
-          // over the content just stored. Remove it whenever the fresh gzip is not committed.
-          await noFailUnlink(filePath + '.gzip')
+        if (rename && stagedGzipPath) {
+          await withPathLock(filePath, async () => {
+            if (compressed) {
+              await rename(stagedGzipPath, filePath + '.gzip')
+            } else {
+              // Compression was staged, so the canonical .gzip was never truncated in place: a gzip
+              // from a previous version of this id could survive and retrieve() would prefer its
+              // stale bytes over the content just stored. Remove it when no fresh gzip is committed.
+              await noFailUnlink(filePath + '.gzip')
+            }
+            // A decompression started against the previous gzip may still be inflating (invalidate
+            // it) or may have already re-registered the canonical path as cache holding the previous
+            // version's bytes (remove that file+entry; the check is a no-op when no entry exists, so
+            // the freshly stored primary content is never touched).
+            invalidateInflightDecompression(filePath)
+            await removeCacheEntry(filePath)
+          })
         }
       } catch (err) {
         // compressContentFile already removed its own (possibly partial) output; this covers a failed
@@ -507,11 +600,16 @@ export async function createFolderBasedFileSystemContentStorage(
     async delete(ids: string[]): Promise<void> {
       for (const id of ids) {
         const filePath = await getFilePath(id)
-        const wasCached = await removeCacheEntry(filePath)
-        if (!wasCached) {
-          await noFailUnlink(filePath)
-        }
-        await noFailUnlink(filePath + '.gzip')
+        // Locked so an in-flight decompression can never resurrect the id by renaming its staged
+        // bytes onto the canonical path after these unlinks.
+        await withPathLock(filePath, async () => {
+          const wasCached = await removeCacheEntry(filePath)
+          if (!wasCached) {
+            await noFailUnlink(filePath)
+          }
+          await noFailUnlink(filePath + '.gzip')
+          invalidateInflightDecompression(filePath)
+        })
       }
     },
     async existMultiple(cids: string[]): Promise<Map<string, boolean>> {

@@ -2,7 +2,7 @@ import { createHash } from 'crypto'
 import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { Readable } from 'stream'
+import { PassThrough, Readable } from 'stream'
 import {
   createFolderBasedFileSystemContentStorage,
   createFsComponent,
@@ -17,11 +17,14 @@ describe('fileSystemContentStorage', () => {
 
   // The eviction runs real (threadpool) unlinks that jest's fake timers do not await, so asserting
   // existPath immediately after advanceTimersByTimeAsync races the I/O and flakes under load. Each
-  // awaited existPath forces a real event-loop turn, so polling lets the pending unlink complete.
-  // Bounded: if the file is never removed, the caller's assertion still fails.
-  async function waitUntilRemoved(filePath: string, attempts = 200): Promise<void> {
+  // awaited existPath forces a real event-loop turn (letting pending unlinks complete), and each
+  // iteration also advances fake time by another eviction interval so a tick that was missed under
+  // load is re-fired rather than waited on forever. Bounded: if the file is never removed, the
+  // caller's assertion still fails.
+  async function waitUntilRemoved(filePath: string, attempts = 100): Promise<void> {
     for (let i = 0; i < attempts; i++) {
       if (!(await fs.existPath(filePath))) return
+      await jest.advanceTimersByTimeAsync(1000)
     }
   }
   let tmpRootDir: string
@@ -920,8 +923,9 @@ describe('fileSystemContentStorage', () => {
         // if a write were in flight) and one leftover from a previous run.
         await sweptStorage.storeStream(id, bufferToStream(content))
         const bootPrefix = stagedNames[0].split('-')[0]
-        ownPrefixedPath = path.join(tempDirPath, `${bootPrefix}-stillbeingwritten`)
-        foreignPath = path.join(tempDirPath, 'deadbeefdeadbeef-fromapreviousrun')
+        // Both carry the staged-name shape, so only the boot prefix decides their fate.
+        ownPrefixedPath = path.join(tempDirPath, `${bootPrefix}-${'a'.repeat(32)}`)
+        foreignPath = path.join(tempDirPath, `deadbeefdeadbeef-${'b'.repeat(32)}`)
         await nodeFs.writeFile(ownPrefixedPath, Buffer.from(''))
         await nodeFs.writeFile(foreignPath, Buffer.from(''))
         await sweptStorage.start?.({} as any)
@@ -935,6 +939,85 @@ describe('fileSystemContentStorage', () => {
 
       it('should remove the leftover from a previous run', async () => {
         expect(await fs.existPath(foreignPath)).toBe(false)
+      })
+    })
+
+    describe('when a file that does not match the staged-name shape sits in the reserved directory', () => {
+      let legacyFilePath: string
+
+      beforeEach(async () => {
+        // In flat (disablePrefixHash) mode a deployment that predates the reservation may hold
+        // legitimate content under `.tmp-writes/` — the sweep must never delete unrecognized files.
+        legacyFilePath = path.join(tmpRootDir, '.tmp-writes', 'legacy-content-file')
+        await nodeFs.writeFile(legacyFilePath, Buffer.from('precious'))
+        await fileSystemContentStorage.start?.({} as any)
+        await fileSystemContentStorage.stop?.()
+      })
+
+      it('should leave the unrecognized file untouched', async () => {
+        expect(await fs.existPath(legacyFilePath)).toBe(true)
+      })
+    })
+
+    describe('when content is overwritten while a range decompression is in flight', () => {
+      let overwriteStorage: IContentStorageComponent
+      let gzipBackedPath: string
+      let rangeResult: Buffer | undefined
+
+      beforeEach(async () => {
+        const realFs = createFsComponent()
+        gzipBackedPath = filePath
+        const gzipPath = filePath + '.gzip'
+        // Gate the FIRST read of the canonical gzip so the decompression stays in flight while the
+        // id is overwritten underneath it.
+        let releaseGzipRead: () => void = () => undefined
+        const gzipReadGate = new Promise<void>((res) => (releaseGzipRead = res))
+        let gzipReadStarted: () => void = () => undefined
+        const gzipReadStartedPromise = new Promise<void>((res) => (gzipReadStarted = res))
+        let holdNextGzipRead = true
+        const gatedFs: IFileSystemComponent = {
+          ...realFs,
+          createReadStream: ((target: any, opts?: any) => {
+            const real = realFs.createReadStream(target, opts)
+            if (String(target) !== gzipPath || !holdNextGzipRead) return real
+            holdNextGzipRead = false
+            const gated = new PassThrough()
+            gzipReadStarted()
+            void gzipReadGate.then(() => real.pipe(gated))
+            return gated
+          }) as typeof realFs.createReadStream
+        }
+        overwriteStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: gatedFs, logs: await createLogComponent({}) },
+          tmpRootDir
+        )
+        // Compressible content: stored gzip-only, so a range request must decompress.
+        await overwriteStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(7))))
+        // Start the range request; its decompression blocks on the gated gzip read.
+        const rangePromise = overwriteStorage.retrieve(id, { start: 0, end: 2 })
+        await gzipReadStartedPromise
+        // Overwrite the id with incompressible content while the old gzip is still inflating.
+        await overwriteStorage.storeStreamAndCompress(id, bufferToStream(content))
+        releaseGzipRead()
+        const item = await rangePromise
+        rangeResult = item ? await streamToBuffer(await item.asStream()) : undefined
+      })
+
+      afterEach(async () => {
+        await overwriteStorage.stop?.()
+      })
+
+      it('should keep the new content at the canonical path instead of the stale inflated bytes', async () => {
+        expect(await nodeFs.readFile(gzipBackedPath)).toEqual(content)
+      })
+
+      it('should serve the whole new content on a later retrieve', async () => {
+        const item = await overwriteStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+
+      it('should serve the range from the new content', () => {
+        expect(rangeResult).toEqual(content.subarray(0, 3))
       })
     })
 
@@ -1006,7 +1089,8 @@ describe('fileSystemContentStorage', () => {
 
       beforeEach(async () => {
         await fileSystemContentStorage.storeStream(id, bufferToStream(content))
-        orphanPath = path.join(tmpRootDir, '.tmp-writes', 'deadbeefdeadbeefdeadbeefdeadbeef')
+        // Exactly the staged-name shape (<16-hex>-<32-hex>) with a foreign boot prefix.
+        orphanPath = path.join(tmpRootDir, '.tmp-writes', 'deadbeefdeadbeef-0123456789abcdef0123456789abcdef')
         await nodeFs.writeFile(orphanPath, Buffer.from(''))
         await fileSystemContentStorage.start?.({} as any)
         // stop() awaits the background sweep, so it has completed by the time we assert.
