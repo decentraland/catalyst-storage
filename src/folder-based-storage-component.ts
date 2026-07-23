@@ -89,10 +89,17 @@ export async function createFolderBasedFileSystemContentStorage(
 
   await components.fs.mkdir(root, { recursive: true })
 
+  const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
+
   // Created up front so storeStream can stage into it without a per-write mkdir.
   const tempDirName = options?.tempDirectoryName ?? TEMP_DIR_NAME
   if (tempDirName === '' || tempDirName === '.' || tempDirName === '..' || /[/\\]/.test(tempDirName)) {
     throw new Error(`tempDirectoryName must be a single path segment, got: ${JSON.stringify(tempDirName)}`)
+  }
+  if (USE_HASH_PREFIX && /^[0-9a-f]{4}$/i.test(tempDirName)) {
+    throw new Error(
+      `tempDirectoryName must not look like a shard directory (4 hex characters) when hash prefixes are enabled, got: ${JSON.stringify(tempDirName)}`
+    )
   }
   const tempDir = path.join(root, tempDirName)
   await components.fs.mkdir(tempDir, { recursive: true })
@@ -103,23 +110,43 @@ export async function createFolderBasedFileSystemContentStorage(
   const bootId = randomBytes(8).toString('hex')
   const newTempPath = (): string => path.join(tempDir, `${bootId}-${randomBytes(16).toString('hex')}`)
 
-  const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
-
-  // In flat mode the root is the content namespace, so a deployment that predates the reservation
-  // may hold content ids under the reserved directory. Such files are preserved (the sweep only
-  // removes staged-shape names) but are not addressable while the reservation holds — surface them
-  // loudly so the operator can migrate them or pick a different tempDirectoryName.
+  // The sweep may only delete files in a temp directory this storage provably owns. With hash
+  // prefixes, ids can never resolve into the reserved dir (containment sends them under a shard),
+  // so everything inside is ours. In flat mode the dir may predate the reservation and hold
+  // legitimate content ids — even ones that coincidentally match the staged-name shape — so
+  // ownership must be established explicitly: a marker written by us, or a directory found empty
+  // (claimed by writing the marker). A pre-existing non-empty, unmarked flat-mode dir is never
+  // swept; its files are preserved and surfaced via the warning below.
+  const OWNERSHIP_MARKER = '.owned-by-catalyst-storage'
+  let sweepAllowed = USE_HASH_PREFIX
   if (!USE_HASH_PREFIX) {
-    try {
-      const preExisting = (await components.fs.readdir(tempDir)).filter((entry) => !STAGED_FILE_NAME.test(entry))
-      if (preExisting.length > 0) {
-        logger.warn(
-          `Found ${preExisting.length} unrecognized file(s) under the reserved temp directory '${tempDirName}'. ` +
-            `They are preserved on disk but not addressable as content ids; migrate them out or configure a different tempDirectoryName.`
-        )
+    const markerPath = path.join(tempDir, OWNERSHIP_MARKER)
+    if (await components.fs.existPath(markerPath)) {
+      sweepAllowed = true
+    } else {
+      try {
+        const entries = await components.fs.readdir(tempDir)
+        if (entries.length === 0) {
+          await pipe(
+            Readable.from([Buffer.from('reserved by catalyst-storage for atomic write staging\n')]),
+            components.fs.createWriteStream(markerPath)
+          )
+          sweepAllowed = true
+        } else {
+          // In flat mode the root is the content namespace, so a deployment that predates the
+          // reservation may hold content ids under the reserved directory. They are preserved (the
+          // sweep is disabled without ownership) but are not addressable while the reservation
+          // holds — surface them loudly so the operator can migrate them or pick a different
+          // tempDirectoryName.
+          logger.warn(
+            `Found ${entries.length} pre-existing file(s) under the reserved temp directory '${tempDirName}'. ` +
+              `They are preserved on disk (the orphan sweep stays disabled) but are not addressable as content ids; ` +
+              `migrate them out or configure a different tempDirectoryName.`
+          )
+        }
+      } catch {
+        // best-effort: ownership could not be established, so the sweep stays disabled
       }
-    } catch {
-      // best-effort advisory only
     }
   }
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
@@ -324,8 +351,8 @@ export async function createFolderBasedFileSystemContentStorage(
     // write. It isn't crash-atomic, but keeps the public IFileSystemComponent backward-compatible;
     // the bundled createFsComponent provides rename and so takes the atomic path below.
     if (!rename) {
-      try {
-        await withPathLock(filePath, async () => {
+      await withPathLock(filePath, async () => {
+        try {
           await pipe(stream, components.fs.createWriteStream(filePath))
           // The raw and its .gzip are one versioned object: a gzip left from a previous version
           // would be preferred by retrieve() and serve stale bytes over the content just stored.
@@ -333,11 +360,13 @@ export async function createFolderBasedFileSystemContentStorage(
           forgetCacheEntry(filePath)
           invalidateInflightDecompression(filePath)
           markCompressionsStale(filePath)
-        })
-      } catch (err) {
-        await noFailUnlink(filePath)
-        throw err
-      }
+        } catch (err) {
+          // Clean up the partial output while still holding the lock: doing it after release could
+          // delete a queued writer's freshly committed content for the same id.
+          await noFailUnlink(filePath)
+          throw err
+        }
+      })
       return
     }
     // Stage the write in the reserved temp dir under a random name, then atomically rename it into
@@ -577,6 +606,10 @@ export async function createFolderBasedFileSystemContentStorage(
   // leftover of an earlier process — a write racing this sweep stages under the current bootId and
   // is never touched. Best-effort: a missing dir or a failed unlink is ignored.
   const sweepOrphanedTempFiles = async (): Promise<number> => {
+    // Never delete anything in a directory whose ownership was not established (see the
+    // OWNERSHIP_MARKER logic above): flat-mode legacy content could coincidentally match the
+    // staged-name shape.
+    if (!sweepAllowed) return 0
     let entries: string[]
     try {
       entries = await components.fs.readdir(tempDir)

@@ -994,6 +994,85 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when a flat-mode deployment holds a staged-shaped legacy id under the reserved directory', () => {
+      let flatRoot: string
+      let legacyStagedShapedPath: string
+      let flatStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The directory pre-exists with content BEFORE the storage ever runs, so ownership is never
+        // claimed and the sweep must not run — even though the filename matches the staged shape.
+        flatRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-flat-legacy-'))
+        await nodeFs.mkdir(path.join(flatRoot, '.tmp-writes'), { recursive: true })
+        legacyStagedShapedPath = path.join(flatRoot, '.tmp-writes', 'deadbeefdeadbeef-0123456789abcdef0123456789abcdef')
+        await nodeFs.writeFile(legacyStagedShapedPath, Buffer.from('legacy'))
+        flatStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          flatRoot,
+          { disablePrefixHash: true }
+        )
+        await flatStorage.start?.({} as any)
+        await flatStorage.stop?.()
+      })
+
+      afterEach(async () => {
+        rmSync(flatRoot, { recursive: true, force: true })
+      })
+
+      it('should not delete the staged-shaped legacy file', async () => {
+        expect(await fs.existPath(legacyStagedShapedPath)).toBe(true)
+      })
+    })
+
+    describe('when a flat-mode temp directory is claimed while empty', () => {
+      let flatRoot: string
+      let orphanPath: string
+      let flatStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The factory finds (creates) an empty reserved directory, claims it with the ownership
+        // marker, and from then on the sweep may remove foreign staged-shape leftovers.
+        flatRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-flat-claimed-'))
+        flatStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          flatRoot,
+          { disablePrefixHash: true }
+        )
+        orphanPath = path.join(flatRoot, '.tmp-writes', 'deadbeefdeadbeef-0123456789abcdef0123456789abcdef')
+        await nodeFs.writeFile(orphanPath, Buffer.from(''))
+        await flatStorage.start?.({} as any)
+        await flatStorage.stop?.()
+      })
+
+      afterEach(async () => {
+        rmSync(flatRoot, { recursive: true, force: true })
+      })
+
+      it('should write the ownership marker', async () => {
+        expect(await fs.existPath(path.join(flatRoot, '.tmp-writes', '.owned-by-catalyst-storage'))).toBe(true)
+      })
+
+      it('should sweep the foreign staged-shape leftover', async () => {
+        expect(await fs.existPath(orphanPath)).toBe(false)
+      })
+    })
+
+    describe('when the tempDirectoryName looks like a shard directory in hash-prefix mode', () => {
+      it('should reject creating the storage', async () => {
+        const badRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-shard-temp-'))
+        try {
+          await expect(
+            createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, badRoot, {
+              disablePrefixHash: false,
+              tempDirectoryName: 'abcd'
+            })
+          ).rejects.toThrow(/shard directory/)
+        } finally {
+          rmSync(badRoot, { recursive: true, force: true })
+        }
+      })
+    })
+
     describe('when the tempDirectoryName is not a single path segment', () => {
       it('should reject creating the storage', async () => {
         const badRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-bad-temp-'))
@@ -1338,6 +1417,37 @@ describe('fileSystemContentStorage', () => {
         await storageWithoutRename.storeStreamAndCompress(id2, bufferToStream(compressible))
         const item = await storageWithoutRename.retrieve(id2, { start: 0, end: 9 })
         expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.alloc(10, 0))
+      })
+
+      describe('and a failing store is followed by a queued store for the same id', () => {
+        let failedError: Error | undefined
+
+        beforeEach(async () => {
+          // A source that stays open until destroyed, so the first store holds the path lock while
+          // the second store queues behind it.
+          const failingStream = new Readable({ read() {} })
+          const failedStore = storageWithoutRename.storeStream(id2, failingStream)
+          // Wait until the failing store has opened the destination file — proof it holds the lock.
+          for (let i = 0; i < 1000 && !(await fs.existPath(filePath2)); i++) {
+            // each awaited existPath yields an event-loop turn
+          }
+          const queuedStore = storageWithoutRename.storeStream(id2, bufferToStream(content2))
+          failingStream.destroy(new Error('boom'))
+          failedError = await failedStore.then(
+            () => undefined,
+            (error: Error) => error
+          )
+          await queuedStore
+        })
+
+        it('should reject the failing store', () => {
+          expect(failedError?.message).toContain('boom')
+        })
+
+        it('should keep the queued store content despite the failed-store cleanup', async () => {
+          const item = await storageWithoutRename.retrieve(id2)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(content2)
+        })
       })
     })
   })
