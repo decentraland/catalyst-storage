@@ -8,12 +8,11 @@ import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
 
-// Suffix for the transient file an atomic `storeStream` writes to before renaming it into place.
-const TEMP_FILE_SUFFIX = '.tmp'
-
-// Matches only the temp files storeStream creates (`<id>.<32-hex>.tmp`) — used to filter them out of
-// `allFileIds` and sweep crash-orphaned ones at start, without ever matching a real id ending in `.tmp`.
-const TEMP_FILE_PATTERN = /\.[0-9a-f]{32}\.tmp$/
+// Reserved directory (under the storage root) where an atomic `storeStream` stages its temp file
+// before renaming it into place. Kept out of the content namespace — a shard is a 4-hex directory and
+// content lives in files, never here — so a temp can never collide with, hide, or be mistaken for an
+// addressable id. Skipped by `allFileIds` and cleaned at startup. Its name is therefore reserved.
+const TEMP_DIR_NAME = '.tmp-writes'
 
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
@@ -75,6 +74,10 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   await components.fs.mkdir(root, { recursive: true })
+
+  // Created up front so storeStream can stage into it without a per-write mkdir.
+  const tempDir = path.join(root, TEMP_DIR_NAME)
+  await components.fs.mkdir(tempDir, { recursive: true })
 
   const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
@@ -207,14 +210,15 @@ export async function createFolderBasedFileSystemContentStorage(
       }
       return
     }
-    // Write to a temp file in the same directory, then atomically rename it into place. A direct
-    // write to the final path leaves a truncated/zero-byte file if the process dies mid-write
-    // (OOM-kill, eviction, crash); since `exist()` only checks for the path, that partial file is
-    // then treated as a valid cached copy and never re-fetched. `rename` within a filesystem is
-    // atomic, so a reader always sees either the previous file or the fully-written new one. (The
-    // data is not fsync'd before the rename, so a power loss can still lose it — content is
+    // Stage the write in the reserved temp dir under a random name, then atomically rename it into
+    // place. A direct write to the final path leaves a truncated/zero-byte file if the process dies
+    // mid-write (OOM-kill, eviction, crash); since `exist()` only checks for the path, that partial
+    // file would then be treated as a valid cached copy and never re-fetched. `rename` within a
+    // filesystem is atomic, so a reader always sees either the previous file or the fully-written new
+    // one. Temp files live outside the content namespace, so they cannot collide with an addressable
+    // id. (Data is not fsync'd before the rename, so a power loss can still lose it — content is
     // content-addressed and simply re-downloaded, so durability past process death isn't needed.)
-    const tempPath = `${filePath}.${randomBytes(16).toString('hex')}${TEMP_FILE_SUFFIX}`
+    const tempPath = path.join(tempDir, randomBytes(16).toString('hex'))
     try {
       await pipe(stream, components.fs.createWriteStream(tempPath))
       await rename(tempPath, filePath)
@@ -324,10 +328,9 @@ export async function createFolderBasedFileSystemContentStorage(
     const dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
     for await (const entry of dirEntries) {
       if (entry.isDirectory()) {
+        // Never descend into the reserved temp-write dir: its files are staging artifacts, not content.
+        if (entry.name === TEMP_DIR_NAME) continue
         yield* allFileIdsRec(path.resolve(folder, entry.name), prefix)
-      } else if (TEMP_FILE_PATTERN.test(entry.name)) {
-        // In-flight (or crash-orphaned) atomic-write temp file — not addressable content, skip it.
-        continue
       } else if (!prefix || entry.name.startsWith(prefix)) {
         const baseName = entry.name.replace(/\.gzip$/, '')
         // Skip cached uncompressed files when the .gzip version also exists
@@ -386,23 +389,20 @@ export async function createFolderBasedFileSystemContentStorage(
     return undefined
   }
 
-  // Removes temp files left behind by a `storeStream` that was interrupted in a previous run. Walks
-  // the sharded tree once; best-effort, so a missing/racing directory or a failed unlink is ignored.
-  const sweepOrphanedTempFiles = async (folder: string): Promise<number> => {
-    let removed = 0
-    let dirEntries
+  // Removes temp files left behind by a `storeStream` interrupted in a previous run. Reads the
+  // reserved temp dir once and deletes what that snapshot contained; because a live write stages
+  // under a fresh random name, a store racing this sweep is never in the snapshot and so can never be
+  // unlinked mid-write. Best-effort: a missing dir or a failed unlink is ignored.
+  const sweepOrphanedTempFiles = async (): Promise<number> => {
+    let entries: string[]
     try {
-      dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
+      entries = await components.fs.readdir(tempDir)
     } catch {
-      return removed
+      return 0
     }
-    for await (const entry of dirEntries) {
-      const entryPath = path.resolve(folder, entry.name)
-      if (entry.isDirectory()) {
-        removed += await sweepOrphanedTempFiles(entryPath)
-      } else if (TEMP_FILE_PATTERN.test(entry.name)) {
-        if (await noFailUnlink(entryPath)) removed++
-      }
+    let removed = 0
+    for (const entry of entries) {
+      if (await noFailUnlink(path.join(tempDir, entry))) removed++
     }
     return removed
   }
@@ -417,7 +417,7 @@ export async function createFolderBasedFileSystemContentStorage(
       evictionTimer.unref()
       // Detached best-effort cleanup of temp files orphaned by an interrupted write in a prior run.
       // Runs in the background so it never delays startup; `stop()` awaits it once, at shutdown.
-      tempFileSweep = sweepOrphanedTempFiles(root)
+      tempFileSweep = sweepOrphanedTempFiles()
         .then((removed) => {
           if (removed > 0) logger.info(`Removed ${removed} orphaned temp file(s) at startup`)
         })

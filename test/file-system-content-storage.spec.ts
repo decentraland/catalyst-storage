@@ -836,20 +836,20 @@ describe('fileSystemContentStorage', () => {
         expect(await fs.existPath(filePath)).toBe(false)
       })
 
-      it('should not leave a temp file behind in the shard directory', async () => {
-        const shardDir = path.dirname(filePath)
-        const entries = (await fs.existPath(shardDir)) ? await nodeFs.readdir(shardDir) : []
-        expect(entries.filter((entry) => entry.endsWith('.tmp'))).toEqual([])
+      it('should not leave a temp file behind in the reserved temp directory', async () => {
+        const tempDir = path.join(tmpRootDir, '.tmp-writes')
+        const entries = (await fs.existPath(tempDir)) ? await nodeFs.readdir(tempDir) : []
+        expect(entries).toEqual([])
       })
     })
 
-    describe('when a temp file is orphaned in a shard by an interrupted write', () => {
+    describe('when an orphaned temp file exists in the reserved temp directory', () => {
       let seenIds: string[]
 
       beforeEach(async () => {
         await fileSystemContentStorage.storeStream(id, bufferToStream(content))
         await nodeFs.writeFile(
-          path.join(path.dirname(filePath), `${id}.deadbeefdeadbeefdeadbeefdeadbeef.tmp`),
+          path.join(tmpRootDir, '.tmp-writes', 'deadbeefdeadbeefdeadbeefdeadbeef'),
           Buffer.from('')
         )
         seenIds = []
@@ -863,7 +863,8 @@ describe('fileSystemContentStorage', () => {
       })
 
       it('should not yield the orphaned temp file', () => {
-        expect(seenIds.some((fileId) => fileId.endsWith('.tmp'))).toBe(false)
+        expect(seenIds).toContain(id)
+        expect(seenIds).toHaveLength(1)
       })
     })
 
@@ -872,7 +873,7 @@ describe('fileSystemContentStorage', () => {
 
       beforeEach(async () => {
         await fileSystemContentStorage.storeStream(id, bufferToStream(content))
-        orphanPath = path.join(path.dirname(filePath), `${id}.deadbeefdeadbeefdeadbeefdeadbeef.tmp`)
+        orphanPath = path.join(tmpRootDir, '.tmp-writes', 'deadbeefdeadbeefdeadbeefdeadbeef')
         await nodeFs.writeFile(orphanPath, Buffer.from(''))
         await fileSystemContentStorage.start?.({} as any)
         // stop() awaits the background sweep, so it has completed by the time we assert.
@@ -888,29 +889,30 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
-    describe('when an id legitimately ends in .tmp', () => {
-      const tmpLikeId = 'legittmpfile.tmp'
-      let tmpLikeFilePath: string
+    describe('when an id collides with the old temp-file pattern', () => {
+      // The exact shape the previous suffix-based filter would have hidden/deleted: `<...>.<32hex>.tmp`.
+      const collidingId = 'asset.deadbeefdeadbeefdeadbeefdeadbeef.tmp'
+      let collidingFilePath: string
 
       beforeEach(async () => {
-        tmpLikeFilePath = path.join(
+        collidingFilePath = path.join(
           tmpRootDir,
-          createHash('sha1').update(tmpLikeId).digest('hex').substring(0, 4),
-          tmpLikeId
+          createHash('sha1').update(collidingId).digest('hex').substring(0, 4),
+          collidingId
         )
-        await fileSystemContentStorage.storeStream(tmpLikeId, bufferToStream(content))
+        await fileSystemContentStorage.storeStream(collidingId, bufferToStream(content))
         await fileSystemContentStorage.start?.({} as any)
         await fileSystemContentStorage.stop?.()
       })
 
-      it('should not sweep it away as a temp file', async () => {
-        expect(await fs.existPath(tmpLikeFilePath)).toBe(true)
+      it('should keep the content file after the startup sweep', async () => {
+        expect(await fs.existPath(collidingFilePath)).toBe(true)
       })
 
       it('should still enumerate it in allFileIds', async () => {
         const seenIds: string[] = []
         for await (const fileId of fileSystemContentStorage.allFileIds()) seenIds.push(fileId)
-        expect(seenIds).toContain(tmpLikeId)
+        expect(seenIds).toContain(collidingId)
       })
     })
 
