@@ -877,6 +877,105 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when a gzip-backed id is overwritten with incompressible content', () => {
+      beforeEach(async () => {
+        await fileSystemContentStorage.storeStreamAndCompress(
+          id,
+          bufferToStream(Buffer.from(new Uint8Array(100).fill(0)))
+        )
+        await fileSystemContentStorage.storeStreamAndCompress(id, bufferToStream(content))
+      })
+
+      it('should retrieve the newly stored bytes, not the stale gzip', async () => {
+        const item = await fileSystemContentStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+
+      it('should remove the stale canonical gzip', async () => {
+        expect(await fs.existPath(filePath + '.gzip')).toBe(false)
+      })
+    })
+
+    describe('when the startup sweep runs with a file staged by this boot present', () => {
+      let ownPrefixedPath: string
+      let foreignPath: string
+      let sweptStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        const realFs = createFsComponent()
+        const tempDirPath = path.join(tmpRootDir, '.tmp-writes')
+        const stagedNames: string[] = []
+        const spyFs: IFileSystemComponent = {
+          ...realFs,
+          createWriteStream: ((target: any, options?: any) => {
+            if (path.dirname(String(target)) === tempDirPath) stagedNames.push(path.basename(String(target)))
+            return realFs.createWriteStream(target, options)
+          }) as typeof realFs.createWriteStream
+        }
+        sweptStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: spyFs, logs: await createLogComponent({}) },
+          tmpRootDir
+        )
+        // Learn this boot's staging prefix from a real store, then plant one file carrying it (as
+        // if a write were in flight) and one leftover from a previous run.
+        await sweptStorage.storeStream(id, bufferToStream(content))
+        const bootPrefix = stagedNames[0].split('-')[0]
+        ownPrefixedPath = path.join(tempDirPath, `${bootPrefix}-stillbeingwritten`)
+        foreignPath = path.join(tempDirPath, 'deadbeefdeadbeef-fromapreviousrun')
+        await nodeFs.writeFile(ownPrefixedPath, Buffer.from(''))
+        await nodeFs.writeFile(foreignPath, Buffer.from(''))
+        await sweptStorage.start?.({} as any)
+        // stop() awaits the background sweep, so it has completed by the time we assert.
+        await sweptStorage.stop?.()
+      })
+
+      it('should keep the file staged by this boot', async () => {
+        expect(await fs.existPath(ownPrefixedPath)).toBe(true)
+      })
+
+      it('should remove the leftover from a previous run', async () => {
+        expect(await fs.existPath(foreignPath)).toBe(false)
+      })
+    })
+
+    describe('when an id resolves inside the reserved temp-write namespace', () => {
+      let flatStorage: IContentStorageComponent
+      let flatRoot: string
+
+      beforeEach(async () => {
+        // disablePrefixHash makes the root itself the containment dir, which is the only mode where
+        // an id can reach the reserved folder.
+        flatRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-reserved-'))
+        flatStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          flatRoot,
+          { disablePrefixHash: true }
+        )
+      })
+
+      afterEach(async () => {
+        await flatStorage.stop?.()
+        rmSync(flatRoot, { recursive: true, force: true })
+      })
+
+      it('should reject storing an id under the reserved folder', async () => {
+        await expect(flatStorage.storeStream('.tmp-writes/foo', bufferToStream(content))).rejects.toThrow(
+          /reserved temp-write/
+        )
+      })
+
+      it('should reject the reserved folder name itself as an id', async () => {
+        await expect(flatStorage.exist('.tmp-writes')).rejects.toThrow(/reserved temp-write/)
+      })
+
+      it('should still allow the reserved name as an id when hash prefixes are enabled', async () => {
+        // With the default sha1 shard prefix the id resolves under a shard, outside the reserved folder.
+        await fileSystemContentStorage.storeStream('.tmp-writes', bufferToStream(content))
+        const item = await fileSystemContentStorage.retrieve('.tmp-writes')
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+    })
+
     describe('when an orphaned temp file exists in the reserved temp directory', () => {
       let seenIds: string[]
 

@@ -79,6 +79,12 @@ export async function createFolderBasedFileSystemContentStorage(
   const tempDir = path.join(root, TEMP_DIR_NAME)
   await components.fs.mkdir(tempDir, { recursive: true })
 
+  // Staged files are prefixed with a per-boot random id so the startup sweep can tell leftovers
+  // from previous runs (any other prefix) apart from files this instance is writing right now —
+  // a write racing the sweep can therefore never have its live staged file unlinked.
+  const bootId = randomBytes(8).toString('hex')
+  const newTempPath = (): string => path.join(tempDir, `${bootId}-${randomBytes(16).toString('hex')}`)
+
   const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
   const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
@@ -153,6 +159,13 @@ export async function createFolderBasedFileSystemContentStorage(
       throw new Error('Cannot manipulate files outside of the root storage folder')
     }
 
+    // The temp-write namespace is reserved: an id resolving into it (reachable when
+    // disablePrefixHash makes the root itself the containment dir, e.g. '.tmp-writes/foo') would be
+    // hidden from allFileIds and could be deleted by the startup sweep.
+    if (finalPath === tempDir || finalPath.startsWith(tempDir + path.sep)) {
+      throw new Error('Cannot manipulate files inside the reserved temp-write folder')
+    }
+
     if (!(await components.fs.existPath(dirname))) {
       await components.fs.mkdir(dirname, { recursive: true })
     }
@@ -218,7 +231,7 @@ export async function createFolderBasedFileSystemContentStorage(
     // one. Temp files live outside the content namespace, so they cannot collide with an addressable
     // id. (Data is not fsync'd before the rename, so a power loss can still lose it — content is
     // content-addressed and simply re-downloaded, so durability past process death isn't needed.)
-    const tempPath = path.join(tempDir, randomBytes(16).toString('hex'))
+    const tempPath = newTempPath()
     try {
       await pipe(stream, components.fs.createWriteStream(tempPath))
       await rename(tempPath, filePath)
@@ -284,7 +297,7 @@ export async function createFolderBasedFileSystemContentStorage(
             // a later range request would silently serve its truncated bytes as valid content.
             // Without rename (legacy custom fs adapter) fall back to writing in place.
             const { rename } = components.fs
-            const writePath = rename ? path.join(tempDir, randomBytes(16).toString('hex')) : uncompressedPath
+            const writePath = rename ? newTempPath() : uncompressedPath
             try {
               // Cap how much the gzip may inflate to so a decompression bomb cannot write an
               // unbounded file to disk. The gzip trailer's declared size is attacker-controllable,
@@ -400,10 +413,10 @@ export async function createFolderBasedFileSystemContentStorage(
     return undefined
   }
 
-  // Removes temp files left behind by a `storeStream` interrupted in a previous run. Reads the
-  // reserved temp dir once and deletes what that snapshot contained; because a live write stages
-  // under a fresh random name, a store racing this sweep is never in the snapshot and so can never be
-  // unlinked mid-write. Best-effort: a missing dir or a failed unlink is ignored.
+  // Removes temp files left behind by writes interrupted in a previous run. Staged filenames carry
+  // this boot's random prefix, so anything with a different prefix is by construction a leftover of
+  // an earlier process — a write racing this sweep stages under the current bootId and is never
+  // touched. Best-effort: a missing dir or a failed unlink is ignored.
   const sweepOrphanedTempFiles = async (): Promise<number> => {
     let entries: string[]
     try {
@@ -413,6 +426,7 @@ export async function createFolderBasedFileSystemContentStorage(
     }
     let removed = 0
     for (const entry of entries) {
+      if (entry.startsWith(`${bootId}-`)) continue
       if (await noFailUnlink(path.join(tempDir, entry))) removed++
     }
     return removed
@@ -460,17 +474,26 @@ export async function createFolderBasedFileSystemContentStorage(
       // `retrieve()` prefers the gzip encoding and would serve the truncated file as valid content.
       // Without rename (legacy custom fs adapter) fall back to compressing in place, as before.
       const { rename } = components.fs
-      const stagedGzipPath = rename ? path.join(tempDir, randomBytes(16).toString('hex')) : undefined
+      const stagedGzipPath = rename ? newTempPath() : undefined
       let compressed: boolean
       try {
         compressed = await compressContentFile(filePath, logger, stagedGzipPath)
         if (compressed && rename && stagedGzipPath) {
           await rename(stagedGzipPath, filePath + '.gzip')
+        } else if (stagedGzipPath) {
+          // Compression was staged, so the canonical .gzip was never truncated in place: a gzip from
+          // a previous version of this id could survive and retrieve() would prefer its stale bytes
+          // over the content just stored. Remove it whenever the fresh gzip is not committed.
+          await noFailUnlink(filePath + '.gzip')
         }
       } catch (err) {
-        // compressContentFile already removed its own (possibly partial) output; this only covers a
-        // failed rename, whose staged file would otherwise linger until the next startup sweep.
-        if (stagedGzipPath) await noFailUnlink(stagedGzipPath)
+        // compressContentFile already removed its own (possibly partial) output; this covers a failed
+        // rename, whose staged file would otherwise linger until the next startup sweep, and clears a
+        // stale pre-existing canonical .gzip for the same reason as above.
+        if (stagedGzipPath) {
+          await noFailUnlink(stagedGzipPath)
+          await noFailUnlink(filePath + '.gzip')
+        }
         throw err
       }
       if (compressed) {
