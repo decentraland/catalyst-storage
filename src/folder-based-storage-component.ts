@@ -509,13 +509,14 @@ export async function createFolderBasedFileSystemContentStorage(
     try {
       await doCommitRepresentation(op, id, stagedPath, primaryPath, counterpartPath, rename, signal)
     } catch (err) {
-      // The commit phase's own cancellation checkpoints throw the caller's abort reason: pass those
-      // through untouched — they ARE cancellations, and marking would tag a caller-owned object
-      // with this module's internal symbol. Every other failure here — pending-intent repair,
-      // journal write, rename, counterpart cleanup, quarantine — cannot be caused by abort teardown
-      // (the source is fully consumed before any commit begins and this backend has no abort hook),
-      // so it is a real storage error that cancellation translation must never mask.
-      if (signal?.aborted && (err === signal.reason || isAbortError(err))) {
+      // The commit phase's own cancellation checkpoints throw the caller's abort reason and nothing
+      // else, so identity is the whole test: pass that through untouched (it IS a cancellation, and
+      // marking would tag a caller-owned object with this module's internal symbol). Every other
+      // failure here — pending-intent repair, journal write, rename, counterpart cleanup, quarantine
+      // — cannot be caused by abort teardown (the source is fully consumed before any commit begins
+      // and this backend has no abort hook), so it is a real storage error that cancellation
+      // translation must never mask, whatever shape it happens to have.
+      if (signal?.aborted && err === signal.reason) {
         throw err
       }
       throw markAsNonCancellationError(err)

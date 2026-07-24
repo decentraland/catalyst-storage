@@ -118,7 +118,11 @@ export async function runStoreWithSignal<T>(
     // running (nor vice versa). The operation's rejection path owns error reporting.
     try {
       if (!stream.destroyed) {
-        teardown.destroyedSource = true
+        // Only a destroy that interrupts a source still delivering data can cause a premature
+        // close. Destroying one that has already emitted 'end' (reachable with `autoDestroy: false`,
+        // or in the tick before an auto-destroy lands) is just resource cleanup and earns no
+        // provenance — otherwise a premature-close rejection from elsewhere would be credited to us.
+        teardown.destroyedSource = !stream.readableEnded
         stream.destroy()
       }
     } catch {

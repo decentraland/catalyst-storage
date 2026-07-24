@@ -161,6 +161,43 @@ describe('runStoreWithSignal', () => {
     })
   })
 
+  describe('when the source had already ended but was not yet destroyed', () => {
+    let prematureClose: Error
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // An ended-but-undestroyed source (reachable with autoDestroy: false, or in the tick before an
+      // auto-destroy lands) cannot be made to close prematurely by our teardown — the consumer
+      // already got its 'end'. So a premature-close rejection here belongs to something else and
+      // must surface as itself, even though the teardown did call destroy() as cleanup.
+      prematureClose = Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' })
+      const source = new Readable({ read() {}, autoDestroy: false })
+      source.push(Buffer.from('fully-read'))
+      source.push(null)
+      source.resume()
+      await new Promise<void>((resolve) => source.once('end', () => resolve()))
+      expect(source.readableEnded).toBe(true)
+      expect(source.destroyed).toBe(false)
+
+      const controller = new AbortController()
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      const pending = runStoreWithSignal(source, controller.signal, () => operation)
+      controller.abort(new Error('cancelled'))
+      rejectOperation(prematureClose)
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should surface the premature close instead of the cancellation reason', () => {
+      expect(outcome).toBe(prematureClose)
+    })
+  })
+
   describe('when an operation raises an abort-shaped error of its own', () => {
     let foreignAbortError: Error
     let outcome: 'resolved' | unknown
