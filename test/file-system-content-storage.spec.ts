@@ -941,6 +941,39 @@ describe('fileSystemContentStorage', () => {
     expect(await fileSystemContentStorage.fileInfo('non-existent-id')).toBeUndefined()
   })
 
+  describe('when a cached shard directory is removed underneath the storage', () => {
+    let firstOutcome: unknown
+    let secondOutcome: unknown
+
+    beforeEach(async () => {
+      // The directory cache assumes the documented exclusive root ownership. If a directory
+      // disappears anyway, the operation that needed it must fail loudly and drop the stale entry,
+      // so a retry recreates the tree instead of failing forever.
+      await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+      rmSync(path.dirname(filePath), { recursive: true, force: true })
+      const attempt = () =>
+        fileSystemContentStorage.storeStream(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
+      firstOutcome = await attempt()
+      secondOutcome = await attempt()
+    })
+
+    it('should fail the store that hit the missing directory', () => {
+      expect((firstOutcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should recreate the directory on the next store', () => {
+      expect(secondOutcome).toEqual('resolved')
+    })
+
+    it('should serve the content stored by the retry', async () => {
+      const item = await fileSystemContentStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+    })
+  })
+
   describe('atomic storeStream', () => {
     describe('when a store completes successfully', () => {
       beforeEach(async () => {

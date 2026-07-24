@@ -712,6 +712,34 @@ export async function createFolderBasedFileSystemContentStorage(
   // promise dangling past shutdown). Repeated start() calls CHAIN onto it instead of replacing it.
   let tempFileSweep: Promise<void> = Promise.resolve()
 
+  // Directories this instance has already created or observed. `getFilePath` runs on EVERY
+  // operation — including every read — and its directory check was one syscall per call (~30% of an
+  // `exist`, ~35% of a `retrieve`, which calls it twice). Caching is sound under the documented
+  // exclusive-root ownership: nothing else removes our directories. If one disappears anyway, the
+  // operation that needs it fails loudly and `forgetDirectory` lets the retry recreate it.
+  // Bounded by construction with hash prefixes (16^4 = 65,536 shards) and capped for flat mode,
+  // where slash-containing ids can nest arbitrarily.
+  const MAX_KNOWN_DIRECTORIES = 100_000
+  const knownDirectories = new Set<string>()
+
+  function forgetDirectory(dirname: string): void {
+    knownDirectories.delete(dirname)
+  }
+
+  /**
+   * Read-path existence probe: ONE stat instead of `existPath` followed by `stat`, since a stat
+   * answers both questions. Any failure means "cannot serve", matching what `existPath` reported
+   * (it tests F_OK|R_OK, so an unreadable file was already a miss here). Recovery invariants use
+   * `existsForInvariant` instead, which must distinguish absent from unreadable.
+   */
+  async function statForRead(filePath: string): Promise<{ size: number } | undefined> {
+    try {
+      return await components.fs.stat(filePath)
+    } catch {
+      return undefined
+    }
+  }
+
   async function getFilePath(id: string): Promise<string> {
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
     // for the file system to handle millions of files in the same directory.
@@ -740,8 +768,16 @@ export async function createFolderBasedFileSystemContentStorage(
       throw new Error('Cannot manipulate files inside the reserved temp-write folder')
     }
 
-    if (!(await components.fs.existPath(dirname))) {
-      await components.fs.mkdir(dirname, { recursive: true })
+    if (!knownDirectories.has(dirname)) {
+      if (!(await components.fs.existPath(dirname))) {
+        await components.fs.mkdir(dirname, { recursive: true })
+      }
+      // Clear wholesale rather than evicting one entry: the cache only holds directory names, so a
+      // rebuild costs one syscall per directory touched afterwards.
+      if (knownDirectories.size >= MAX_KNOWN_DIRECTORIES) {
+        knownDirectories.clear()
+      }
+      knownDirectories.add(dirname)
     }
 
     return finalPath
@@ -755,9 +791,8 @@ export async function createFolderBasedFileSystemContentStorage(
     const extension = encoding ? '.' + encoding : ''
     const filePath = (await getFilePath(id)) + extension
 
-    if (await components.fs.existPath(filePath)) {
-      const stat = await components.fs.stat(filePath)
-
+    const stat = await statForRead(filePath)
+    if (stat) {
       if (range) {
         const clampedEnd = clampRange(range, stat.size)
         return new SimpleContentItem(
@@ -832,6 +867,11 @@ export async function createFolderBasedFileSystemContentStorage(
       // cleared: destroying it would let the next reconciliation apply the failed commit.
       if (!(err instanceof UncommittedIntentSurvivedError && err.stagedPath === tempPath)) {
         await noFailUnlink(tempPath)
+      }
+      // A missing directory can only mean the cached entry is stale (something removed a directory
+      // this instance owns): drop it so a retry recreates the tree instead of failing forever.
+      if ((err as { code?: string } | null)?.code === 'ENOENT') {
+        forgetDirectory(path.dirname(filePath))
       }
       throw err
     }
@@ -1062,8 +1102,8 @@ export async function createFolderBasedFileSystemContentStorage(
     for (const encoding of possibleEncondings) {
       const extension = encoding ? '.' + encoding : ''
       const filePath = baseFilePath + extension
-      if (await components.fs.existPath(filePath)) {
-        const stat = await components.fs.stat(filePath)
+      const stat = await statForRead(filePath)
+      if (stat) {
         if (encoding === 'gzip') {
           const contentSize = await readGzipOriginalSize(filePath, stat.size)
           return {
