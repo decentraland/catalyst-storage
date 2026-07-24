@@ -941,6 +941,97 @@ describe('fileSystemContentStorage', () => {
     expect(await fileSystemContentStorage.fileInfo('non-existent-id')).toBeUndefined()
   })
 
+  describe('when a custom adapter provides no lstat', () => {
+    let noLstatRoot: string
+    let noLstatStorage: IContentStorageComponent
+    const compressible = Buffer.from(new Uint8Array(4096).fill(4))
+
+    beforeEach(async () => {
+      // `lstat` is optional on IFileSystemComponent, so the compression's size comparison has to fall
+      // back to `stat` — an adapter without it must still get compressed stores.
+      noLstatRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-no-lstat-'))
+      const noLstatFs: IFileSystemComponent = { ...createFsComponent(), lstat: undefined }
+      noLstatStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: noLstatFs, logs: await createLogComponent({}) },
+        noLstatRoot
+      )
+      await noLstatStorage.storeStreamAndCompress(id, bufferToStream(compressible))
+    })
+
+    afterEach(async () => {
+      await noLstatStorage.stop?.()
+      rmSync(noLstatRoot, { recursive: true, force: true })
+    })
+
+    it('should still compress the store', async () => {
+      expect((await noLstatStorage.fileInfo(id))!.encoding).toEqual('gzip')
+    })
+
+    it('should serve the stored content', async () => {
+      const item = await noLstatStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(compressible)
+    })
+  })
+
+  describe('when the filesystem component is a custom adapter', () => {
+    let adapterRoot: string
+    let adapterStorage: IContentStorageComponent
+    let streamedThroughAdapter: string[]
+    const compressible = Buffer.from(new Uint8Array(4096).fill(3))
+
+    beforeEach(async () => {
+      // Compression reads and writes through the INJECTED component, so an adapter that instruments
+      // or virtualizes paths gets compressed stores too — not just atomic raw writes. Native `fs`
+      // would happily produce the same on-disk result here, so the assertions below check that the
+      // bytes travelled through the adapter, which is the part that a custom adapter depends on.
+      adapterRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-adapter-'))
+      streamedThroughAdapter = []
+      const realFs = createFsComponent()
+      const recordingFs: IFileSystemComponent = {
+        ...realFs,
+        createReadStream(target: any, options?: any) {
+          streamedThroughAdapter.push(`read:${target}`)
+          return realFs.createReadStream(target, options)
+        },
+        createWriteStream(target: any, options?: any) {
+          streamedThroughAdapter.push(`write:${target}`)
+          return realFs.createWriteStream(target, options)
+        }
+      }
+      adapterStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: recordingFs, logs: await createLogComponent({}) },
+        adapterRoot
+      )
+      await adapterStorage.storeStreamAndCompress(id, bufferToStream(compressible))
+    })
+
+    afterEach(async () => {
+      await adapterStorage.stop?.()
+      rmSync(adapterRoot, { recursive: true, force: true })
+    })
+
+    it('should compress the store', async () => {
+      expect((await adapterStorage.fileInfo(id))!.encoding).toEqual('gzip')
+    })
+
+    it('should read the staged raw back through the adapter to compress it', () => {
+      // The first write of a compressed store is the staged raw; the compression is the only thing
+      // that reads it back, so its presence here proves the compression used this component.
+      const stagedRaw = streamedThroughAdapter[0].replace(/^write:/, '')
+      expect(streamedThroughAdapter).toContain(`read:${stagedRaw}`)
+    })
+
+    it('should write the gzip output through the adapter', () => {
+      const writes = streamedThroughAdapter.filter((entry) => entry.startsWith('write:'))
+      expect(writes).toHaveLength(2)
+    })
+
+    it('should serve the stored content', async () => {
+      const item = await adapterStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(compressible)
+    })
+  })
+
   describe('when a cached shard directory is removed underneath the storage', () => {
     let firstOutcome: unknown
     let secondOutcome: unknown

@@ -597,7 +597,7 @@ export async function createFolderBasedFileSystemContentStorage(
         if (!signal?.aborted) {
           let compressed = false
           try {
-            compressed = await compressContentFile(filePath, logger, undefined, signal)
+            compressed = await compressContentFile(filePath, logger, undefined, signal, components.fs)
           } catch (err) {
             // The compression failed (or was torn down): its own cleanup of the partial canonical
             // output is best-effort, so VERIFY none survived — in this mode the compression writes
@@ -656,7 +656,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // CPU/disk immediately instead of only at the next checkpoint.
       let compressed: boolean
       try {
-        compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath, signal)
+        compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath, signal, components.fs)
       } catch (err) {
         // This call site is the one place that hands a signal to an abortable pipeline, so it is
         // where an abort-shaped rejection is provably our own teardown rather than a coincidence:
