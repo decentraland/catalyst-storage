@@ -137,30 +137,55 @@ export async function createFolderBasedFileSystemContentStorage(
   // Construction invariant: the storage never runs in a state where the reserved staging namespace
   // could hide addressable content. With hash prefixes, ids can never resolve into the reserved dir
   // (containment sends them under a shard), so everything inside is ours by construction. In flat
-  // (disablePrefixHash) mode the root IS the content namespace, so ownership must be proven: a
-  // marker written by this storage, or a directory found empty and claimed by writing the marker.
-  // Anything else — a pre-existing unmarked directory with content, or a failure to establish
-  // ownership — REFUSES TO START instead of warning-and-hiding: pre-existing ids under the reserved
-  // name would otherwise be silently unreachable through retrieve()/exist()/allFileIds() after an
-  // upgrade. This also means the orphan sweep never needs a runtime ownership check.
+  // (disablePrefixHash) mode the root IS the content namespace, so ownership must be proven, and
+  // the marker's mere EXISTENCE is not proof: before the reservation, the marker path itself was a
+  // valid content id, so a legacy deployment could hold an arbitrary file there. Ownership requires
+  // ALL of: the marker exists, its bytes are exactly what this storage writes, and every other
+  // entry matches the staged-name shape this storage generates. Anything else — an unmarked
+  // non-empty directory, a marker with foreign content, an unrecognized sibling, or a failure to
+  // establish ownership — REFUSES TO START instead of warning-and-hiding: pre-existing ids under
+  // the reserved name would otherwise be silently unreachable (or, shape-matching ones, sweepable)
+  // after an upgrade. A byte-exact forgery of the marker alongside exclusively staged-shaped
+  // siblings is indistinguishable from genuine ownership by construction and is treated as opt-in.
+  // This also means the orphan sweep never needs a runtime ownership check.
   const OWNERSHIP_MARKER = '.owned-by-catalyst-storage'
+  const OWNERSHIP_MARKER_CONTENT = 'reserved by catalyst-storage for atomic write staging\n'
   if (!USE_HASH_PREFIX) {
     const markerPath = path.join(tempDir, OWNERSHIP_MARKER)
-    if (!(await components.fs.existPath(markerPath))) {
-      const entries = await components.fs.readdir(tempDir)
-      if (entries.length > 0) {
-        throw new Error(
-          `Refusing to start: the reserved temp directory '${tempDirName}' under the storage root already contains ` +
-            `${entries.length} file(s) that this storage cannot prove it owns. In disablePrefixHash mode these may be ` +
-            `pre-existing content ids that the reservation would hide from retrieval and enumeration. ` +
-            `Migrate them out of '${tempDirName}', configure a different tempDirectoryName, or restore the ` +
-            `'${OWNERSHIP_MARKER}' marker if they are staging leftovers from a previous run.`
+    const refuseToStart = (reason: string): never => {
+      throw new Error(
+        `Refusing to start: ${reason} In disablePrefixHash mode the reserved temp directory '${tempDirName}' may hold ` +
+          `pre-existing content ids that the reservation would hide from retrieval and enumeration. ` +
+          `Migrate those files out of '${tempDirName}', configure a different tempDirectoryName, or restore the ` +
+          `'${OWNERSHIP_MARKER}' marker (with its original content) if they are staging leftovers from a previous run.`
+      )
+    }
+    if (await components.fs.existPath(markerPath)) {
+      const markerBody = await components.fs.readFile(markerPath, 'utf8')
+      if (markerBody !== OWNERSHIP_MARKER_CONTENT) {
+        refuseToStart(
+          `the ownership marker '${OWNERSHIP_MARKER}' exists but its content is not the one this storage writes, ` +
+            `so it may be a pre-existing content id rather than a marker.`
         )
       }
-      await pipe(
-        Readable.from([Buffer.from('reserved by catalyst-storage for atomic write staging\n')]),
-        components.fs.createWriteStream(markerPath)
+      const foreign = (await components.fs.readdir(tempDir)).filter(
+        (entry) => entry !== OWNERSHIP_MARKER && !STAGED_FILE_NAME.test(entry)
       )
+      if (foreign.length > 0) {
+        refuseToStart(
+          `the reserved temp directory '${tempDirName}' contains ${foreign.length} file(s) that this storage ` +
+            `did not create.`
+        )
+      }
+    } else {
+      const entries = await components.fs.readdir(tempDir)
+      if (entries.length > 0) {
+        refuseToStart(
+          `the reserved temp directory '${tempDirName}' already contains ${entries.length} file(s) that this ` +
+            `storage cannot prove it owns.`
+        )
+      }
+      await pipe(Readable.from([Buffer.from(OWNERSHIP_MARKER_CONTENT)]), components.fs.createWriteStream(markerPath))
     }
   }
 
@@ -210,31 +235,6 @@ export async function createFolderBasedFileSystemContentStorage(
   function invalidateInflightDecompression(filePath: string): void {
     const token = inflightDecompressionTokens.get(filePath)
     if (token) token.invalidated = true
-  }
-
-  // A compression stage (storeStreamAndCompress) produces a gzip of the raw bytes it committed; if
-  // another store or a delete lands on the same path before the gzip commit, that gzip belongs to
-  // replaced bytes and must be discarded — and the raw file must not be unlinked, since it may now
-  // be someone else's newer primary content. Registered at raw-commit time, marked by any later
-  // committer, unregistered when the compression stage ends. Bounded by in-flight compressions.
-  const inflightCompressionTokens = new Map<string, Set<{ stale: boolean }>>()
-  function registerCompressionToken(filePath: string): { stale: boolean } {
-    const token = { stale: false }
-    const tokens = inflightCompressionTokens.get(filePath) ?? new Set()
-    tokens.add(token)
-    inflightCompressionTokens.set(filePath, tokens)
-    return token
-  }
-  function unregisterCompressionToken(filePath: string, token: { stale: boolean }): void {
-    const tokens = inflightCompressionTokens.get(filePath)
-    if (!tokens) return
-    tokens.delete(token)
-    if (tokens.size === 0) inflightCompressionTokens.delete(filePath)
-  }
-  function markCompressionsStale(filePath: string): void {
-    for (const token of inflightCompressionTokens.get(filePath) ?? []) {
-      token.stale = true
-    }
   }
 
   // Drops the cache-tracking entry WITHOUT unlinking the file. Used when the canonical path stops
@@ -381,7 +381,6 @@ export async function createFolderBasedFileSystemContentStorage(
           await noFailUnlink(filePath + '.gzip')
           forgetCacheEntry(filePath)
           invalidateInflightDecompression(filePath)
-          markCompressionsStale(filePath)
         } catch (err) {
           // Clean up the partial output while still holding the lock: doing it after release could
           // delete a queued writer's freshly committed content for the same id.
@@ -408,11 +407,9 @@ export async function createFolderBasedFileSystemContentStorage(
         // be preferred by retrieve() and serve stale bytes over the content just stored.
         await noFailUnlink(filePath + '.gzip')
         // The canonical path now holds primary content: drop any stale decompress-cache tracking so
-        // eviction can never delete it, tell an in-flight decompression its output is outdated, and
-        // tell an in-flight compression its staged gzip no longer matches the canonical bytes.
+        // eviction can never delete it, and tell an in-flight decompression its output is outdated.
         forgetCacheEntry(filePath)
         invalidateInflightDecompression(filePath)
-        markCompressionsStale(filePath)
       })
     } catch (err) {
       // On a write error the temp file may be partial; on a rename error it still exists. Either way
@@ -445,7 +442,10 @@ export async function createFolderBasedFileSystemContentStorage(
   // id — commits are atomic renames and a version's raw/gzip transition happens under the path
   // lock — but a read that overlaps a commit may still serve the previous version (e.g. its gzip,
   // which retrieve prefers, in the instant before the committing section unlinks it). Reads started
-  // after a store/delete promise resolves observe that operation's outcome.
+  // after a store/delete promise resolves observe that operation's outcome. The returned
+  // ContentItem opens its stream LAZILY: a store/delete landing between retrieve() and asStream()
+  // can unlink the observed file, making asStream() fail (typically ENOENT) — callers should treat
+  // that as a retryable miss, exactly like retrieve() having returned undefined.
   const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
     if (range) validateRange(range)
     try {
@@ -684,87 +684,56 @@ export async function createFolderBasedFileSystemContentStorage(
     async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
       const filePath = await getFilePath(id)
       const { rename } = components.fs
-      // Without rename (legacy custom fs adapter) fall back to the original in-place behavior: the
-      // in-place compression truncates/removes the old gzip itself, and none of it is crash-atomic.
+      // Without rename (legacy custom fs adapter) everything is necessarily in place, so the whole
+      // sequence runs under the path lock: no concurrent store/delete can interleave between the
+      // raw write, the compression and the raw cleanup (which would otherwise be able to delete a
+      // newer writer's file). Not crash-atomic, like the rest of the no-rename mode.
       if (!rename) {
-        await storeStream(id, stream)
-        if (await compressContentFile(filePath, logger)) {
-          // try to remove original file if present
-          const contentItem = await retrieve(id)
-          if (contentItem?.encoding) {
+        await withPathLock(filePath, async () => {
+          try {
+            await pipe(stream, components.fs.createWriteStream(filePath))
+            await noFailUnlink(filePath + '.gzip')
+            forgetCacheEntry(filePath)
+            invalidateInflightDecompression(filePath)
+          } catch (err) {
+            // Clean up the partial output while still holding the lock (see storeStream).
+            await noFailUnlink(filePath)
+            throw err
+          }
+          if (await compressContentFile(filePath, logger)) {
+            // The in-place compression succeeded: the gzip exists at its canonical path and, under
+            // the lock, the raw is provably still the bytes that were compressed.
             await noFailUnlink(filePath)
           }
-        }
+        })
         return
       }
-      // The raw file and its .gzip are one versioned object, and retrieve() prefers the gzip. The
-      // overwrite therefore commits in two locked steps:
-      //   1. raw commit — rename the staged raw into place AND remove the previous version's gzip in
-      //      the same locked section, so no decompression of the old gzip can commit past this
-      //      point. (Reads are not locked: one overlapping this section may still serve the
-      //      previous version's gzip — a complete older version, never a partial or mixed one; see
-      //      the read contract on retrieve().)
-      //   2. gzip commit — after compressing (outside any lock), re-take the lock and, only if no
-      //      other store/delete landed in between (compression token still fresh), rename the staged
-      //      gzip into place and remove the now-redundant raw. If the token went stale, the staged
-      //      gzip belongs to replaced bytes: discard it and leave the newer content untouched.
-      // A process killed between the steps leaves the raw as the (fully valid) primary
-      // representation — never a partial file at a canonical path.
-      const tempPath = newTempPath()
-      let token: { stale: boolean }
+      // Fully staged: both the raw bytes and their gzip are produced in the operation-owned staging
+      // area — the compression reads the PRIVATE staged raw, so no concurrent store/delete can
+      // supersede or fail it — and the id transitions in ONE locked commit to either the gzip-only
+      // or the raw-only representation of the new version. Until that commit the previous version
+      // stays fully intact; a process killed at any point leaves only sweepable staged files.
+      const stagedRawPath = newTempPath()
+      const stagedGzipPath = newTempPath()
       try {
-        await pipe(stream, components.fs.createWriteStream(tempPath))
-        token = await withPathLock(filePath, async () => {
-          await rename(tempPath, filePath)
-          await noFailUnlink(filePath + '.gzip')
+        await pipe(stream, components.fs.createWriteStream(stagedRawPath))
+        const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath)
+        await withPathLock(filePath, async () => {
+          if (compressed) {
+            await rename(stagedGzipPath, filePath + '.gzip')
+            await noFailUnlink(filePath)
+          } else {
+            await rename(stagedRawPath, filePath)
+            await noFailUnlink(filePath + '.gzip')
+          }
           forgetCacheEntry(filePath)
           invalidateInflightDecompression(filePath)
-          markCompressionsStale(filePath)
-          return registerCompressionToken(filePath)
         })
-      } catch (err) {
-        await noFailUnlink(tempPath)
-        throw err
-      }
-      try {
-        const stagedGzipPath = newTempPath()
-        try {
-          const compressed = await compressContentFile(filePath, logger, stagedGzipPath)
-          await withPathLock(filePath, async () => {
-            if (token.stale) {
-              // Another store or delete landed after our raw commit: the staged gzip compresses
-              // bytes that are no longer canonical. Discard it; the newer committer owns the path.
-              if (compressed) await noFailUnlink(stagedGzipPath)
-              return
-            }
-            if (!compressed) {
-              // Not beneficial: the raw stays primary; the old gzip was already removed at raw
-              // commit and compressContentFile removed its own staged output.
-              return
-            }
-            await rename(stagedGzipPath, filePath + '.gzip')
-            // The gzip is now the primary representation; the raw becomes redundant. Unlinking it
-            // under the same lock and token check guarantees it is still the exact version this
-            // gzip was produced from.
-            await noFailUnlink(filePath)
-          })
-        } catch (err) {
-          // compressContentFile already removed its own (possibly partial) staged output on error;
-          // this covers a failed rename, whose staged file would otherwise linger until the sweep.
-          await noFailUnlink(stagedGzipPath)
-          // Compression reads the mutable canonical path outside the lock, so a concurrent
-          // store/delete can remove or replace it mid-read and make compression fail — but that is
-          // not a failure of THIS operation: its raw bytes were committed and a newer operation now
-          // owns the path. Rethrowing would make callers retry and potentially overwrite the newer
-          // content. The empty locked section is a barrier: the superseding commit (which unlinked
-          // the file compression was reading) marks the token inside its own locked section, so
-          // after the barrier the staleness answer is definitive.
-          const superseded = await withPathLock(filePath, async () => token.stale)
-          if (superseded) return
-          throw err
-        }
       } finally {
-        unregisterCompressionToken(filePath, token)
+        // Whatever was not renamed into place is staging residue (the raw after a gzip-only commit,
+        // both files after a failure). The previous canonical version is untouched on any error.
+        await noFailUnlink(stagedRawPath)
+        await noFailUnlink(stagedGzipPath)
       }
     },
     async delete(ids: string[]): Promise<void> {
@@ -779,7 +748,6 @@ export async function createFolderBasedFileSystemContentStorage(
           }
           await noFailUnlink(filePath + '.gzip')
           invalidateInflightDecompression(filePath)
-          markCompressionsStale(filePath)
         })
       }
     },

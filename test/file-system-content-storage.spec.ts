@@ -995,24 +995,18 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
-    describe('when a store is superseded by a delete while compressing', () => {
-      let supersededStorage: IContentStorageComponent
+    describe('when the compression of a staged store fails', () => {
       let compressSpy: jest.SpyInstance
       let storeOutcome: 'resolved' | Error
 
       beforeEach(async () => {
-        supersededStorage = await createFolderBasedFileSystemContentStorage(
-          { fs, logs: await createLogComponent({}) },
-          tmpRootDir
-        )
-        // Simulate a concurrent delete landing while the compression reads the canonical path: the
-        // source disappears mid-read and the compression fails — but the store itself has already
-        // committed its raw bytes and was merely superseded, so its promise must not reject.
+        // The compression reads the operation-owned STAGED raw, so a failure means nothing was
+        // committed: the store rejects and the previous canonical version stays fully intact.
+        await fileSystemContentStorage.storeStream(id, bufferToStream(content))
         compressSpy = jest.spyOn(compressionModule, 'compressContentFile').mockImplementationOnce(async () => {
-          await supersededStorage.delete([id])
-          throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' })
+          throw Object.assign(new Error('EIO: gzip write failed'), { code: 'EIO' })
         })
-        storeOutcome = await supersededStorage
+        storeOutcome = await fileSystemContentStorage
           .storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(0))))
           .then(
             () => 'resolved' as const,
@@ -1020,17 +1014,21 @@ describe('fileSystemContentStorage', () => {
           )
       })
 
-      afterEach(async () => {
+      afterEach(() => {
         compressSpy.mockRestore()
-        await supersededStorage.stop?.()
       })
 
-      it('should not reject the superseded store', () => {
-        expect(storeOutcome).toBe('resolved')
+      it('should reject the failed store', () => {
+        expect((storeOutcome as Error).message).toContain('EIO')
       })
 
-      it('should leave the id deleted by the newer operation', async () => {
-        expect(await supersededStorage.exist(id)).toBe(false)
+      it('should keep the previous version intact', async () => {
+        const item = await fileSystemContentStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+
+      it('should leave no staging residue', async () => {
+        expect(await nodeFs.readdir(path.join(tmpRootDir, '.tmp-writes'))).toEqual([])
       })
     })
 
@@ -1074,6 +1072,80 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when a flat-mode deployment holds a legacy content id at the marker path', () => {
+      let flatRoot: string
+      let markerSpoofPath: string
+      let constructionError: Error | undefined
+
+      beforeEach(async () => {
+        // Before the reservation, '.tmp-writes/.owned-by-catalyst-storage' was itself a valid
+        // flat-mode content id. Its existence alone must not be taken as proof of ownership.
+        flatRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-marker-spoof-'))
+        await nodeFs.mkdir(path.join(flatRoot, '.tmp-writes'), { recursive: true })
+        markerSpoofPath = path.join(flatRoot, '.tmp-writes', '.owned-by-catalyst-storage')
+        await nodeFs.writeFile(markerSpoofPath, Buffer.from('legacy content stored under the marker path'))
+        constructionError = undefined
+        try {
+          await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, flatRoot, {
+            disablePrefixHash: true
+          })
+        } catch (error: any) {
+          constructionError = error
+        }
+      })
+
+      afterEach(async () => {
+        rmSync(flatRoot, { recursive: true, force: true })
+      })
+
+      it('should refuse to start because the marker content is not the one this storage writes', () => {
+        expect(constructionError?.message).toContain('may be a pre-existing content id')
+      })
+
+      it('should leave the legacy file untouched', async () => {
+        expect(await nodeFs.readFile(markerSpoofPath, 'utf8')).toBe('legacy content stored under the marker path')
+      })
+    })
+
+    describe('when a claimed flat-mode temp directory contains a file this storage did not create', () => {
+      let flatRoot: string
+      let foreignPath: string
+      let constructionError: Error | undefined
+
+      beforeEach(async () => {
+        // A valid marker alongside an unrecognized sibling is not proof of ownership either: the
+        // sibling may be a legacy content id that predates the (possibly spoofed) marker.
+        flatRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-foreign-sibling-'))
+        await nodeFs.mkdir(path.join(flatRoot, '.tmp-writes'), { recursive: true })
+        await nodeFs.writeFile(
+          path.join(flatRoot, '.tmp-writes', '.owned-by-catalyst-storage'),
+          Buffer.from('reserved by catalyst-storage for atomic write staging\n')
+        )
+        foreignPath = path.join(flatRoot, '.tmp-writes', 'legacy-content-id')
+        await nodeFs.writeFile(foreignPath, Buffer.from('precious'))
+        constructionError = undefined
+        try {
+          await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, flatRoot, {
+            disablePrefixHash: true
+          })
+        } catch (error: any) {
+          constructionError = error
+        }
+      })
+
+      afterEach(async () => {
+        rmSync(flatRoot, { recursive: true, force: true })
+      })
+
+      it('should refuse to start because of the unrecognized sibling', () => {
+        expect(constructionError?.message).toContain('did not create')
+      })
+
+      it('should leave the unrecognized file untouched', async () => {
+        expect(await nodeFs.readFile(foreignPath, 'utf8')).toBe('precious')
+      })
+    })
+
     describe('when a flat-mode root has a previously claimed temp directory', () => {
       let flatRoot: string
       let orphanPath: string
@@ -1084,7 +1156,10 @@ describe('fileSystemContentStorage', () => {
         // succeeds and the sweep may remove foreign staged-shape leftovers.
         flatRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-flat-owned-'))
         await nodeFs.mkdir(path.join(flatRoot, '.tmp-writes'), { recursive: true })
-        await nodeFs.writeFile(path.join(flatRoot, '.tmp-writes', '.owned-by-catalyst-storage'), Buffer.from(''))
+        await nodeFs.writeFile(
+          path.join(flatRoot, '.tmp-writes', '.owned-by-catalyst-storage'),
+          Buffer.from('reserved by catalyst-storage for atomic write staging\n')
+        )
         orphanPath = path.join(flatRoot, '.tmp-writes', 'deadbeefdeadbeef-0123456789abcdef0123456789abcdef')
         await nodeFs.writeFile(orphanPath, Buffer.from(''))
         flatStorage = await createFolderBasedFileSystemContentStorage(
@@ -1557,6 +1632,34 @@ describe('fileSystemContentStorage', () => {
         it('should keep the queued store content despite the failed-store cleanup', async () => {
           const item = await storageWithoutRename.retrieve(id2)
           expect(await streamToBuffer(await item!.asStream())).toEqual(content2)
+        })
+      })
+
+      describe('and a compressed store is followed by a queued store for the same id', () => {
+        beforeEach(async () => {
+          // The whole no-rename compressed store (raw write, compression, raw cleanup) runs under
+          // the path lock, so the later store is strictly ordered after it and its cleanup can
+          // never delete the newer raw.
+          const gatedStream = new Readable({ read() {} })
+          const compressedStore = storageWithoutRename.storeStreamAndCompress(id2, gatedStream)
+          // Wait until the compressed store has opened the destination file — proof it holds the lock.
+          for (let i = 0; i < 1000 && !(await fs.existPath(filePath2)); i++) {
+            // each awaited existPath yields an event-loop turn
+          }
+          const queuedStore = storageWithoutRename.storeStream(id2, bufferToStream(content2))
+          gatedStream.push(Buffer.from(new Uint8Array(100).fill(0)))
+          gatedStream.push(null)
+          await compressedStore
+          await queuedStore
+        })
+
+        it('should keep the later store content as the final version', async () => {
+          const item = await storageWithoutRename.retrieve(id2)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(content2)
+        })
+
+        it('should not leave the compressed store gzip shadowing the later raw', async () => {
+          expect(await fs.existPath(filePath2 + '.gzip')).toBe(false)
         })
       })
     })
