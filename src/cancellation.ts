@@ -59,7 +59,12 @@ function isAbortTeardownError(error: unknown, signal: AbortSignal, teardown: Tea
   if (error === signal.reason) return true
   const err = error as { name?: unknown; code?: unknown } | null
   if (teardown.destroyedSource && err?.code === 'ERR_STREAM_PREMATURE_CLOSE') return true
-  // aws-sdk v2 ManagedUpload.abort()
+  // aws-sdk v2 ManagedUpload.abort(). NOTE for a future v3 migration (v3 was tried in #66 and
+  // rolled back in #74): v3 rejects aborted requests with an `AbortError` from @smithy, a shape this
+  // function deliberately does NOT credit — a custom transport can raise one coincidentally. A v3
+  // port must therefore attribute the abort where it is known, as the compression pipeline does at
+  // its call site (or rely on v3's native `abortSignal` request option), or cancelled uploads will
+  // surface as raw abort errors instead of the caller's reason.
   if (teardown.abortedTransport && (err?.code === 'RequestAbortedError' || err?.name === 'RequestAbortedError')) {
     return true
   }
