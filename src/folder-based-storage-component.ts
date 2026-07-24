@@ -176,6 +176,16 @@ export async function createFolderBasedFileSystemContentStorage(
   const intentPathFor = (id: string): string =>
     path.join(tempDir, `${createHash('sha1').update(id).digest('hex')}.intent`)
 
+  // Removing an intent journal is semantically must-succeed wherever it is called: a journal that
+  // outlives its purpose is later interpreted as a pending repair instruction. Centralized so the
+  // invariant cannot be accidentally weakened back into a best-effort unlink.
+  async function removeIntentOrThrow(intentPath: string, context: string): Promise<void> {
+    await noFailUnlink(intentPath)
+    if (await components.fs.existPath(intentPath)) {
+      throw new Error(`${context}: the intent journal '${intentPath}' could not be removed.`)
+    }
+  }
+
   async function writeIntent(op: 'raw' | 'gzip', id: string, stagedPath: string): Promise<string> {
     const intentPath = intentPathFor(id)
     // The staged BASENAME lets reconciliation prove whether the commit rename landed: renames
@@ -214,9 +224,13 @@ export async function createFolderBasedFileSystemContentStorage(
     }
     const stagedPath = path.join(tempDir, staged)
     if (await components.fs.existPath(stagedPath)) {
-      // Prepared but never renamed: the commit did not happen.
+      // Prepared but never renamed: the commit did not happen. The staged file is the PROOF of
+      // that, and the intent is the dangerous artifact — remove the journal first (must succeed),
+      // and only then the inert staged garbage. The reverse order could destroy the proof while the
+      // journal survives, letting the next construction reinterpret this pre-rename intent as a
+      // committed transition and delete the valid counterpart.
+      await removeIntentOrThrow(intentPath, `Cannot discard the uncommitted ${op} intent for ${id}`)
       await noFailUnlink(stagedPath)
-      await noFailUnlink(intentPath)
       logger.info(`Discarded a prepared but uncommitted ${op} transition`, { id })
       return
     }
@@ -241,7 +255,7 @@ export async function createFolderBasedFileSystemContentStorage(
       }
       logger.info(`Reconciled an interrupted ${op} commit`, { id })
     }
-    await noFailUnlink(intentPath)
+    await removeIntentOrThrow(intentPath, `Reconciled ${id} but could not discharge its intent journal`)
   }
 
   // Construction invariant: the storage never runs in a state where the reserved staging namespace
@@ -407,7 +421,7 @@ export async function createFolderBasedFileSystemContentStorage(
         )
       }
       if (intentPath) {
-        await noFailUnlink(intentPath)
+        await removeIntentOrThrow(intentPath, `Committed ${id} but could not discharge its intent journal`)
       }
     }
   }
@@ -986,11 +1000,24 @@ export async function createFolderBasedFileSystemContentStorage(
         // Locked so an in-flight decompression can never resurrect the id by renaming its staged
         // bytes onto the canonical path after these unlinks.
         await withPathLock(filePath, async () => {
+          // A pending intent (a failed counterpart cleanup earlier) must not outlive its id: an
+          // orphaned journal whose id has neither a staged file nor any representation would refuse
+          // the next construction even though this delete was intentional. Repair first (throws if
+          // impossible), which discharges the journal; a crash mid-delete afterwards leaves at
+          // worst a partial delete with NO journal, which construction accepts.
+          const pendingIntentPath = intentPathFor(id)
+          if (ATOMIC_MODE && (await components.fs.existPath(pendingIntentPath))) {
+            await applyPendingIntent(pendingIntentPath)
+          }
           const wasCached = await removeCacheEntry(filePath)
           if (!wasCached) {
             await noFailUnlink(filePath)
           }
           await noFailUnlink(filePath + '.gzip')
+          if (ATOMIC_MODE) {
+            // Defensive: applyPendingIntent already discharged any journal; verify none remains.
+            await removeIntentOrThrow(pendingIntentPath, `Deleted ${id} but could not remove its intent journal`)
+          }
           invalidateInflightDecompression(filePath)
         })
       }

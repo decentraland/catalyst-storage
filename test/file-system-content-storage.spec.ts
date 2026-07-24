@@ -1359,6 +1359,154 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when discarding an uncommitted intent fails', () => {
+      let crashRoot: string
+      let gzipPath: string
+      let stagedPath: string
+      let intentPath: string
+      let originalBytes: Buffer
+      let constructionError: Error | undefined
+
+      beforeEach(async () => {
+        // Pre-rename state (gzip primary + raw cache + staged + intent) where the intent journal
+        // cannot be removed: construction must refuse WITHOUT destroying the staged-file proof —
+        // deleting the proof first would let the next construction reinterpret the surviving
+        // pre-rename intent as a committed transition and delete the valid gzip.
+        crashRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-discard-fail-'))
+        originalBytes = Buffer.from(new Uint8Array(100).fill(5))
+        const preparer = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          crashRoot
+        )
+        await preparer.storeStreamAndCompress(id, bufferToStream(originalBytes))
+        await preparer.retrieve(id, { start: 0, end: 9 })
+        await preparer.stop?.()
+        gzipPath = path.join(crashRoot, '9584', id) + '.gzip'
+        const stagedName = `deadbeefdeadbeef-${'a'.repeat(32)}`
+        stagedPath = path.join(crashRoot, '.tmp-writes', stagedName)
+        intentPath = path.join(crashRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        await nodeFs.writeFile(stagedPath, Buffer.from('never committed'))
+        await nodeFs.writeFile(intentPath, Buffer.from(JSON.stringify({ op: 'raw', id, staged: stagedName })))
+        const realFs = createFsComponent()
+        let failuresLeft = 1
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          unlink: (async (target: any) => {
+            if (String(target) === intentPath && failuresLeft-- > 0) {
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        constructionError = undefined
+        try {
+          await createFolderBasedFileSystemContentStorage(
+            { fs: failingFs, logs: await createLogComponent({}) },
+            crashRoot
+          )
+        } catch (error: any) {
+          constructionError = error
+        }
+      })
+
+      afterEach(async () => {
+        rmSync(crashRoot, { recursive: true, force: true })
+      })
+
+      it('should refuse to construct', () => {
+        expect(constructionError?.message).toContain('Cannot discard the uncommitted')
+      })
+
+      it('should preserve the staged-file proof', async () => {
+        expect(await fs.existPath(stagedPath)).toBe(true)
+      })
+
+      it('should keep the valid gzip primary', async () => {
+        expect(await fs.existPath(gzipPath)).toBe(true)
+      })
+
+      it('should discard both artifacts and keep the previous version at the following construction', async () => {
+        const repaired = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          crashRoot
+        )
+        try {
+          expect(await fs.existPath(stagedPath)).toBe(false)
+          expect(await fs.existPath(intentPath)).toBe(false)
+          const item = await repaired.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(originalBytes)
+        } finally {
+          await repaired.stop?.()
+        }
+      })
+    })
+
+    describe('when an id with a pending intent is deleted', () => {
+      let deleteRoot: string
+      let storeOutcome: 'resolved' | Error
+      let failingStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // A committed transition whose counterpart cleanup failed leaves a pending intent; the
+        // caller then deletes the id on purpose. The delete must repair and discharge the journal —
+        // an orphaned intent whose id has neither a staged file nor any representation would refuse
+        // the next construction.
+        deleteRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-delete-intent-'))
+        const gzipPath = path.join(deleteRoot, '9584', id) + '.gzip'
+        const realFs = createFsComponent()
+        let failuresLeft = 1
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          unlink: (async (target: any) => {
+            if (String(target) === gzipPath && failuresLeft-- > 0) {
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          deleteRoot
+        )
+        await failingStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(0))))
+        storeOutcome = await failingStorage.storeStream(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: Error) => error
+        )
+        await failingStorage.delete([id])
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(deleteRoot, { recursive: true, force: true })
+      })
+
+      it('should have failed the store that left the pending intent', () => {
+        expect((storeOutcome as Error).message).toContain('failed to remove its previous gzip representation')
+      })
+
+      it('should delete the id despite the pending intent', async () => {
+        expect(await failingStorage.exist(id)).toBe(false)
+      })
+
+      it('should leave no intent journal behind', async () => {
+        const entries = await nodeFs.readdir(path.join(deleteRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => entry.endsWith('.intent'))).toEqual([])
+      })
+
+      it('should construct cleanly afterwards', async () => {
+        const restarted = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          deleteRoot
+        )
+        try {
+          expect(await restarted.exist(id)).toBe(false)
+        } finally {
+          await restarted.stop?.()
+        }
+      })
+    })
+
     describe('when reconciliation cannot remove the stale counterpart', () => {
       let mixedRoot: string
       let gzipPath: string
