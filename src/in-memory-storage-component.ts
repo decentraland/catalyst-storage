@@ -1,6 +1,7 @@
 import { Readable } from 'stream'
 import { clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
+import { runStoreWithSignal } from './cancellation'
 
 /**
  * @public
@@ -14,14 +15,14 @@ export function createInMemoryStorage(): IContentStorageComponent {
   }
 
   return {
-    async storeStreamAndCompress(fileId: string, content: Readable): Promise<void> {
-      storage.set(fileId, await streamToBuffer(content))
+    async storeStreamAndCompress(fileId: string, content: Readable, signal?: AbortSignal): Promise<void> {
+      storage.set(fileId, await runStoreWithSignal(content, signal, () => streamToBuffer(content)))
     },
     async exist(fileId: string): Promise<boolean> {
       return storage.has(fileId)
     },
-    async storeStream(fileId: string, content: Readable): Promise<void> {
-      storage.set(fileId, await streamToBuffer(content))
+    async storeStream(fileId: string, content: Readable, signal?: AbortSignal): Promise<void> {
+      storage.set(fileId, await runStoreWithSignal(content, signal, () => streamToBuffer(content)))
     },
     async delete(ids: string[]): Promise<void> {
       ids.forEach((id) => storage.delete(id))

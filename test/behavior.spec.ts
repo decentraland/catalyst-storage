@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
+import { Readable } from 'stream'
 import {
   createFolderBasedFileSystemContentStorage,
   createFsComponent,
@@ -47,6 +48,53 @@ function createCommonSuite(components: { storage?: IContentStorageComponent }) {
       'f/b/c/3': true,
       'f/b/c/4': true
     })
+  })
+
+  it(`When a signal is provided but never aborts, then the store completes normally`, async () => {
+    const controller = new AbortController()
+
+    await components.storage!.storeStream('signal/completed', bufferToStream(Buffer.from('123456')), controller.signal)
+
+    expect(await components.storage!.exist('signal/completed')).toBe(true)
+  })
+
+  it(`When the signal is already aborted, then the store rejects with the reason and stores nothing`, async () => {
+    const reason = new Error('cancelled before start')
+    const controller = new AbortController()
+    controller.abort(reason)
+
+    await expect(
+      components.storage!.storeStream('signal/pre-aborted', bufferToStream(Buffer.from('123456')), controller.signal)
+    ).rejects.toBe(reason)
+    expect(await components.storage!.exist('signal/pre-aborted')).toBe(false)
+  })
+
+  it(`When the signal aborts while the source is still streaming, then the store rejects with the reason and stores nothing`, async () => {
+    const reason = new Error('cancelled mid-stream')
+    const controller = new AbortController()
+    const source = new Readable({ read() {} })
+    source.push(Buffer.from('first-chunk'))
+
+    const pending = components.storage!.storeStream('signal/mid-aborted', source, controller.signal)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    controller.abort(reason)
+
+    await expect(pending).rejects.toBe(reason)
+    expect(await components.storage!.exist('signal/mid-aborted')).toBe(false)
+  })
+
+  it(`When the signal aborts while a compressed store is still streaming, then it rejects with the reason and stores nothing`, async () => {
+    const reason = new Error('cancelled mid-compress')
+    const controller = new AbortController()
+    const source = new Readable({ read() {} })
+    source.push(Buffer.from('first-chunk'))
+
+    const pending = components.storage!.storeStreamAndCompress('signal/mid-aborted-gzip', source, controller.signal)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    controller.abort(reason)
+
+    await expect(pending).rejects.toBe(reason)
+    expect(await components.storage!.exist('signal/mid-aborted-gzip')).toBe(false)
   })
 }
 

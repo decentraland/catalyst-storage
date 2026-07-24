@@ -14,8 +14,21 @@ export type AppComponents = {
  * @public
  */
 export type IContentStorageComponent = IBaseComponent & {
-  storeStream(fileId: string, content: Readable): Promise<void>
-  storeStreamAndCompress(fileId: string, content: Readable): Promise<void>
+  /**
+   * Stores the stream under the given id.
+   *
+   * @param signal Optional cancellation signal. When it aborts, the store stops consuming the
+   * stream, tears down any in-flight transport (e.g. the S3 upload), and rejects with the
+   * signal's reason. A store that completes before observing the abort is allowed to succeed;
+   * either way no partial content is ever observable under the id.
+   */
+  storeStream(fileId: string, content: Readable, signal?: AbortSignal): Promise<void>
+  /**
+   * Stores the stream under the given id, compressed when the backend supports it.
+   *
+   * @param signal Optional cancellation signal with the same semantics as {@link storeStream}.
+   */
+  storeStreamAndCompress(fileId: string, content: Readable, signal?: AbortSignal): Promise<void>
   delete(fileIds: string[]): Promise<void>
   retrieve(fileId: string, range?: { start: number; end: number }): Promise<ContentItem | undefined>
   fileInfo(fileId: string): Promise<FileInfo | undefined>

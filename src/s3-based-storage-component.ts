@@ -2,6 +2,7 @@ import { S3 } from 'aws-sdk'
 import { Readable } from 'stream'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem } from './content-item'
+import { runStoreWithSignal } from './cancellation'
 import { ListObjectsV2Output } from 'aws-sdk/clients/s3'
 // Workaround: TS "commonjs" transforms import() to require().
 // This indirection preserves the native import() needed for ESM-only packages.
@@ -116,30 +117,42 @@ export async function createS3BasedFileSystemContentStorage(
     }
   }
 
-  async function storeStream(id: string, stream: Readable): Promise<void> {
-    // Inspect only the head for MIME detection, then stream the body straight to S3 so large
-    // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
-    // upload, buffering only part-sized chunks rather than the whole file.
-    const { head, body } = await peekHead(stream, MIME_DETECTION_BYTES)
-    const mimeType = await detectMimeTypeFromBuffer(head)
+  async function storeStream(id: string, stream: Readable, signal?: AbortSignal): Promise<void> {
+    // Destroying the source on abort is not enough to cancel the upload: once the SDK has
+    // buffered the bytes (always, for files below the part size) the request no longer depends
+    // on the source, so the managed upload itself must be aborted to tear down its transport.
+    let upload: S3.ManagedUpload | undefined
+    await runStoreWithSignal(
+      stream,
+      signal,
+      async () => {
+        // Inspect only the head for MIME detection, then stream the body straight to S3 so large
+        // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
+        // upload, buffering only part-sized chunks rather than the whole file.
+        const { head, body } = await peekHead(stream, MIME_DETECTION_BYTES)
+        const mimeType = await detectMimeTypeFromBuffer(head)
+        signal?.throwIfAborted()
 
-    try {
-      await s3
-        .upload({
+        upload = s3.upload({
           Bucket,
           Key: getKey(id),
           Body: body,
           ContentType: mimeType
         })
-        .promise()
-    } catch (error) {
-      // Release the source stream if the upload stopped consuming the body (e.g. it failed before
-      // reading anything, so peekHead's generator never started and can't self-clean). Destroying
-      // the source releases its underlying resources (e.g. file descriptors). No-op if already
-      // ended/destroyed.
-      stream.destroy()
-      throw error
-    }
+        try {
+          await upload.promise()
+        } catch (error) {
+          // Release the source stream if the upload stopped consuming the body (e.g. it failed
+          // before reading anything, so peekHead's generator never started and can't self-clean).
+          // Destroying the source releases its underlying resources (e.g. file descriptors).
+          // No-op if already ended/destroyed.
+          stream.destroy()
+          throw error
+        }
+      },
+      // Optional call: S3-compatible test doubles may not implement ManagedUpload.abort().
+      () => upload?.abort?.()
+    )
   }
 
   async function retrieve(id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
@@ -187,9 +200,9 @@ export async function createS3BasedFileSystemContentStorage(
     return undefined
   }
 
-  async function storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
+  async function storeStreamAndCompress(id: string, stream: Readable, signal?: AbortSignal): Promise<void> {
     // In AWS S3 we don't compress, we directly store the stream
-    await storeStream(id, stream)
+    await storeStream(id, stream, signal)
   }
 
   async function deleteFn(ids: string[]): Promise<void> {

@@ -4,6 +4,7 @@ import { pipeline, Readable, Transform } from 'stream'
 import { promisify } from 'util'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
+import { runStoreWithSignal } from './cancellation'
 import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
@@ -721,7 +722,7 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  const storeStream = async (id: string, stream: Readable): Promise<void> => {
+  const doStoreStream = async (id: string, stream: Readable): Promise<void> => {
     const filePath = await getFilePath(id)
     const { rename } = components.fs
     // A custom fs adapter that predates the optional `rename` falls back to the original direct
@@ -1070,6 +1071,70 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  const doStoreStreamAndCompress = async (id: string, stream: Readable): Promise<void> => {
+    const filePath = await getFilePath(id)
+    const { rename } = components.fs
+    // Without rename (legacy custom fs adapter) everything is necessarily in place, so the whole
+    // sequence runs under the path lock: no concurrent store/delete can interleave between the
+    // raw write, the compression and the raw cleanup (which would otherwise be able to delete a
+    // newer writer's file). Not crash-atomic, like the rest of the no-rename mode.
+    if (!rename) {
+      await withPathLock(filePath, async () => {
+        await writeRawInPlaceLocked(id, filePath, stream)
+        if (await compressContentFile(filePath, logger)) {
+          // The in-place compression succeeded: the gzip exists at its canonical path and, under
+          // the lock, the raw is provably still the bytes that were compressed.
+          await noFailUnlink(filePath)
+        }
+      })
+      return
+    }
+    // Fully staged: both the raw bytes and their gzip are produced in the operation-owned staging
+    // area — the compression reads the PRIVATE staged raw, so no concurrent store/delete can
+    // supersede or fail it — and the id transitions in ONE locked commit to either the gzip-only
+    // or the raw-only representation of the new version. Until that commit the previous version
+    // stays fully intact; a process killed at any point leaves only sweepable staged files.
+    const stagedRawPath = newTempPath()
+    const stagedGzipPath = newTempPath()
+    // Set when a failed rename could not clear its intent: that exact staged path is the proof
+    // the commit never landed and must survive the staging cleanup below.
+    let preservedStagedPath: string | undefined
+    try {
+      await pipe(stream, components.fs.createWriteStream(stagedRawPath))
+      const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath)
+      await withPathLock(filePath, async () => {
+        try {
+          // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
+          // reconciled at next construction, never leaving mixed versions for reads to prefer.
+          if (compressed) {
+            await commitRepresentation('gzip', id, stagedGzipPath, filePath + '.gzip', filePath, rename)
+          } else {
+            await commitRepresentation('raw', id, stagedRawPath, filePath, filePath + '.gzip', rename)
+          }
+        } finally {
+          // Run even when the commit throws post-rename (failed counterpart cleanup).
+          forgetCacheEntry(filePath)
+          invalidateInflightDecompression(filePath)
+        }
+      })
+    } catch (err) {
+      if (err instanceof UncommittedIntentSurvivedError) {
+        preservedStagedPath = err.stagedPath
+      }
+      throw err
+    } finally {
+      // Whatever was not renamed into place is staging residue (the raw after a gzip-only commit,
+      // both files after a failure) — except a preserved uncommitted-intent proof. The previous
+      // canonical version is untouched on any error.
+      if (stagedRawPath !== preservedStagedPath) {
+        await noFailUnlink(stagedRawPath)
+      }
+      if (stagedGzipPath !== preservedStagedPath) {
+        await noFailUnlink(stagedGzipPath)
+      }
+    }
+  }
+
   await reconcileIntents()
 
   return {
@@ -1108,72 +1173,12 @@ export async function createFolderBasedFileSystemContentStorage(
         await evictCacheEntry(filePath, entry)
       }
     },
-    storeStream,
+    storeStream: (id: string, stream: Readable, signal?: AbortSignal): Promise<void> =>
+      runStoreWithSignal(stream, signal, () => doStoreStream(id, stream)),
     retrieve,
     exist,
-    async storeStreamAndCompress(id: string, stream: Readable): Promise<void> {
-      const filePath = await getFilePath(id)
-      const { rename } = components.fs
-      // Without rename (legacy custom fs adapter) everything is necessarily in place, so the whole
-      // sequence runs under the path lock: no concurrent store/delete can interleave between the
-      // raw write, the compression and the raw cleanup (which would otherwise be able to delete a
-      // newer writer's file). Not crash-atomic, like the rest of the no-rename mode.
-      if (!rename) {
-        await withPathLock(filePath, async () => {
-          await writeRawInPlaceLocked(id, filePath, stream)
-          if (await compressContentFile(filePath, logger)) {
-            // The in-place compression succeeded: the gzip exists at its canonical path and, under
-            // the lock, the raw is provably still the bytes that were compressed.
-            await noFailUnlink(filePath)
-          }
-        })
-        return
-      }
-      // Fully staged: both the raw bytes and their gzip are produced in the operation-owned staging
-      // area — the compression reads the PRIVATE staged raw, so no concurrent store/delete can
-      // supersede or fail it — and the id transitions in ONE locked commit to either the gzip-only
-      // or the raw-only representation of the new version. Until that commit the previous version
-      // stays fully intact; a process killed at any point leaves only sweepable staged files.
-      const stagedRawPath = newTempPath()
-      const stagedGzipPath = newTempPath()
-      // Set when a failed rename could not clear its intent: that exact staged path is the proof
-      // the commit never landed and must survive the staging cleanup below.
-      let preservedStagedPath: string | undefined
-      try {
-        await pipe(stream, components.fs.createWriteStream(stagedRawPath))
-        const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath)
-        await withPathLock(filePath, async () => {
-          try {
-            // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
-            // reconciled at next construction, never leaving mixed versions for reads to prefer.
-            if (compressed) {
-              await commitRepresentation('gzip', id, stagedGzipPath, filePath + '.gzip', filePath, rename)
-            } else {
-              await commitRepresentation('raw', id, stagedRawPath, filePath, filePath + '.gzip', rename)
-            }
-          } finally {
-            // Run even when the commit throws post-rename (failed counterpart cleanup).
-            forgetCacheEntry(filePath)
-            invalidateInflightDecompression(filePath)
-          }
-        })
-      } catch (err) {
-        if (err instanceof UncommittedIntentSurvivedError) {
-          preservedStagedPath = err.stagedPath
-        }
-        throw err
-      } finally {
-        // Whatever was not renamed into place is staging residue (the raw after a gzip-only commit,
-        // both files after a failure) — except a preserved uncommitted-intent proof. The previous
-        // canonical version is untouched on any error.
-        if (stagedRawPath !== preservedStagedPath) {
-          await noFailUnlink(stagedRawPath)
-        }
-        if (stagedGzipPath !== preservedStagedPath) {
-          await noFailUnlink(stagedGzipPath)
-        }
-      }
-    },
+    storeStreamAndCompress: (id: string, stream: Readable, signal?: AbortSignal): Promise<void> =>
+      runStoreWithSignal(stream, signal, () => doStoreStreamAndCompress(id, stream)),
     async delete(ids: string[]): Promise<void> {
       for (const id of ids) {
         const filePath = await getFilePath(id)

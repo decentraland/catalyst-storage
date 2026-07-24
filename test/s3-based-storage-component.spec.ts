@@ -396,3 +396,34 @@ describe('S3 Storage retrieve error logging', () => {
     expect(logger.error.mock.calls[0][1]).toMatchObject({ key: 'some-key', code: 'InternalError' })
   })
 })
+
+describe('S3 Storage upload cancellation', () => {
+  it(`When the signal aborts while the upload is in flight, then the managed upload is aborted and the call rejects with the reason`, async () => {
+    const logs = await createLogComponent({})
+    let rejectUpload: (error: Error) => void = () => undefined
+    const abort = jest.fn(() =>
+      rejectUpload(Object.assign(new Error('Request aborted by user'), { code: 'RequestAbortedError' }))
+    )
+    const upload = jest.fn(() => ({
+      promise: () =>
+        new Promise<never>((_resolve, reject) => {
+          rejectUpload = reject
+        }),
+      abort
+    }))
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+    const controller = new AbortController()
+    const reason = new Error('deployment deadline exceeded')
+
+    // Larger than the MIME-detection window so the store is genuinely mid-upload when aborted, and
+    // fully buffered by the fake SDK, so destroying the source alone could never settle the call.
+    const pending = storage.storeStream('wedged-id', bufferToStream(Buffer.alloc(5000, 1)), controller.signal)
+    while (upload.mock.calls.length === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve))
+    }
+    controller.abort(reason)
+
+    await expect(pending).rejects.toBe(reason)
+    expect(abort).toHaveBeenCalledTimes(1)
+  })
+})
