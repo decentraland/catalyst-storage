@@ -108,6 +108,10 @@ function createSizeLimitTransform(maxBytes: number): Transform {
  *   every write stages into a reserved directory and renames into place, so an interrupted write
  *   can never leave a partial file at a canonical path. Without `rename` (legacy custom adapters)
  *   writes fall back to non-atomic direct writes; a warning is logged at construction.
+ * - **Atomicity covers process crashes, NOT power-loss durability** — staged data is deliberately
+ *   not `fsync`'d before the commit rename. A power loss / kernel panic between write and flush may
+ *   lose the file entirely (never a partial/mixed state); content is content-addressed and
+ *   re-downloadable, so durability past process death is intentionally out of contract.
  * - **Reserved staging namespace** — one directory name directly under the root (default
  *   `.tmp-writes`, see {@link FolderStorageOptions.tempDirectoryName}) is reserved; ids resolving
  *   into it are rejected. With `disablePrefixHash` the factory REFUSES TO START if that directory
@@ -500,6 +504,31 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  // Shared no-rename (legacy) direct write. MUST be called while holding the path lock. Writes the
+  // raw in place and enforces the same successful-write invariant as the atomic path: never resolve
+  // while the preferred gzip counterpart survives. There is no journal in this mode, so a surviving
+  // gzip rolls the in-place store back through the catch — the previous gzip version stays cleanly
+  // intact (the raw overwritten by the pipe can only have been that gzip's own re-derivable cache).
+  async function writeRawInPlaceLocked(id: string, filePath: string, stream: Readable): Promise<void> {
+    try {
+      await pipe(stream, components.fs.createWriteStream(filePath))
+      await noFailUnlink(filePath + '.gzip')
+      if (await existsForInvariant(filePath + '.gzip')) {
+        throw new Error(
+          `Failed to remove the previous gzip representation of ${id}; the in-place store was rolled back ` +
+            `and reads keep serving the previous version.`
+        )
+      }
+      forgetCacheEntry(filePath)
+      invalidateInflightDecompression(filePath)
+    } catch (err) {
+      // Clean up the partial output while still holding the lock: doing it after release could
+      // delete a queued writer's freshly committed content for the same id.
+      await noFailUnlink(filePath)
+      throw err
+    }
+  }
+
   // Drops the cache-tracking entry WITHOUT unlinking the file. Used when the canonical path stops
   // being a derived cache and becomes primary content (a store landed there): a stale entry would
   // let TTL/size eviction delete the only copy of the new content.
@@ -645,31 +674,7 @@ export async function createFolderBasedFileSystemContentStorage(
     // write. It isn't crash-atomic, but keeps the public IFileSystemComponent backward-compatible;
     // the bundled createFsComponent provides rename and so takes the atomic path below.
     if (!rename) {
-      await withPathLock(filePath, async () => {
-        try {
-          await pipe(stream, components.fs.createWriteStream(filePath))
-          // The raw and its .gzip are one versioned object: a gzip left from a previous version
-          // would be preferred by retrieve() and serve stale bytes over the content just stored.
-          // The same successful-write invariant as the atomic path applies: never resolve while the
-          // preferred counterpart survives. There is no journal in this mode, so the throw below
-          // rolls back through the catch — the previous gzip version stays cleanly intact (the raw
-          // overwritten by the pipe can only have been that gzip's own re-derivable cache).
-          await noFailUnlink(filePath + '.gzip')
-          if (await existsForInvariant(filePath + '.gzip')) {
-            throw new Error(
-              `Failed to remove the previous gzip representation of ${id}; the in-place store was rolled back ` +
-                `and reads keep serving the previous version.`
-            )
-          }
-          forgetCacheEntry(filePath)
-          invalidateInflightDecompression(filePath)
-        } catch (err) {
-          // Clean up the partial output while still holding the lock: doing it after release could
-          // delete a queued writer's freshly committed content for the same id.
-          await noFailUnlink(filePath)
-          throw err
-        }
-      })
+      await withPathLock(filePath, () => writeRawInPlaceLocked(id, filePath, stream))
       return
     }
     // Stage the write in the reserved temp dir under a random name, then atomically rename it into
@@ -1053,23 +1058,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // newer writer's file). Not crash-atomic, like the rest of the no-rename mode.
       if (!rename) {
         await withPathLock(filePath, async () => {
-          try {
-            await pipe(stream, components.fs.createWriteStream(filePath))
-            // Same successful-write invariant and rollback semantics as the storeStream fallback.
-            await noFailUnlink(filePath + '.gzip')
-            if (await existsForInvariant(filePath + '.gzip')) {
-              throw new Error(
-                `Failed to remove the previous gzip representation of ${id}; the in-place store was rolled back ` +
-                  `and reads keep serving the previous version.`
-              )
-            }
-            forgetCacheEntry(filePath)
-            invalidateInflightDecompression(filePath)
-          } catch (err) {
-            // Clean up the partial output while still holding the lock (see storeStream).
-            await noFailUnlink(filePath)
-            throw err
-          }
+          await writeRawInPlaceLocked(id, filePath, stream)
           if (await compressContentFile(filePath, logger)) {
             // The in-place compression succeeded: the gzip exists at its canonical path and, under
             // the lock, the raw is provably still the bytes that were compressed.
