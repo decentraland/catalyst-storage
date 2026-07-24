@@ -4,16 +4,22 @@
 
 The Catalyst Storage Library provides multiple implementations to handle file storage for Catalyst servers. This allows users to store and retrieve content through different backends like S3, folder-based storage, or in-memory solutions. It abstracts the complexity of interacting with these systems, offering a unified API for managing file storage.
 
-## Installation 
+## Installation
 
-`npm install @dcl/catalyst-storage` 
+`npm install @dcl/catalyst-storage`
 
-
-## Supported storage types 
+## Supported storage types
 
 - S3 Storage: Store and retrieve content from AWS S3 buckets.
 - Folder-based Storage: Local file storage on disk.
 - In-memory Storage: Temporary storage for testing or lightweight operations.
+
+## Cancellation scope
+
+`storeStream` and `storeStreamAndCompress` accept an `AbortSignal`. Cancelling stops the work and rejects with the caller's reason, and a store that already completed before observing the abort is allowed to succeed. What "nothing was stored" guarantees differs by backend, because the two commit through different machinery:
+
+- **Folder-based — absolute.** The commit is a local `rename` this storage fully controls, with a checkpoint at every phase boundary, so a cancelled store never leaves content at a canonical path. The previous version of the id stays intact.
+- **S3 — one bounded window.** The abort tears down the in-flight request itself (`PutObject`, `UploadPart`, `CompleteMultipartUpload`), so the key does not appear; a partially uploaded multipart upload is also cleaned up, and that cleanup deliberately ignores the signal that triggered it. What cannot be covered is a request S3 has **already received in full** when the abort fires — tearing down the connection does not un-send those bytes, and the service may still apply them. The residue is bounded: S3 object writes are atomic, so the key is either absent or holds the complete content (never partial or mixed), and because content is addressed by its own hash the worst outcome is the correct bytes existing under their own id after a store reported as cancelled.
 
 ## Folder-based storage: operational contract
 
