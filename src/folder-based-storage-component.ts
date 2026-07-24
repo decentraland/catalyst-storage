@@ -545,8 +545,12 @@ export async function createFolderBasedFileSystemContentStorage(
       // Clearing it is must-succeed — if it cannot be cleared, the staged file is preserved as the
       // proof the rename never landed, exactly like a failed rename.
       await clearIntentOrThrowPreservingProof(intentPath, stagedPath, id, signal.reason)
-      signal.throwIfAborted()
     }
+    // Unconditional last checkpoint before the irreversible rename: without it, an abort landing
+    // during the awaited counterpart check on a fresh id (no counterpart → no intent → the block
+    // above skipped) would proceed to commit. No journal exists past this line unless it was just
+    // cleared, so a plain throw is safe.
+    signal?.throwIfAborted()
     try {
       await rename(stagedPath, primaryPath)
     } catch (err) {

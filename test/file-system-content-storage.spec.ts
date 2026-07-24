@@ -1129,6 +1129,62 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the signal aborts during the counterpart check of a fresh id', () => {
+      let freshAbortRoot: string
+      let reason: Error
+      let storeOutcome: 'resolved' | unknown
+      let freshAbortStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // A fresh id has no counterpart: no intent is journaled, so the intent-cleanup checkpoint
+        // is skipped — only the unconditional pre-rename checkpoint can stop the commit when the
+        // abort lands during the awaited counterpart existence check.
+        freshAbortRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-fresh-abort-'))
+        const counterpartPath = path.join(freshAbortRoot, '9584', id) + '.gzip'
+        const realFs = createFsComponent()
+        const controller = new AbortController()
+        reason = new Error('cancelled during the counterpart check')
+        const abortingFs: IFileSystemComponent = {
+          ...realFs,
+          stat: (async (target: any) => {
+            if (String(target) === counterpartPath) {
+              // The abort lands inside this await; the check itself reports "absent" as reality would.
+              controller.abort(reason)
+            }
+            return realFs.stat(target)
+          }) as typeof realFs.stat
+        }
+        freshAbortStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: abortingFs, logs: await createLogComponent({}) },
+          freshAbortRoot
+        )
+        storeOutcome = await freshAbortStorage.storeStream(id, bufferToStream(content), controller.signal).then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
+      })
+
+      afterEach(async () => {
+        await freshAbortStorage.stop?.()
+        rmSync(freshAbortRoot, { recursive: true, force: true })
+      })
+
+      it('should reject with the abort reason instead of committing the fresh object', () => {
+        expect(storeOutcome).toBe(reason)
+      })
+
+      it('should not commit anything', async () => {
+        expect(await freshAbortStorage.exist(id)).toBe(false)
+      })
+
+      it('should leave no staged residue', async () => {
+        const staged = (await nodeFs.readdir(path.join(freshAbortRoot, '.tmp-writes'))).filter((entry) =>
+          /^[0-9a-f]{16}-[0-9a-f]{32}$/.test(entry)
+        )
+        expect(staged).toEqual([])
+      })
+    })
+
     describe('when the signal aborts during the pre-rename work inside the commit', () => {
       let preRenameRoot: string
       let previousBytes: Buffer

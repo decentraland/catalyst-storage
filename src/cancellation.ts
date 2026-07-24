@@ -40,16 +40,18 @@ export function isAbortError(error: unknown): boolean {
 /**
  * True only for rejections provably produced by this module's abort teardown: the signal's own
  * reason (checkpoint throws), abort errors (signalled pipelines, `throwIfAborted` defaults), a
- * prematurely closed stream (the destroyed source — including {@link streamToBuffer}'s close
- * rejection, which carries the same code), or an aborted S3 managed upload. Anything else — fs,
- * zlib, transport or logic errors that merely raced the abort — is NOT teardown-caused and must
- * surface as itself.
+ * prematurely closed stream — but ONLY when this run's teardown actually destroyed the live source
+ * (`ERR_STREAM_PREMATURE_CLOSE` is a public shape: a source can close prematurely for a real
+ * upstream fault and then race the abort, and that failure must surface as itself) — or an aborted
+ * S3 managed upload (`RequestAbortedError` only arises from `ManagedUpload.abort()`, which nothing
+ * but this module's hook calls on these uploads). Anything else — fs, zlib, transport or logic
+ * errors that merely raced the abort — is NOT teardown-caused and must surface as itself.
  */
-function isAbortTeardownError(error: unknown, signal: AbortSignal): boolean {
+function isAbortTeardownError(error: unknown, signal: AbortSignal, teardownDestroyedSource: boolean): boolean {
   if (error === signal.reason) return true
   if (isAbortError(error)) return true
   const err = error as { name?: unknown; code?: unknown } | null
-  if (err?.code === 'ERR_STREAM_PREMATURE_CLOSE') return true
+  if (teardownDestroyedSource && err?.code === 'ERR_STREAM_PREMATURE_CLOSE') return true
   // aws-sdk v2 ManagedUpload.abort()
   if (err?.code === 'RequestAbortedError' || err?.name === 'RequestAbortedError') return true
   return false
@@ -94,12 +96,20 @@ export async function runStoreWithSignal<T>(
     }
     throw abortReasonOf(signal)
   }
+  // Whether THIS run's teardown destroyed a live source. A premature-close rejection is only
+  // provably ours when it did: if the source was already dead (ended, or destroyed by a real
+  // upstream fault) when the abort fired, our destroy was a no-op and a premature-close failure
+  // belongs to that fault, not to the cancellation.
+  let teardownDestroyedSource = false
   const abort = (): void => {
     // Exception-safe: this runs inside the signal's event dispatch, where a throw would escape as
     // an uncaught exception — and a failing stream teardown must not prevent the backend hook from
     // running (nor vice versa). The operation's rejection path owns error reporting.
     try {
-      stream.destroy()
+      if (!stream.destroyed) {
+        teardownDestroyedSource = true
+        stream.destroy()
+      }
     } catch {
       // best-effort
     }
@@ -116,9 +126,12 @@ export async function runStoreWithSignal<T>(
     // Translate ONLY rejections provably caused by the abort teardown (destroyed source, aborted
     // transport, checkpoint throws) to the caller's cancellation reason. Real backend/storage
     // failures that merely raced the abort — an S3 rejection, ENOSPC on a staged write, a zlib
-    // error — surface as themselves; the marker check is a hard override guaranteeing commit-phase
-    // errors are never translated even if one ever matched a teardown shape.
-    throw signal.aborted && isAbortTeardownError(error, signal) && !isNonCancellationError(error)
+    // error, a source that closed prematurely on its own — surface as themselves; the marker check
+    // is a hard override guaranteeing commit-phase errors are never translated even if one ever
+    // matched a teardown shape.
+    throw signal.aborted &&
+      isAbortTeardownError(error, signal, teardownDestroyedSource) &&
+      !isNonCancellationError(error)
       ? abortReasonOf(signal)
       : error
   } finally {

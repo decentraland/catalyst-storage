@@ -126,6 +126,36 @@ describe('runStoreWithSignal', () => {
     })
   })
 
+  describe('when the source closed prematurely on its own before the abort', () => {
+    let upstreamFault: Error
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // The source died for a real upstream fault BEFORE the abort fired: the teardown destroyed
+      // nothing, so the premature-close failure belongs to that fault and must surface as itself —
+      // the public ERR_STREAM_PREMATURE_CLOSE shape alone is not proof of our teardown.
+      upstreamFault = Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' })
+      const controller = new AbortController()
+      const source = new Readable({ read() {} })
+      source.destroy()
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      const pending = runStoreWithSignal(source, controller.signal, () => operation)
+      controller.abort(new Error('cancelled'))
+      rejectOperation(upstreamFault)
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should surface the upstream fault instead of the cancellation reason', () => {
+      expect(outcome).toBe(upstreamFault)
+    })
+  })
+
   describe('when the abort reason is an explicit null', () => {
     let outcome: 'resolved' | unknown
 
