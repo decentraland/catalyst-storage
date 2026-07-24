@@ -53,22 +53,33 @@ export function bufferToStream(buffer: Uint8Array | Buffer): Readable {
 export function streamToBuffer(stream: Readable): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const buffers: Uint8Array[] = []
-    stream.on('error', reject)
+    // Tracks settlement so the 'close' fallback below costs nothing on the graceful path: 'close'
+    // always follows 'end'/'error', and building its error unconditionally captured a stack on
+    // EVERY call — the dominant cost of this helper — only to reject an already-settled promise.
+    let settled = false
+    stream.on('error', (error) => {
+      settled = true
+      reject(error)
+    })
     stream.on('data', (data) => {
       if (data instanceof Uint8Array || Buffer.isBuffer(data)) {
         buffers.push(data)
       } else {
+        settled = true
         reject(new Error('Stream did not emit Uint8Array'))
         stream.destroy()
       }
     })
-    stream.on('end', () => resolve(Buffer.concat(buffers)))
+    stream.on('end', () => {
+      settled = true
+      resolve(Buffer.concat(buffers))
+    })
     // A stream destroyed without an error emits neither 'end' nor 'error' — only 'close'. Without
-    // this the returned promise would never settle. On the graceful path 'close' arrives after
-    // 'end'/'error', where this rejection is a no-op. Carries the standard premature-close code so
+    // this the returned promise would never settle. Carries the standard premature-close code so
     // cancellation handling can recognize it as teardown-caused rather than a real failure.
-    stream.on('close', () =>
+    stream.on('close', () => {
+      if (settled) return
       reject(Object.assign(new Error('Stream closed before it ended.'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }))
-    )
+    })
   })
 }
