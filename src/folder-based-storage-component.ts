@@ -173,10 +173,47 @@ export async function createFolderBasedFileSystemContentStorage(
   // per path and construction reconciles before any write — so reconciliation needs no ordering
   // heuristics. Fresh-id writes — the overwhelmingly common case in content-addressed use — have no
   // counterpart and never pay for an intent.
+  const intentPathFor = (id: string): string =>
+    path.join(tempDir, `${createHash('sha1').update(id).digest('hex')}.intent`)
+
   async function writeIntent(op: 'raw' | 'gzip', id: string): Promise<string> {
-    const intentPath = path.join(tempDir, `${createHash('sha1').update(id).digest('hex')}.intent`)
+    const intentPath = intentPathFor(id)
     await pipe(Readable.from([Buffer.from(`${op}\n${id}`)]), components.fs.createWriteStream(intentPath))
     return intentPath
+  }
+
+  // Applies a pending intent: when both representations of its id exist, removes the stale
+  // counterpart the intent identifies, and discharges the intent once the state is consistent.
+  // THROWS when the stale counterpart cannot be removed — callers must never proceed over a mixed
+  // state, because live reads do not consult intents and would keep serving the stale
+  // representation. Used by construction-time reconciliation and by commits that find a pending
+  // intent for their id (a failed cleanup earlier in this process), so an unapplied repair
+  // instruction is never overwritten.
+  async function applyPendingIntent(intentPath: string): Promise<void> {
+    const body = await components.fs.readFile(intentPath, 'utf8')
+    const separator = body.indexOf('\n')
+    const op = separator === -1 ? '' : body.slice(0, separator)
+    const id = separator === -1 ? '' : body.slice(separator + 1)
+    if ((op !== 'raw' && op !== 'gzip') || id === '') {
+      // A partial intent means its commit never started (intents are written before renames): discard.
+      await noFailUnlink(intentPath)
+      return
+    }
+    const filePath = await getFilePath(id)
+    const gzipPath = filePath + '.gzip'
+    if ((await components.fs.existPath(filePath)) && (await components.fs.existPath(gzipPath))) {
+      const stalePath = op === 'raw' ? gzipPath : filePath
+      await noFailUnlink(stalePath)
+      if (await components.fs.existPath(stalePath)) {
+        throw new Error(
+          `Cannot repair the interrupted ${op} commit for ${id}: its stale ${
+            op === 'raw' ? 'gzip' : 'raw'
+          } representation could not be removed.`
+        )
+      }
+      logger.info(`Reconciled an interrupted ${op} commit`, { id })
+    }
+    await noFailUnlink(intentPath)
   }
 
   // Construction invariant: the storage never runs in a state where the reserved staging namespace
@@ -234,6 +271,15 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  if (
+    options?.decompressMaxFileSize !== undefined &&
+    (!Number.isSafeInteger(options.decompressMaxFileSize) || options.decompressMaxFileSize <= 0)
+  ) {
+    // NaN/Infinity/non-positive values would silently disable the decompression-bomb cap.
+    throw new Error(
+      `decompressMaxFileSize must be a positive safe integer, got: ${String(options.decompressMaxFileSize)}`
+    )
+  }
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
   const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
@@ -289,6 +335,12 @@ export async function createFolderBasedFileSystemContentStorage(
     counterpartPath: string,
     rename: (from: string, to: string) => Promise<void>
   ): Promise<void> {
+    // A pending intent means a previous commit for this id failed its cleanup in this process:
+    // repair first (throws if impossible), so the intent written below always describes a
+    // transition from a consistent state and never overwrites an unapplied repair instruction.
+    if (await components.fs.existPath(intentPathFor(id))) {
+      await applyPendingIntent(intentPathFor(id))
+    }
     const hadCounterpart = await components.fs.existPath(counterpartPath)
     const intentPath = hadCounterpart ? await writeIntent(op, id) : undefined
     await rename(stagedPath, primaryPath)
@@ -762,36 +814,18 @@ export async function createFolderBasedFileSystemContentStorage(
       return
     }
     // Intent paths are a deterministic function of the id, so there is at most one per id and no
-    // ordering to resolve.
+    // ordering to resolve. A repair that cannot be completed FAILS CONSTRUCTION: live reads do not
+    // consult intents, so a usable instance over an unreconciled mixed state would keep serving the
+    // stale representation for its whole lifetime.
     for (const name of entries.filter((entry) => INTENT_FILE_NAME.test(entry)).sort()) {
-      const intentPath = path.join(tempDir, name)
       try {
-        const body = await components.fs.readFile(intentPath, 'utf8')
-        const separator = body.indexOf('\n')
-        const op = separator === -1 ? '' : body.slice(0, separator)
-        const id = separator === -1 ? '' : body.slice(separator + 1)
-        if ((op !== 'raw' && op !== 'gzip') || id === '') {
-          // A partial intent means its commit never started (intents are written first): discard.
-          await noFailUnlink(intentPath)
-          continue
-        }
-        const filePath = await getFilePath(id)
-        const gzipPath = filePath + '.gzip'
-        if ((await components.fs.existPath(filePath)) && (await components.fs.existPath(gzipPath))) {
-          const stalePath = op === 'raw' ? gzipPath : filePath
-          await noFailUnlink(stalePath)
-          if (await components.fs.existPath(stalePath)) {
-            // Mirror the commit invariant: the intent is the only recovery signal, so it must
-            // survive until the stale counterpart is confirmed gone — otherwise a transient unlink
-            // failure here would leave the mixed state unrepairable.
-            logger.warn(`Could not remove the stale counterpart while reconciling; keeping the intent`, { id })
-            continue
-          }
-          logger.info(`Reconciled an interrupted ${op} commit`, { id })
-        }
-        await noFailUnlink(intentPath)
-      } catch {
-        // Unreadable or failing right now: leave the intent for the next construction.
+        await applyPendingIntent(path.join(tempDir, name))
+      } catch (err: any) {
+        throw new Error(
+          `Refusing to start: ${err instanceof Error ? err.message : String(err)} ` +
+            `The intent journal '${name}' under '${tempDirName}' was kept; fix the underlying filesystem issue ` +
+            `(permissions, immutability) and restart.`
+        )
       }
     }
   }

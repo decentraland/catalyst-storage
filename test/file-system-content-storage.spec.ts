@@ -1227,13 +1227,24 @@ describe('fileSystemContentStorage', () => {
           await repaired.stop?.()
         }
       })
+
+      it('should repair on a retried store in the same process before committing', async () => {
+        // The retry finds the pending intent, applies the repair first (the injected failure is
+        // exhausted), and only then commits — the recovery signal is never overwritten unapplied.
+        await failingStorage.storeStream(id, bufferToStream(content))
+        expect(await fs.existPath(gzipPath)).toBe(false)
+        expect(await fs.existPath(intentPath)).toBe(false)
+        const item = await failingStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
     })
 
     describe('when reconciliation cannot remove the stale counterpart', () => {
       let mixedRoot: string
       let gzipPath: string
       let intentPath: string
-      let firstStorage: IContentStorageComponent
+      let firstStorage: IContentStorageComponent | undefined
+      let constructionError: Error | undefined
 
       beforeEach(async () => {
         // The reconciliation's own cleanup fails transiently: the intent — the only recovery
@@ -1260,15 +1271,24 @@ describe('fileSystemContentStorage', () => {
             return realFs.unlink(target)
           }) as typeof realFs.unlink
         }
-        firstStorage = await createFolderBasedFileSystemContentStorage(
-          { fs: failingFs, logs: await createLogComponent({}) },
-          mixedRoot
-        )
+        constructionError = undefined
+        try {
+          firstStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: failingFs, logs: await createLogComponent({}) },
+            mixedRoot
+          )
+        } catch (error: any) {
+          constructionError = error
+        }
       })
 
       afterEach(async () => {
-        await firstStorage.stop?.()
+        await firstStorage?.stop?.()
         rmSync(mixedRoot, { recursive: true, force: true })
+      })
+
+      it('should refuse to construct over the unreconcilable mixed state', () => {
+        expect(constructionError?.message).toContain('Refusing to start')
       })
 
       it('should keep the intent when its cleanup fails', async () => {
@@ -1587,6 +1607,22 @@ describe('fileSystemContentStorage', () => {
               tempDirectoryName: 'abcd'
             })
           ).rejects.toThrow(/shard directory/)
+        } finally {
+          rmSync(badRoot, { recursive: true, force: true })
+        }
+      })
+    })
+
+    describe('when decompressMaxFileSize is not a positive safe integer', () => {
+      it('should reject creating the storage', async () => {
+        const badRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-bad-cap-'))
+        try {
+          await expect(
+            createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, badRoot, {
+              disablePrefixHash: false,
+              decompressMaxFileSize: Number.NaN
+            })
+          ).rejects.toThrow(/positive safe integer/)
         } finally {
           rmSync(badRoot, { recursive: true, force: true })
         }
