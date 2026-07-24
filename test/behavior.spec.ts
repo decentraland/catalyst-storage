@@ -12,8 +12,7 @@ import {
 } from '../src'
 import { bufferToStream } from '../src'
 import { createLogComponent } from '@well-known-components/logger'
-import { FileSystemUtils as fsu } from './file-system-utils'
-import AWSMock from 'mock-aws-s3'
+import { createFakeS3Client } from './fake-s3-client'
 
 const options: (undefined | FolderStorageOptions)[] = [
   undefined,
@@ -120,13 +119,10 @@ describe('s3 behavior', () => {
   const components: { storage?: IContentStorageComponent } = {}
 
   beforeAll(async () => {
-    const root = fsu.createTempDirectory()
-    AWSMock.config.basePath = path.join(root, 'buckets') // Can configure a basePath for your local buckets
-    const s3 = new AWSMock.S3({
-      params: { Bucket: 'example' }
-    })
     const logs = await createLogComponent({})
-    components.storage = await createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: 'example' })
+    components.storage = await createS3BasedFileSystemContentStorage({ logs }, createFakeS3Client(), {
+      Bucket: 'example'
+    })
   })
 
   createCommonSuite(components)

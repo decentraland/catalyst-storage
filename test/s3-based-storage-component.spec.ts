@@ -1,13 +1,13 @@
-import path from 'path'
 import {
   createAwsS3BasedFileSystemContentStorage,
   createS3BasedFileSystemContentStorage,
   IContentStorageComponent
 } from '../src'
 import { bufferToStream, streamToBuffer } from '../src'
-import { FileSystemUtils as fsu } from './file-system-utils'
-import AWSMock from 'mock-aws-s3'
+import { createFakeS3Client, FakeS3Client } from './fake-s3-client'
 import { Readable } from 'stream'
+import { Upload } from '@aws-sdk/lib-storage'
+import { PutObjectCommand } from '@aws-sdk/client-s3'
 import { once } from 'events'
 import { createLogComponent } from '@well-known-components/logger'
 import { createConfigComponent } from '@well-known-components/env-config-provider'
@@ -34,13 +34,8 @@ describe('S3 Storage', () => {
   let content2: Buffer
 
   beforeEach(async () => {
-    const root = fsu.createTempDirectory()
-    AWSMock.config.basePath = path.join(root, 'buckets') // Can configure a basePath for your local buckets
-    const s3 = new AWSMock.S3({
-      params: { Bucket: 'example' }
-    })
     const logs = await createLogComponent({})
-    storage = await createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: 'example' })
+    storage = await createS3BasedFileSystemContentStorage({ logs }, createFakeS3Client(), { Bucket: 'example' })
 
     id = 'some-id'
     content = Buffer.from('123')
@@ -131,8 +126,8 @@ describe('S3 Storage', () => {
     expect(retrievedContent?.encoding).toBeUndefined()
   })
 
-  // Note: mock-aws-s3 does not support the Range parameter, so stream content
-  // assertions are skipped. These tests verify our size calculation and validation logic.
+  // The in-memory double honors Range, so these assert the served BYTES as well as the computed
+  // size — content assertions the previous v2 emulator could not support.
 
   it(`When a range is requested on a non-existent key, then it returns undefined`, async () => {
     const item = await storage.retrieve('non-existent', { start: 0, end: 4 })
@@ -144,8 +139,8 @@ describe('S3 Storage', () => {
     await storage.storeStream(id, bufferToStream(data))
 
     const item = await storage.retrieve(id, { start: 4, end: 4 })
-    expect(item).toBeDefined()
     expect(item!.size).toBe(1)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('o'))
   })
 
   it(`When content is stored, then a range retrieve returns correct size`, async () => {
@@ -153,8 +148,8 @@ describe('S3 Storage', () => {
     await storage.storeStream(id, bufferToStream(data))
 
     const item = await storage.retrieve(id, { start: 0, end: 4 })
-    expect(item).toBeDefined()
     expect(item!.size).toBe(5)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('Hello'))
   })
 
   it(`When content is stored, then a range in the middle returns correct size`, async () => {
@@ -162,8 +157,8 @@ describe('S3 Storage', () => {
     await storage.storeStream(id, bufferToStream(data))
 
     const item = await storage.retrieve(id, { start: 7, end: 11 })
-    expect(item).toBeDefined()
     expect(item!.size).toBe(5)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('World'))
   })
 
   it(`When a range with end beyond file size is requested, then it clamps to file size`, async () => {
@@ -171,8 +166,8 @@ describe('S3 Storage', () => {
     await storage.storeStream(id, bufferToStream(data))
 
     const item = await storage.retrieve(id, { start: 7, end: 999 })
-    expect(item).toBeDefined()
     expect(item!.size).toBe(6)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('World!'))
   })
 
   it(`When a range with start > end is requested, then it throws a RangeError`, async () => {
@@ -239,7 +234,7 @@ describe('S3 Storage', () => {
 
 describe('S3 Storage MIME type detection', () => {
   let storage: IContentStorageComponent
-  let uploadSpy: jest.SpyInstance
+  let fakeS3: FakeS3Client
 
   // Each payload is padded well beyond the detection window so the test proves the type is
   // detected from the head alone, without buffering the whole file.
@@ -253,69 +248,55 @@ describe('S3 Storage MIME type detection', () => {
   const gltfJson = Buffer.from(JSON.stringify({ asset: { version: '2.0' } }))
 
   beforeEach(async () => {
-    const root = fsu.createTempDirectory()
-    AWSMock.config.basePath = path.join(root, 'buckets')
-    const s3 = new AWSMock.S3({ params: { Bucket: 'example' } })
-    uploadSpy = jest.spyOn(s3, 'upload')
+    fakeS3 = createFakeS3Client()
     const logs = await createLogComponent({})
-    storage = await createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: 'example' })
+    storage = await createS3BasedFileSystemContentStorage({ logs }, fakeS3, { Bucket: 'example' })
   })
 
-  const uploadedContentType = (): string => uploadSpy.mock.calls[0][0].ContentType
+  const uploadedContentType = (key: string): string => fakeS3.objects.get(key)!.contentType!
 
   it(`When a PNG larger than the detection window is stored, then it is uploaded as image/png`, async () => {
     await storage.storeStream('png-id', bufferToStream(png))
 
-    expect(uploadedContentType()).toBe('image/png')
+    expect(uploadedContentType('png-id')).toBe('image/png')
   })
 
   it(`When a JPEG larger than the detection window is stored, then it is uploaded as image/jpeg`, async () => {
     await storage.storeStream('jpeg-id', bufferToStream(jpeg))
 
-    expect(uploadedContentType()).toBe('image/jpeg')
+    expect(uploadedContentType('jpeg-id')).toBe('image/jpeg')
   })
 
   it(`When a binary glTF (GLB) larger than the detection window is stored, then it is uploaded as model/gltf-binary`, async () => {
     await storage.storeStream('glb-id', bufferToStream(glb))
 
-    expect(uploadedContentType()).toBe('model/gltf-binary')
+    expect(uploadedContentType('glb-id')).toBe('model/gltf-binary')
   })
 
   it(`When a text-based glTF (JSON) is stored, then it falls back to application/octet-stream`, async () => {
     await storage.storeStream('gltf-id', bufferToStream(gltfJson))
 
-    expect(uploadedContentType()).toBe('application/octet-stream')
+    expect(uploadedContentType('gltf-id')).toBe('application/octet-stream')
   })
 })
 
 describe('S3 Storage edge cases', () => {
   it(`When a file has ContentLength 0, then fileInfo returns size 0 instead of null`, async () => {
-    const headObjectResponse = { ETag: '"abc"', ContentLength: 0, ContentEncoding: undefined }
-    const mockS3 = {
-      headObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve(headObjectResponse) }),
-      upload: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
-      getObject: jest.fn().mockReturnValue({ createReadStream: () => bufferToStream(Buffer.alloc(0)) }),
-      deleteObjects: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
-      listObjectsV2: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Contents: [], IsTruncated: false }) })
-    }
+    const fake = createFakeS3Client()
+    fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentLength: 0, ContentEncoding: undefined }))
     const logs = await createLogComponent({})
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
 
     const info = await storage.fileInfo('empty-file')
     expect(info).toEqual({ encoding: null, size: 0, contentSize: 0 })
   })
 
   it(`When headObject returns no ContentLength, then a range retrieve returns null size`, async () => {
-    const headObjectResponse = { ETag: '"abc"', ContentEncoding: undefined }
-    const mockS3 = {
-      headObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve(headObjectResponse) }),
-      upload: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
-      getObject: jest.fn().mockReturnValue({ createReadStream: () => bufferToStream(Buffer.from('Hello')) }),
-      deleteObjects: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
-      listObjectsV2: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Contents: [], IsTruncated: false }) })
-    }
+    const fake = createFakeS3Client()
+    fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentEncoding: undefined }))
+    fake.on('GetObjectCommand', () => ({ Body: bufferToStream(Buffer.from('Hello')) }))
     const logs = await createLogComponent({})
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
 
     const item = await storage.retrieve('some-file', { start: 0, end: 4 })
     expect(item).toBeDefined()
@@ -323,15 +304,15 @@ describe('S3 Storage edge cases', () => {
   })
 
   it(`When the upload fails, then the source stream is released`, async () => {
-    const mockS3 = {
-      headObject: jest.fn().mockReturnValue({ promise: () => Promise.resolve({}) }),
-      upload: jest.fn().mockReturnValue({ promise: () => Promise.reject(new Error('upload failed')) }),
-      getObject: jest.fn(),
-      deleteObjects: jest.fn().mockReturnValue({ promise: () => Promise.resolve() }),
-      listObjectsV2: jest.fn().mockReturnValue({ promise: () => Promise.resolve({ Contents: [], IsTruncated: false }) })
+    const fake = createFakeS3Client()
+    const uploadFailure = () => {
+      throw new Error('upload failed')
     }
+    // lib-storage may take either the single-part or multipart route depending on buffering.
+    fake.on('PutObjectCommand', uploadFailure)
+    fake.on('CreateMultipartUploadCommand', uploadFailure)
     const logs = await createLogComponent({})
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, mockS3 as any, { Bucket: 'test' })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
 
     // Two chunks so the body still has unread data after the head is peeked.
     const source = Readable.from([Buffer.alloc(5000, 1), Buffer.alloc(5000, 1)])
@@ -352,21 +333,18 @@ describe('S3 Storage retrieve error logging', () => {
 
   async function retrieveWithHeadError(headError: any) {
     const { logs, logger } = createSpyLogs()
-    const mockS3 = {
-      headObject: jest.fn().mockReturnValue({ promise: () => Promise.reject(headError) }),
-      getObject: jest.fn(),
-      upload: jest.fn(),
-      deleteObjects: jest.fn(),
-      listObjectsV2: jest.fn()
-    }
-    const storage = await createS3BasedFileSystemContentStorage({ logs } as any, mockS3 as any, { Bucket: 'test' })
+    const fake = createFakeS3Client()
+    fake.on('HeadObjectCommand', () => {
+      throw headError
+    })
+    const storage = await createS3BasedFileSystemContentStorage({ logs } as any, fake, { Bucket: 'test' })
     const result = await storage.retrieve('some-key')
     return { result, logger }
   }
 
   it(`When headObject returns 403 Forbidden, then it warns with the key and does not error`, async () => {
     const { result, logger } = await retrieveWithHeadError(
-      Object.assign(new Error(), { code: 'Forbidden', statusCode: 403 })
+      Object.assign(new Error(), { name: 'Forbidden', $metadata: { httpStatusCode: 403 } })
     )
 
     expect(result).toBeUndefined()
@@ -377,7 +355,7 @@ describe('S3 Storage retrieve error logging', () => {
 
   it(`When headObject returns NotFound, then it logs nothing and returns undefined`, async () => {
     const { result, logger } = await retrieveWithHeadError(
-      Object.assign(new Error(), { code: 'NotFound', statusCode: 404 })
+      Object.assign(new Error(), { name: 'NotFound', $metadata: { httpStatusCode: 404 } })
     )
 
     expect(result).toBeUndefined()
@@ -387,7 +365,7 @@ describe('S3 Storage retrieve error logging', () => {
 
   it(`When headObject fails with a non-403 error, then it logs an error with the key`, async () => {
     const { result, logger } = await retrieveWithHeadError(
-      Object.assign(new Error('boom'), { code: 'InternalError', statusCode: 500 })
+      Object.assign(new Error('boom'), { name: 'InternalError', $metadata: { httpStatusCode: 500 } })
     )
 
     expect(result).toBeUndefined()
@@ -397,76 +375,221 @@ describe('S3 Storage retrieve error logging', () => {
   })
 })
 
-describe('S3 Storage upload cancellation', () => {
-  it(`When the signal aborts while the upload is in flight, then the managed upload is aborted and the call rejects with the reason`, async () => {
+describe('S3 Storage response bodies', () => {
+  it(`When GetObject returns no body, then reading the item fails with an actionable error`, async () => {
+    // `Body` is optional in the v3 types, so a misconfigured client (or a non-Node runtime shape)
+    // could hand back something that is not a stream. Casting it would push the failure out to a
+    // consumer; this keeps it at the boundary with a message naming what arrived.
     const logs = await createLogComponent({})
-    let rejectUpload: (error: Error) => void = () => undefined
-    const abort = jest.fn(() =>
-      rejectUpload(Object.assign(new Error('Request aborted by user'), { code: 'RequestAbortedError' }))
-    )
-    const upload = jest.fn(() => ({
-      promise: () =>
-        new Promise<never>((_resolve, reject) => {
-          rejectUpload = reject
-        }),
-      abort
-    }))
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+    const fake = createFakeS3Client()
+    await fake.send(new PutObjectCommand({ Bucket: 'example', Key: 'bodiless-id', Body: Buffer.from('x') }))
+    fake.on('GetObjectCommand', () => ({ ContentLength: 1 }))
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+
+    const item = await storage.retrieve('bodiless-id')
+
+    await expect(item!.asStream()).rejects.toThrow(/no readable body for bodiless-id; received undefined/)
+  })
+
+  it(`When GetObject returns a non-stream body, then the error names what arrived`, async () => {
+    const logs = await createLogComponent({})
+    const fake = createFakeS3Client()
+    await fake.send(new PutObjectCommand({ Bucket: 'example', Key: 'blob-id', Body: Buffer.from('x') }))
+    fake.on('GetObjectCommand', () => ({ Body: new Date(), ContentLength: 1 }))
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+
+    const item = await storage.retrieve('blob-id')
+
+    await expect(item!.asStream()).rejects.toThrow(/received a Date/)
+  })
+})
+
+describe('S3 Storage upload cancellation', () => {
+  it(`When the signal aborts while the upload is in flight, then it is torn down and the call rejects with the reason`, async () => {
+    // The fake honors abortSignal like the real client, so this drives lib-storage's genuine
+    // Upload.abort() path: the store must reject with the caller's reason and commit nothing.
+    const logs = await createLogComponent({})
+    const fake = createFakeS3Client()
+    const inFlight = fake.hang('PutObjectCommand')
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
     const controller = new AbortController()
     const reason = new Error('deployment deadline exceeded')
 
-    // Larger than the MIME-detection window so the store is genuinely mid-upload when aborted, and
-    // fully buffered by the fake SDK, so destroying the source alone could never settle the call.
+    // Larger than the MIME-detection window, so the store is genuinely mid-upload when aborted.
     const pending = storage.storeStream('wedged-id', bufferToStream(Buffer.alloc(5000, 1)), controller.signal)
-    while (upload.mock.calls.length === 0) {
-      await new Promise<void>((resolve) => setImmediate(resolve))
-    }
+    await inFlight.started
     controller.abort(reason)
 
     await expect(pending).rejects.toBe(reason)
-    expect(abort).toHaveBeenCalledTimes(1)
+    expect(fake.objects.has('wedged-id')).toBe(false)
+    // Asserting absence before the request settles would pass even if the abort had only stopped
+    // lib-storage's own loop: release the transport and let it run to where a surviving request
+    // would have written the object.
+    inFlight.release()
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(fake.objects.has('wedged-id')).toBe(false)
+    inFlight.release()
   })
 
-  it(`When the SDK reports an aborted request the hook did not cause, then the real error surfaces`, async () => {
-    // RequestAbortedError is a public SDK shape: an SDK-internal socket teardown can produce it and
-    // merely race the caller's cancellation. Without our own abort being the cause (this double has
-    // no abort(), so the hook tears nothing down), the real failure must not be reported as the
-    // caller's cancellation reason.
+  it(`When a real failure races an abort we caused, then lib-storage's abort race still reports the reason`, async () => {
+    // Documents an SDK-level limitation, not our attribution: `Upload.done()` races the upload
+    // against an abort watcher that rejects with lib-storage's own AbortError the instant abort()
+    // fires, so a genuine failure arriving in that window is discarded ABOVE this layer and cannot
+    // be recovered here. Our attribution then correctly reports the caller's reason.
     const logs = await createLogComponent({})
+    const accessDenied = Object.assign(new Error('AccessDenied'), { name: 'AccessDenied' })
+    const fake = createFakeS3Client()
+    let started: () => void = () => undefined
+    const uploadStarted = new Promise<void>((resolve) => (started = resolve))
+    fake.on('PutObjectCommand', async () => {
+      started()
+      await new Promise<void>((resolve) => setTimeout(resolve, 10))
+      throw accessDenied
+    })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
     const controller = new AbortController()
-    const sdkFault = Object.assign(new Error('Request aborted by the socket'), { code: 'RequestAbortedError' })
-    let rejectUpload: (error: Error) => void = () => undefined
-    const upload = jest.fn(() => ({
-      promise: () =>
-        new Promise<never>((_resolve, reject) => {
-          rejectUpload = reject
-        })
-      // deliberately no abort(): the teardown hook cannot tear this upload down
-    }))
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
 
-    const pending = storage.storeStream('sdk-fault-id', bufferToStream(Buffer.alloc(5000, 1)), controller.signal)
-    while (upload.mock.calls.length === 0) {
-      await new Promise<void>((resolve) => setImmediate(resolve))
+    const reason = new Error('cancelled while the upload was failing')
+    const pending = storage.storeStream('racing-fault-id', bufferToStream(Buffer.alloc(5000, 1)), controller.signal)
+    await uploadStarted
+    controller.abort(reason)
+
+    await expect(pending).rejects.toBe(reason)
+    expect(fake.objects.has('racing-fault-id')).toBe(false)
+  })
+
+  it(`When the abort lands during the head read, then no upload command is ever sent`, async () => {
+    // The checkpoint before the upload is created must stop the store outright.
+    const logs = await createLogComponent({})
+    const fake = createFakeS3Client()
+    const sent: string[] = []
+    for (const command of ['PutObjectCommand', 'CreateMultipartUploadCommand']) {
+      fake.on(command, () => {
+        sent.push(command)
+        return { ETag: '"x"', UploadId: 'u' }
+      })
     }
-    controller.abort(new Error('cancelled while the socket was failing'))
-    rejectUpload(sdkFault)
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const controller = new AbortController()
+    const reason = new Error('cancelled during the head read')
+    const source = bufferToStream(Buffer.alloc(5000, 1))
+    // Aborts in the same event as the head read completing, before any upload exists.
+    source.on('end', () => controller.abort(reason))
 
-    await expect(pending).rejects.toBe(sdkFault)
+    await expect(storage.storeStream('head-abort-id', source, controller.signal)).rejects.toBe(reason)
+    expect(sent).toEqual([])
+  })
+
+  it(`When the abort lands mid-PutObject, then the request is torn down and the key never appears`, async () => {
+    // lib-storage issues `client.send(new PutObjectCommand(...))` with NO request options, so its
+    // own abort() only wins the race inside done() while that HTTP request keeps going — it could
+    // still commit the object after this store had already rejected as cancelled. This asserts the
+    // request itself is cancelled: the held transport is released afterwards and given time to run,
+    // and the commit handler must never be reached.
+    const logs = await createLogComponent({})
+    const fake = createFakeS3Client()
+    let commitsAttempted = 0
+    const inFlight = fake.hang('PutObjectCommand')
+    fake.on('PutObjectCommand', (input: any) => {
+      commitsAttempted++
+      fake.objects.set(input.Key, { body: Buffer.alloc(0) })
+      return { ETag: '"x"' }
+    })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const controller = new AbortController()
+    const reason = new Error('cancelled mid-put')
+
+    const pending = storage.storeStream('mid-put-id', bufferToStream(Buffer.alloc(5000, 1)), controller.signal)
+    await inFlight.started
+    controller.abort(reason)
+
+    await expect(pending).rejects.toBe(reason)
+    // Release the held request and drain: a request that was not really aborted would reach its
+    // handler here and write the key.
+    inFlight.release()
+    await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(commitsAttempted).toEqual(0)
+    expect(fake.objects.has('mid-put-id')).toBe(false)
+  })
+
+  it(`When the abort lands mid-multipart, then no part commits and the multipart upload is still cleaned up`, async () => {
+    // The same hole exists on the multipart path (UploadPart and CompleteMultipartUpload are sent
+    // without request options), with one extra requirement: the AbortMultipartUpload that removes
+    // the uploaded parts must NOT be cancelled by the very signal that triggered it, or the parts
+    // accumulate and are billed until a lifecycle rule reaps them.
+    const logs = await createLogComponent({})
+    const fake = createFakeS3Client()
+    let completes = 0
+    let cleanups = 0
+    fake.on('CompleteMultipartUploadCommand', () => {
+      completes++
+      return { ETag: '"x"' }
+    })
+    fake.on('AbortMultipartUploadCommand', () => {
+      cleanups++
+      return {}
+    })
+    const inFlight = fake.hang('UploadPartCommand')
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const controller = new AbortController()
+    const reason = new Error('cancelled mid-multipart')
+
+    // Larger than lib-storage's 5MB minimum part size, so this is a genuine multipart upload.
+    const pending = storage.storeStream('mid-part-id', bufferToStream(Buffer.alloc(12 << 20, 1)), controller.signal)
+    await inFlight.started
+    controller.abort(reason)
+
+    await expect(pending).rejects.toBe(reason)
+    inFlight.release()
+    await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(completes).toEqual(0)
+    expect(fake.objects.has('mid-part-id')).toBe(false)
+    expect(cleanups).toBeGreaterThan(0)
+  })
+
+  it(`When Upload.abort() throws, then the store is still cancelled and nothing is committed`, async () => {
+    // Teardown is best-effort: a throwing abort() must not escape the signal's event dispatch. It
+    // must also not leave the upload running — the transport is torn down through the abort
+    // controller this storage owns, which does not depend on Upload.abort() working at all.
+    const logs = await createLogComponent({})
+    const abortSpy = jest.spyOn(Upload.prototype, 'abort').mockImplementation(() => {
+      throw new Error('abort exploded')
+    })
+    try {
+      const fake = createFakeS3Client()
+      const inFlight = fake.hang('PutObjectCommand')
+      const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+      const controller = new AbortController()
+      const reason = new Error('cancelled with a broken abort')
+
+      const pending = storage.storeStream('broken-abort-id', bufferToStream(Buffer.alloc(5000, 1)), controller.signal)
+      await inFlight.started
+      controller.abort(reason)
+      // Released so a request that survived the abort would run to completion and commit.
+      inFlight.release()
+
+      await expect(pending).rejects.toBe(reason)
+      expect(abortSpy).toHaveBeenCalled()
+      expect(fake.objects.has('broken-abort-id')).toBe(false)
+    } finally {
+      abortSpy.mockRestore()
+    }
   })
 
   it(`When the upload fails and the source destroy throws, then the upload error is preserved`, async () => {
     const logs = await createLogComponent({})
-    const uploadFault = Object.assign(new Error('AccessDenied'), { code: 'AccessDenied' })
+    const uploadFault = Object.assign(new Error('AccessDenied'), { name: 'AccessDenied' })
     let uploadRejected = false
-    const upload = jest.fn(() => ({
-      promise: async () => {
-        uploadRejected = true
-        throw uploadFault
-      },
-      abort: jest.fn()
-    }))
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+    const fake = createFakeS3Client()
+    fake.on('PutObjectCommand', () => {
+      uploadRejected = true
+      throw uploadFault
+    })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
     const source = bufferToStream(Buffer.from('some content'))
     // Throw only for the cleanup destroy after the upload failed: an unconditional override would
     // also break the async-iterator teardown the head read performs before the upload exists.
@@ -479,52 +602,5 @@ describe('S3 Storage upload cancellation', () => {
     }) as typeof source.destroy
 
     await expect(storage.storeStream('destroy-throws-id', source)).rejects.toBe(uploadFault)
-  })
-
-  it(`When an S3-compatible abort() throws during upload creation, then the caller still sees the reason`, async () => {
-    // The manual teardown in the post-creation checkpoint must be as exception-safe as the listener's
-    // hook: a throwing abort() cannot be allowed to replace the caller's cancellation reason.
-    const logs = await createLogComponent({})
-    const controller = new AbortController()
-    const reason = new Error('cancelled during upload creation')
-    const promiseSpy = jest.fn(() => new Promise<never>(() => undefined))
-    const upload = jest.fn(() => {
-      controller.abort(reason)
-      return {
-        promise: promiseSpy,
-        abort: () => {
-          throw new Error('abort exploded')
-        }
-      }
-    })
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
-
-    await expect(
-      storage.storeStream('abort-throws-id', bufferToStream(Buffer.from('small')), controller.signal)
-    ).rejects.toBe(reason)
-    expect(promiseSpy).not.toHaveBeenCalled()
-  })
-
-  it(`When the signal aborts during upload creation, then the upload is torn down before it is awaited`, async () => {
-    // The abort listener can only call ManagedUpload.abort() once the upload variable is assigned:
-    // an abort firing during s3.upload(...) itself finds it undefined, and with a small source
-    // already buffered into the head, the upload would otherwise complete for a cancelled store.
-    const logs = await createLogComponent({})
-    const controller = new AbortController()
-    const reason = new Error('cancelled during upload creation')
-    const abort = jest.fn()
-    const promiseSpy = jest.fn(() => new Promise<never>(() => undefined))
-    const upload = jest.fn(() => {
-      // Fires while the caller's `upload` variable is still unassigned.
-      controller.abort(reason)
-      return { promise: promiseSpy, abort }
-    })
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
-
-    const pending = storage.storeStream('creation-abort-id', bufferToStream(Buffer.from('small')), controller.signal)
-
-    await expect(pending).rejects.toBe(reason)
-    expect(abort).toHaveBeenCalledTimes(1)
-    expect(promiseSpy).not.toHaveBeenCalled()
   })
 })
