@@ -1092,7 +1092,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.writeFile(gzipPath, Buffer.from('stale gzip of the previous version'))
         await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
-          path.join(mixedRoot, '.tmp-writes', 'deadbeefdeadbeef-0000000000000000.intent'),
+          path.join(mixedRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
           Buffer.from(`raw\n${id}`)
         )
         mixedStorage = await createFolderBasedFileSystemContentStorage(
@@ -1140,7 +1140,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.writeFile(rawPath + '.gzip', gzipSync(newBytes))
         await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
-          path.join(mixedRoot, '.tmp-writes', 'deadbeefdeadbeef-0000000000000000.intent'),
+          path.join(mixedRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
           Buffer.from(`gzip\n${id}`)
         )
         mixedStorage = await createFolderBasedFileSystemContentStorage(
@@ -1164,6 +1164,173 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the counterpart cleanup fails after a committed rename', () => {
+      let failRoot: string
+      let gzipPath: string
+      let intentPath: string
+      let storeOutcome: 'resolved' | Error
+      let failingStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The rename lands but the stale gzip cannot be unlinked: the store must fail loudly (this
+        // process would keep serving the stale gzip) and the intent must survive so the next
+        // construction repairs the mixed state.
+        failRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-unlink-fail-'))
+        const shardDir = path.join(failRoot, '9584')
+        gzipPath = path.join(shardDir, id) + '.gzip'
+        intentPath = path.join(failRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        const realFs = createFsComponent()
+        let failuresLeft = 1
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          unlink: (async (target: any) => {
+            if (String(target) === gzipPath && failuresLeft-- > 0) {
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          failRoot
+        )
+        await failingStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(0))))
+        storeOutcome = await failingStorage.storeStream(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: Error) => error
+        )
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(failRoot, { recursive: true, force: true })
+      })
+
+      it('should fail the store instead of resolving while the stale gzip is still preferred', () => {
+        expect((storeOutcome as Error).message).toContain('failed to remove its previous gzip representation')
+      })
+
+      it('should keep the intent as the recovery signal', async () => {
+        expect(await fs.existPath(intentPath)).toBe(true)
+      })
+
+      it('should repair the mixed state at the next construction', async () => {
+        const repaired = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          failRoot
+        )
+        try {
+          expect(await fs.existPath(gzipPath)).toBe(false)
+          const item = await repaired.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+        } finally {
+          await repaired.stop?.()
+        }
+      })
+    })
+
+    describe('when reconciliation cannot remove the stale counterpart', () => {
+      let mixedRoot: string
+      let gzipPath: string
+      let intentPath: string
+      let firstStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The reconciliation's own cleanup fails transiently: the intent — the only recovery
+        // signal — must be kept so the next construction can retry, instead of being discharged
+        // over a still-mixed state.
+        mixedRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-reconcile-fail-'))
+        const shardDir = path.join(mixedRoot, '9584')
+        await nodeFs.mkdir(shardDir, { recursive: true })
+        const rawPath = path.join(shardDir, id)
+        gzipPath = rawPath + '.gzip'
+        await nodeFs.writeFile(rawPath, content)
+        await nodeFs.writeFile(gzipPath, Buffer.from('stale gzip of the previous version'))
+        await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
+        intentPath = path.join(mixedRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        await nodeFs.writeFile(intentPath, Buffer.from(`raw\n${id}`))
+        const realFs = createFsComponent()
+        let failuresLeft = 1
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          unlink: (async (target: any) => {
+            if (String(target) === gzipPath && failuresLeft-- > 0) {
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        firstStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          mixedRoot
+        )
+      })
+
+      afterEach(async () => {
+        await firstStorage.stop?.()
+        rmSync(mixedRoot, { recursive: true, force: true })
+      })
+
+      it('should keep the intent when its cleanup fails', async () => {
+        expect(await fs.existPath(intentPath)).toBe(true)
+      })
+
+      it('should repair the mixed state at the following construction', async () => {
+        const repaired = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          mixedRoot
+        )
+        try {
+          expect(await fs.existPath(gzipPath)).toBe(false)
+          expect(await fs.existPath(intentPath)).toBe(false)
+          const item = await repaired.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+        } finally {
+          await repaired.stop?.()
+        }
+      })
+    })
+
+    describe('when a no-rename flat-mode adapter uses the reserved namespace as content', () => {
+      let legacyRoot: string
+      let legacyStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // Without rename there is no staging, no sweep and no reconciliation, so the reserved
+        // namespace is neither created nor enforced: a legacy no-rename deployment that stored ids
+        // under the default reserved name keeps working unchanged.
+        legacyRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-norename-flat-'))
+        await nodeFs.mkdir(path.join(legacyRoot, '.tmp-writes'), { recursive: true })
+        await nodeFs.writeFile(path.join(legacyRoot, '.tmp-writes', 'foo'), Buffer.from('legacy bytes'))
+        const fsWithoutRename: IFileSystemComponent = { ...createFsComponent(), rename: undefined }
+        legacyStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: fsWithoutRename, logs: await createLogComponent({}) },
+          legacyRoot,
+          { disablePrefixHash: true }
+        )
+      })
+
+      afterEach(async () => {
+        await legacyStorage.stop?.()
+        rmSync(legacyRoot, { recursive: true, force: true })
+      })
+
+      it('should construct despite the pre-existing content under the reserved name', async () => {
+        expect(await legacyStorage.exist('.tmp-writes/foo')).toBe(true)
+      })
+
+      it('should retrieve the pre-existing id under the reserved name', async () => {
+        const item = await legacyStorage.retrieve('.tmp-writes/foo')
+        expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('legacy bytes'))
+      })
+
+      it('should store new ids under the reserved name', async () => {
+        await legacyStorage.storeStream('.tmp-writes/bar', bufferToStream(content))
+        const item = await legacyStorage.retrieve('.tmp-writes/bar')
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+    })
+
     describe('when construction finds an intent for an id in a consistent state', () => {
       let consistentRoot: string
       let gzipPath: string
@@ -1181,7 +1348,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.writeFile(gzipPath, gzipSync(oldBytes))
         await nodeFs.mkdir(path.join(consistentRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
-          path.join(consistentRoot, '.tmp-writes', 'deadbeefdeadbeef-0000000000000000.intent'),
+          path.join(consistentRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
           Buffer.from(`raw\n${id}`)
         )
         consistentStorage = await createFolderBasedFileSystemContentStorage(

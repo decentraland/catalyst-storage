@@ -20,11 +20,14 @@ const TEMP_DIR_NAME = '.tmp-writes'
 // legitimate content there, and deleting unrecognized files would turn an upgrade into data loss.
 const STAGED_FILE_NAME = /^[0-9a-f]{16}-[0-9a-f]{32}$/
 
-// Matches the intent-journal files a representation-transition commit writes (`<16-hex
-// bootId>-<16-hex seq>.intent`). An intent records which representation (raw|gzip) is the NEW
-// primary for an id, so a crash between the commit rename and the counterpart cleanup is
-// reconciled at the next construction instead of leaving mixed versions that reads could prefer.
-const INTENT_FILE_NAME = /^[0-9a-f]{16}-[0-9a-f]{16}\.intent$/
+// Matches the intent-journal files a representation-transition commit writes (`<40-hex
+// sha1(id)>.intent`). An intent records which representation (raw|gzip) is the NEW primary for an
+// id, so a crash between the commit rename and the counterpart cleanup is reconciled at the next
+// construction instead of leaving mixed versions that reads could prefer. The path is a
+// deterministic function of the id: at most one intent can ever exist per id (commits are
+// serialized per path, and construction reconciles before any write), so reconciliation needs no
+// ordering heuristics.
+const INTENT_FILE_NAME = /^[0-9a-f]{40}\.intent$/
 
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
@@ -54,7 +57,9 @@ export type FolderStorageOptions = {
    * their temp files. The name is reserved: ids resolving into it are rejected. Configurable so a
    * flat-mode (disablePrefixHash) deployment that already holds content under the default name can
    * pick a different reserved name instead of migrating that content. Must be a single path
-   * segment. Default: '.tmp-writes'.
+   * segment. Default: '.tmp-writes'. Only meaningful when the filesystem component provides
+   * `rename` (atomic mode); without it no staging happens and the namespace is neither created nor
+   * enforced.
    */
   tempDirectoryName?: string
 }
@@ -114,30 +119,45 @@ export async function createFolderBasedFileSystemContentStorage(
 
   const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
 
-  // Created up front so storeStream can stage into it without a per-write mkdir.
-  const tempDirName = options?.tempDirectoryName ?? TEMP_DIR_NAME
-  if (tempDirName === '' || tempDirName === '.' || tempDirName === '..' || /[/\\]/.test(tempDirName)) {
-    throw new Error(`tempDirectoryName must be a single path segment, got: ${JSON.stringify(tempDirName)}`)
-  }
-  if (USE_HASH_PREFIX && /^[0-9a-f]{4}$/i.test(tempDirName)) {
-    throw new Error(
-      `tempDirectoryName must not look like a shard directory (4 hex characters) when hash prefixes are enabled, got: ${JSON.stringify(tempDirName)}`
+  // Atomic-write support requires `rename` on the filesystem component. Without it (legacy custom
+  // adapters) every write falls back to the in-place direct write and NONE of the staging machinery
+  // applies — so the reserved temp namespace is neither created nor enforced: a legacy no-rename
+  // deployment that stored ids under the default reserved name keeps working unchanged, it just
+  // gets none of the crash-atomicity or reconciliation guarantees.
+  const ATOMIC_MODE = !!components.fs.rename
+  if (!ATOMIC_MODE) {
+    logger.warn(
+      'The filesystem component does not provide rename: writes will NOT be crash-atomic, and the reserved ' +
+        'staging directory, orphan sweep and crash reconciliation are disabled (legacy direct-write mode).'
     )
   }
+
+  // Created up front so storeStream can stage into it without a per-write mkdir.
+  const tempDirName = options?.tempDirectoryName ?? TEMP_DIR_NAME
   const tempDir = path.join(root, tempDirName)
-  // A legacy flat-mode content id could live exactly AT the reserved path as a file; mkdir would
-  // then fail with a low-level filesystem error. Detect it first and give the same actionable
-  // guidance as the other reservation conflicts.
-  if (await components.fs.existPath(tempDir)) {
-    const tempDirStat = await components.fs.stat(tempDir)
-    if (!tempDirStat.isDirectory()) {
+  if (ATOMIC_MODE) {
+    if (tempDirName === '' || tempDirName === '.' || tempDirName === '..' || /[/\\]/.test(tempDirName)) {
+      throw new Error(`tempDirectoryName must be a single path segment, got: ${JSON.stringify(tempDirName)}`)
+    }
+    if (USE_HASH_PREFIX && /^[0-9a-f]{4}$/i.test(tempDirName)) {
       throw new Error(
-        `Refusing to start: the reserved temp path '${tempDirName}' under the storage root exists as a file — ` +
-          `likely a pre-existing content id. Migrate it out or configure a different tempDirectoryName.`
+        `tempDirectoryName must not look like a shard directory (4 hex characters) when hash prefixes are enabled, got: ${JSON.stringify(tempDirName)}`
       )
     }
+    // A legacy flat-mode content id could live exactly AT the reserved path as a file; mkdir would
+    // then fail with a low-level filesystem error. Detect it first and give the same actionable
+    // guidance as the other reservation conflicts.
+    if (await components.fs.existPath(tempDir)) {
+      const tempDirStat = await components.fs.stat(tempDir)
+      if (!tempDirStat.isDirectory()) {
+        throw new Error(
+          `Refusing to start: the reserved temp path '${tempDirName}' under the storage root exists as a file — ` +
+            `likely a pre-existing content id. Migrate it out or configure a different tempDirectoryName.`
+        )
+      }
+    }
+    await components.fs.mkdir(tempDir, { recursive: true })
   }
-  await components.fs.mkdir(tempDir, { recursive: true })
 
   // Staged files are prefixed with a per-boot random id so the startup sweep can tell leftovers
   // from previous runs (any other prefix) apart from files this instance is writing right now —
@@ -148,23 +168,17 @@ export async function createFolderBasedFileSystemContentStorage(
   // Journal for representation-transition commits: written before the commit rename whenever a
   // counterpart representation exists, removed once the counterpart is confirmed gone. A crash in
   // between leaves the intent behind, and the next construction resolves the mixed state in favor
-  // of the representation the intent names (see reconcileIntents). Fresh-id writes — the
-  // overwhelmingly common case in content-addressed use — have no counterpart and never pay for an
-  // intent.
-  let intentSeq = 0
+  // of the representation the intent names (see reconcileIntents). The path is a deterministic
+  // function of the id — at most one intent per id can ever exist, because commits are serialized
+  // per path and construction reconciles before any write — so reconciliation needs no ordering
+  // heuristics. Fresh-id writes — the overwhelmingly common case in content-addressed use — have no
+  // counterpart and never pay for an intent.
   async function writeIntent(op: 'raw' | 'gzip', id: string): Promise<string> {
-    const intentPath = path.join(tempDir, `${bootId}-${(intentSeq++).toString(16).padStart(16, '0')}.intent`)
+    const intentPath = path.join(tempDir, `${createHash('sha1').update(id).digest('hex')}.intent`)
     await pipe(Readable.from([Buffer.from(`${op}\n${id}`)]), components.fs.createWriteStream(intentPath))
     return intentPath
   }
 
-  // The sweep may only delete files in a temp directory this storage provably owns. With hash
-  // prefixes, ids can never resolve into the reserved dir (containment sends them under a shard),
-  // so everything inside is ours. In flat mode the dir may predate the reservation and hold
-  // legitimate content ids — even ones that coincidentally match the staged-name shape — so
-  // ownership must be established explicitly: a marker written by us, or a directory found empty
-  // (claimed by writing the marker). A pre-existing non-empty, unmarked flat-mode dir is never
-  // swept; its files are preserved and surfaced via the warning below.
   // Construction invariant: the storage never runs in a state where the reserved staging namespace
   // could hide addressable content. With hash prefixes, ids can never resolve into the reserved dir
   // (containment sends them under a shard), so everything inside is ours by construction. In flat
@@ -181,7 +195,7 @@ export async function createFolderBasedFileSystemContentStorage(
   // This also means the orphan sweep never needs a runtime ownership check.
   const OWNERSHIP_MARKER = '.owned-by-catalyst-storage'
   const OWNERSHIP_MARKER_CONTENT = 'reserved by catalyst-storage for atomic write staging\n'
-  if (!USE_HASH_PREFIX) {
+  if (ATOMIC_MODE && !USE_HASH_PREFIX) {
     const markerPath = path.join(tempDir, OWNERSHIP_MARKER)
     const refuseToStart = (reason: string): never => {
       throw new Error(
@@ -220,13 +234,6 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  // Make the degraded compatibility mode visible: without `rename` on the fs component every write
-  // falls back to the legacy non-atomic direct write (see IFileSystemComponent.rename).
-  if (!components.fs.rename) {
-    logger.warn(
-      'The filesystem component does not provide rename: writes will NOT be crash-atomic (legacy direct-write mode).'
-    )
-  }
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
   const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
@@ -287,9 +294,17 @@ export async function createFolderBasedFileSystemContentStorage(
     await rename(stagedPath, primaryPath)
     if (hadCounterpart) {
       await noFailUnlink(counterpartPath)
-      // Only discharge the intent once the counterpart is confirmed gone; a failed unlink keeps the
-      // intent so the next construction finishes the cleanup.
-      if (intentPath && !(await components.fs.existPath(counterpartPath))) {
+      if (await components.fs.existPath(counterpartPath)) {
+        // The new version is committed, but the stale counterpart could not be removed and reads in
+        // THIS process would keep preferring it. Fail the store loudly instead of resolving with a
+        // lie: the intent survives, so the next construction finishes the cleanup, and a retried
+        // store re-attempts it immediately.
+        throw new Error(
+          `Stored ${id} but failed to remove its previous ${op === 'raw' ? 'gzip' : 'raw'} representation; ` +
+            `reads may serve the previous version until a retry or restart completes the cleanup.`
+        )
+      }
+      if (intentPath) {
         await noFailUnlink(intentPath)
       }
     }
@@ -378,7 +393,7 @@ export async function createFolderBasedFileSystemContentStorage(
     // The temp-write namespace is reserved: an id resolving into it (reachable when
     // disablePrefixHash makes the root itself the containment dir, e.g. '.tmp-writes/foo') would be
     // hidden from allFileIds and could be deleted by the startup sweep.
-    if (finalPath === tempDir || finalPath.startsWith(tempDir + path.sep)) {
+    if (ATOMIC_MODE && (finalPath === tempDir || finalPath.startsWith(tempDir + path.sep))) {
       throw new Error('Cannot manipulate files inside the reserved temp-write folder')
     }
 
@@ -460,14 +475,18 @@ export async function createFolderBasedFileSystemContentStorage(
     try {
       await pipe(stream, components.fs.createWriteStream(tempPath))
       await withPathLock(filePath, async () => {
-        // The raw and its .gzip are one versioned object: a gzip left from a previous version would
-        // be preferred by retrieve() and serve stale bytes over the content just stored (intent-
-        // journaled so even a crash mid-cleanup cannot leave the stale gzip preferred).
-        await commitRepresentation('raw', id, tempPath, filePath, filePath + '.gzip', rename)
-        // The canonical path now holds primary content: drop any stale decompress-cache tracking so
-        // eviction can never delete it, and tell an in-flight decompression its output is outdated.
-        forgetCacheEntry(filePath)
-        invalidateInflightDecompression(filePath)
+        try {
+          // The raw and its .gzip are one versioned object: a gzip left from a previous version
+          // would be preferred by retrieve() and serve stale bytes over the content just stored
+          // (intent-journaled so even a crash mid-cleanup cannot leave the stale gzip preferred).
+          await commitRepresentation('raw', id, tempPath, filePath, filePath + '.gzip', rename)
+        } finally {
+          // Run the bookkeeping even when the commit throws (a failed counterpart cleanup reports
+          // failure AFTER the rename landed): drop any stale decompress-cache tracking so eviction
+          // can never delete the new content, and tell an in-flight decompression it is outdated.
+          forgetCacheEntry(filePath)
+          invalidateInflightDecompression(filePath)
+        }
       })
     } catch (err) {
       // On a write error the temp file may be partial; on a rename error it still exists. Either way
@@ -643,7 +662,7 @@ export async function createFolderBasedFileSystemContentStorage(
         // The reserved temp-write dir only exists directly under the storage root; skip it there and
         // only there, so a deeper same-named directory (reachable via a slash-containing id) is not
         // silently hidden from enumeration.
-        if (folder === root && entry.name === tempDirName) continue
+        if (ATOMIC_MODE && folder === root && entry.name === tempDirName) continue
         yield* allFileIdsRec(path.resolve(folder, entry.name), prefix)
       } else if (!prefix || entry.name.startsWith(prefix)) {
         const baseName = entry.name.replace(/\.gzip$/, '')
@@ -708,6 +727,9 @@ export async function createFolderBasedFileSystemContentStorage(
   // leftover of an earlier process — a write racing this sweep stages under the current bootId and
   // is never touched. Best-effort: a missing dir or a failed unlink is ignored.
   const sweepOrphanedTempFiles = async (): Promise<number> => {
+    // No staging happens without atomic-write support, so there is nothing of ours to sweep — and
+    // the directory (if it exists at all) is not ours to touch.
+    if (!ATOMIC_MODE) return 0
     // Ownership of the reserved dir is a construction invariant (see the OWNERSHIP_MARKER logic in
     // the factory): if this storage is running, everything staged-shaped in there is ours.
     let entries: string[]
@@ -731,17 +753,17 @@ export async function createFolderBasedFileSystemContentStorage(
   // intent whose id is in a consistent state is simply discharged. Runs at construction, before any
   // operation can observe the storage.
   async function reconcileIntents(): Promise<void> {
+    // No intents are ever written without atomic-write support.
+    if (!ATOMIC_MODE) return
     let entries: string[]
     try {
       entries = await components.fs.readdir(tempDir)
     } catch {
       return
     }
-    const intentNames = entries.filter((entry) => INTENT_FILE_NAME.test(entry)).sort()
-    if (intentNames.length === 0) return
-
-    const newestById = new Map<string, { op: string; mtimeMs: number; paths: string[] }>()
-    for (const name of intentNames) {
+    // Intent paths are a deterministic function of the id, so there is at most one per id and no
+    // ordering to resolve.
+    for (const name of entries.filter((entry) => INTENT_FILE_NAME.test(entry)).sort()) {
       const intentPath = path.join(tempDir, name)
       try {
         const body = await components.fs.readFile(intentPath, 'utf8')
@@ -753,35 +775,23 @@ export async function createFolderBasedFileSystemContentStorage(
           await noFailUnlink(intentPath)
           continue
         }
-        const { mtimeMs } = await components.fs.stat(intentPath)
-        const known = newestById.get(id)
-        if (!known) {
-          newestById.set(id, { op, mtimeMs, paths: [intentPath] })
-        } else {
-          known.paths.push(intentPath)
-          if (mtimeMs >= known.mtimeMs) {
-            known.op = op
-            known.mtimeMs = mtimeMs
-          }
-        }
-      } catch {
-        // Unreadable right now: leave it for the next construction.
-      }
-    }
-
-    for (const [id, intent] of newestById) {
-      try {
         const filePath = await getFilePath(id)
         const gzipPath = filePath + '.gzip'
         if ((await components.fs.existPath(filePath)) && (await components.fs.existPath(gzipPath))) {
-          await noFailUnlink(intent.op === 'raw' ? gzipPath : filePath)
+          const stalePath = op === 'raw' ? gzipPath : filePath
+          await noFailUnlink(stalePath)
+          if (await components.fs.existPath(stalePath)) {
+            // Mirror the commit invariant: the intent is the only recovery signal, so it must
+            // survive until the stale counterpart is confirmed gone — otherwise a transient unlink
+            // failure here would leave the mixed state unrepairable.
+            logger.warn(`Could not remove the stale counterpart while reconciling; keeping the intent`, { id })
+            continue
+          }
+          logger.info(`Reconciled an interrupted ${op} commit`, { id })
         }
-        for (const intentPath of intent.paths) {
-          await noFailUnlink(intentPath)
-        }
-        logger.info(`Reconciled an interrupted ${intent.op} commit`, { id })
+        await noFailUnlink(intentPath)
       } catch {
-        // Leave the intent in place; the next construction retries the reconciliation.
+        // Unreadable or failing right now: leave the intent for the next construction.
       }
     }
   }
@@ -857,15 +867,19 @@ export async function createFolderBasedFileSystemContentStorage(
         await pipe(stream, components.fs.createWriteStream(stagedRawPath))
         const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath)
         await withPathLock(filePath, async () => {
-          // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
-          // reconciled at next construction, never leaving mixed versions for reads to prefer.
-          if (compressed) {
-            await commitRepresentation('gzip', id, stagedGzipPath, filePath + '.gzip', filePath, rename)
-          } else {
-            await commitRepresentation('raw', id, stagedRawPath, filePath, filePath + '.gzip', rename)
+          try {
+            // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
+            // reconciled at next construction, never leaving mixed versions for reads to prefer.
+            if (compressed) {
+              await commitRepresentation('gzip', id, stagedGzipPath, filePath + '.gzip', filePath, rename)
+            } else {
+              await commitRepresentation('raw', id, stagedRawPath, filePath, filePath + '.gzip', rename)
+            }
+          } finally {
+            // Run even when the commit throws post-rename (failed counterpart cleanup).
+            forgetCacheEntry(filePath)
+            invalidateInflightDecompression(filePath)
           }
-          forgetCacheEntry(filePath)
-          invalidateInflightDecompression(filePath)
         })
       } finally {
         // Whatever was not renamed into place is staging residue (the raw after a gzip-only commit,
