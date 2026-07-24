@@ -3,6 +3,7 @@ import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
 import { PassThrough, Readable } from 'stream'
+import { gzipSync } from 'zlib'
 import {
   createFolderBasedFileSystemContentStorage,
   createFsComponent,
@@ -1072,6 +1073,173 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when construction finds an interrupted raw commit (new raw plus stale gzip)', () => {
+      let mixedRoot: string
+      let rawPath: string
+      let gzipPath: string
+      let mixedStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // A crash between storeStream's rename and its gzip cleanup leaves the new raw next to the
+        // previous version's gzip — which non-range reads would prefer. The surviving intent lets
+        // construction reconcile in favor of the committed raw.
+        mixedRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-mixed-raw-'))
+        const shardDir = path.join(mixedRoot, '9584')
+        await nodeFs.mkdir(shardDir, { recursive: true })
+        rawPath = path.join(shardDir, id)
+        gzipPath = rawPath + '.gzip'
+        await nodeFs.writeFile(rawPath, content)
+        await nodeFs.writeFile(gzipPath, Buffer.from('stale gzip of the previous version'))
+        await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
+        await nodeFs.writeFile(
+          path.join(mixedRoot, '.tmp-writes', 'deadbeefdeadbeef-0000000000000000.intent'),
+          Buffer.from(`raw\n${id}`)
+        )
+        mixedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          mixedRoot
+        )
+      })
+
+      afterEach(async () => {
+        await mixedStorage.stop?.()
+        rmSync(mixedRoot, { recursive: true, force: true })
+      })
+
+      it('should remove the stale gzip so reads cannot prefer it', async () => {
+        expect(await fs.existPath(gzipPath)).toBe(false)
+      })
+
+      it('should serve the committed raw bytes', async () => {
+        const item = await mixedStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+
+      it('should discharge the intent', async () => {
+        const entries = await nodeFs.readdir(path.join(mixedRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => entry.endsWith('.intent'))).toEqual([])
+      })
+    })
+
+    describe('when construction finds an interrupted gzip commit (new gzip plus stale raw)', () => {
+      let mixedRoot: string
+      let rawPath: string
+      let newBytes: Buffer
+      let mixedStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // A crash between storeStreamAndCompress's gzip rename and its raw cleanup leaves the new
+        // gzip next to the previous version's raw — which range reads would serve. The surviving
+        // intent lets construction reconcile in favor of the committed gzip.
+        mixedRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-mixed-gzip-'))
+        const shardDir = path.join(mixedRoot, '9584')
+        await nodeFs.mkdir(shardDir, { recursive: true })
+        rawPath = path.join(shardDir, id)
+        newBytes = Buffer.from(new Uint8Array(100).fill(9))
+        await nodeFs.writeFile(rawPath, Buffer.from('stale raw of the previous version'))
+        await nodeFs.writeFile(rawPath + '.gzip', gzipSync(newBytes))
+        await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
+        await nodeFs.writeFile(
+          path.join(mixedRoot, '.tmp-writes', 'deadbeefdeadbeef-0000000000000000.intent'),
+          Buffer.from(`gzip\n${id}`)
+        )
+        mixedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          mixedRoot
+        )
+      })
+
+      afterEach(async () => {
+        await mixedStorage.stop?.()
+        rmSync(mixedRoot, { recursive: true, force: true })
+      })
+
+      it('should remove the stale raw so range reads cannot serve it', async () => {
+        expect(await fs.existPath(rawPath)).toBe(false)
+      })
+
+      it('should serve the committed gzip bytes', async () => {
+        const item = await mixedStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(newBytes)
+      })
+    })
+
+    describe('when construction finds an intent for an id in a consistent state', () => {
+      let consistentRoot: string
+      let gzipPath: string
+      let oldBytes: Buffer
+      let consistentStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // A crash after writing the intent but before the commit rename: the previous version is
+        // whole (gzip only) and must be left exactly as it is; the intent is just discharged.
+        consistentRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-consistent-'))
+        const shardDir = path.join(consistentRoot, '9584')
+        await nodeFs.mkdir(shardDir, { recursive: true })
+        oldBytes = Buffer.from(new Uint8Array(100).fill(3))
+        gzipPath = path.join(shardDir, id) + '.gzip'
+        await nodeFs.writeFile(gzipPath, gzipSync(oldBytes))
+        await nodeFs.mkdir(path.join(consistentRoot, '.tmp-writes'), { recursive: true })
+        await nodeFs.writeFile(
+          path.join(consistentRoot, '.tmp-writes', 'deadbeefdeadbeef-0000000000000000.intent'),
+          Buffer.from(`raw\n${id}`)
+        )
+        consistentStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          consistentRoot
+        )
+      })
+
+      afterEach(async () => {
+        await consistentStorage.stop?.()
+        rmSync(consistentRoot, { recursive: true, force: true })
+      })
+
+      it('should keep the previous version untouched', async () => {
+        const item = await consistentStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(oldBytes)
+      })
+
+      it('should discharge the intent', async () => {
+        const entries = await nodeFs.readdir(path.join(consistentRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => entry.endsWith('.intent'))).toEqual([])
+      })
+    })
+
+    describe('when a flat-mode deployment holds a legacy content file exactly at the reserved path', () => {
+      let flatRoot: string
+      let constructionError: Error | undefined
+
+      beforeEach(async () => {
+        flatRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-reserved-file-'))
+        await nodeFs.writeFile(path.join(flatRoot, '.tmp-writes'), Buffer.from('legacy content id'))
+        constructionError = undefined
+        try {
+          await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, flatRoot, {
+            disablePrefixHash: true
+          })
+        } catch (error: any) {
+          constructionError = error
+        }
+      })
+
+      afterEach(async () => {
+        rmSync(flatRoot, { recursive: true, force: true })
+      })
+
+      it('should refuse to start with the migration guidance instead of a low-level mkdir error', () => {
+        expect(constructionError?.message).toContain('exists as a file')
+      })
+
+      it('should point the operator at the tempDirectoryName option', () => {
+        expect(constructionError?.message).toContain('tempDirectoryName')
+      })
+
+      it('should leave the legacy file untouched', async () => {
+        expect(await nodeFs.readFile(path.join(flatRoot, '.tmp-writes'), 'utf8')).toBe('legacy content id')
+      })
+    })
+
     describe('when a flat-mode deployment holds a legacy content id at the marker path', () => {
       let flatRoot: string
       let markerSpoofPath: string
@@ -1660,6 +1828,61 @@ describe('fileSystemContentStorage', () => {
 
         it('should not leave the compressed store gzip shadowing the later raw', async () => {
           expect(await fs.existPath(filePath2 + '.gzip')).toBe(false)
+        })
+      })
+
+      describe('and an in-place range decompression is followed by a queued store for the same id', () => {
+        let gatedStorage: IContentStorageComponent
+
+        beforeEach(async () => {
+          // The in-place decompression runs entirely under the path lock, so the later store is
+          // strictly ordered after it: the stale decompression can neither keep writing over the
+          // newer raw nor leave its cache registration shadowing it.
+          const realFs = createFsComponent()
+          const gzipPath = filePath2 + '.gzip'
+          let releaseGzipRead: () => void = () => undefined
+          const gzipReadGate = new Promise<void>((res) => (releaseGzipRead = res))
+          let gzipReadStarted: () => void = () => undefined
+          const gzipReadStartedPromise = new Promise<void>((res) => (gzipReadStarted = res))
+          let holdNextGzipRead = true
+          const gatedFs: IFileSystemComponent = {
+            ...realFs,
+            rename: undefined,
+            createReadStream: ((target: any, opts?: any) => {
+              const real = realFs.createReadStream(target, opts)
+              if (String(target) !== gzipPath || !holdNextGzipRead) return real
+              holdNextGzipRead = false
+              const gated = new PassThrough()
+              gzipReadStarted()
+              void gzipReadGate.then(() => real.pipe(gated))
+              return gated
+            }) as typeof realFs.createReadStream
+          }
+          gatedStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: gatedFs, logs: await createLogComponent({}) },
+            tmpRootDir
+          )
+          // Compressible content stored via the in-place fallback ends up gzip-only.
+          await gatedStorage.storeStreamAndCompress(id2, bufferToStream(Buffer.from(new Uint8Array(100).fill(7))))
+          // The range request takes the path lock and blocks on the gated gzip read.
+          const rangePromise = gatedStorage.retrieve(id2, { start: 0, end: 9 })
+          await gzipReadStartedPromise
+          const storePromise = gatedStorage.storeStream(id2, bufferToStream(content2))
+          releaseGzipRead()
+          // In no-rename mode reads are not guaranteed a complete version while an in-place write
+          // is in flight (documented degradation), so the racy range outcome is not asserted —
+          // only the final state below matters.
+          await rangePromise.catch(() => undefined)
+          await storePromise
+        })
+
+        afterEach(async () => {
+          await gatedStorage.stop?.()
+        })
+
+        it('should keep the later store content as the final version', async () => {
+          const item = await gatedStorage.retrieve(id2)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(content2)
         })
       })
     })

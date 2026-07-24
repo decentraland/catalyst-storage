@@ -20,6 +20,12 @@ const TEMP_DIR_NAME = '.tmp-writes'
 // legitimate content there, and deleting unrecognized files would turn an upgrade into data loss.
 const STAGED_FILE_NAME = /^[0-9a-f]{16}-[0-9a-f]{32}$/
 
+// Matches the intent-journal files a representation-transition commit writes (`<16-hex
+// bootId>-<16-hex seq>.intent`). An intent records which representation (raw|gzip) is the NEW
+// primary for an id, so a crash between the commit rename and the counterpart cleanup is
+// reconciled at the next construction instead of leaving mixed versions that reads could prefer.
+const INTENT_FILE_NAME = /^[0-9a-f]{16}-[0-9a-f]{16}\.intent$/
+
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
 const FIVE_GB_IN_BYTES = 5 * 1024 * 1024 * 1024
@@ -119,6 +125,18 @@ export async function createFolderBasedFileSystemContentStorage(
     )
   }
   const tempDir = path.join(root, tempDirName)
+  // A legacy flat-mode content id could live exactly AT the reserved path as a file; mkdir would
+  // then fail with a low-level filesystem error. Detect it first and give the same actionable
+  // guidance as the other reservation conflicts.
+  if (await components.fs.existPath(tempDir)) {
+    const tempDirStat = await components.fs.stat(tempDir)
+    if (!tempDirStat.isDirectory()) {
+      throw new Error(
+        `Refusing to start: the reserved temp path '${tempDirName}' under the storage root exists as a file — ` +
+          `likely a pre-existing content id. Migrate it out or configure a different tempDirectoryName.`
+      )
+    }
+  }
   await components.fs.mkdir(tempDir, { recursive: true })
 
   // Staged files are prefixed with a per-boot random id so the startup sweep can tell leftovers
@@ -126,6 +144,19 @@ export async function createFolderBasedFileSystemContentStorage(
   // a write racing the sweep can therefore never have its live staged file unlinked.
   const bootId = randomBytes(8).toString('hex')
   const newTempPath = (): string => path.join(tempDir, `${bootId}-${randomBytes(16).toString('hex')}`)
+
+  // Journal for representation-transition commits: written before the commit rename whenever a
+  // counterpart representation exists, removed once the counterpart is confirmed gone. A crash in
+  // between leaves the intent behind, and the next construction resolves the mixed state in favor
+  // of the representation the intent names (see reconcileIntents). Fresh-id writes — the
+  // overwhelmingly common case in content-addressed use — have no counterpart and never pay for an
+  // intent.
+  let intentSeq = 0
+  async function writeIntent(op: 'raw' | 'gzip', id: string): Promise<string> {
+    const intentPath = path.join(tempDir, `${bootId}-${(intentSeq++).toString(16).padStart(16, '0')}.intent`)
+    await pipe(Readable.from([Buffer.from(`${op}\n${id}`)]), components.fs.createWriteStream(intentPath))
+    return intentPath
+  }
 
   // The sweep may only delete files in a temp directory this storage provably owns. With hash
   // prefixes, ids can never resolve into the reserved dir (containment sends them under a shard),
@@ -169,7 +200,7 @@ export async function createFolderBasedFileSystemContentStorage(
         )
       }
       const foreign = (await components.fs.readdir(tempDir)).filter(
-        (entry) => entry !== OWNERSHIP_MARKER && !STAGED_FILE_NAME.test(entry)
+        (entry) => entry !== OWNERSHIP_MARKER && !STAGED_FILE_NAME.test(entry) && !INTENT_FILE_NAME.test(entry)
       )
       if (foreign.length > 0) {
         refuseToStart(
@@ -235,6 +266,33 @@ export async function createFolderBasedFileSystemContentStorage(
   function invalidateInflightDecompression(filePath: string): void {
     const token = inflightDecompressionTokens.get(filePath)
     if (token) token.invalidated = true
+  }
+
+  // Commits a staged file onto its canonical primary path and removes the other representation.
+  // The logical object spans two paths (raw and .gzip) but only the rename is atomic, so when a
+  // counterpart exists an intent is journaled FIRST: if the process dies (or the unlink fails)
+  // between the rename and the cleanup, the next construction reconciles the mixed state in favor
+  // of the representation committed here, instead of reads preferring the stale counterpart. Must
+  // be called while holding the path lock.
+  async function commitRepresentation(
+    op: 'raw' | 'gzip',
+    id: string,
+    stagedPath: string,
+    primaryPath: string,
+    counterpartPath: string,
+    rename: (from: string, to: string) => Promise<void>
+  ): Promise<void> {
+    const hadCounterpart = await components.fs.existPath(counterpartPath)
+    const intentPath = hadCounterpart ? await writeIntent(op, id) : undefined
+    await rename(stagedPath, primaryPath)
+    if (hadCounterpart) {
+      await noFailUnlink(counterpartPath)
+      // Only discharge the intent once the counterpart is confirmed gone; a failed unlink keeps the
+      // intent so the next construction finishes the cleanup.
+      if (intentPath && !(await components.fs.existPath(counterpartPath))) {
+        await noFailUnlink(intentPath)
+      }
+    }
   }
 
   // Drops the cache-tracking entry WITHOUT unlinking the file. Used when the canonical path stops
@@ -402,10 +460,10 @@ export async function createFolderBasedFileSystemContentStorage(
     try {
       await pipe(stream, components.fs.createWriteStream(tempPath))
       await withPathLock(filePath, async () => {
-        await rename(tempPath, filePath)
         // The raw and its .gzip are one versioned object: a gzip left from a previous version would
-        // be preferred by retrieve() and serve stale bytes over the content just stored.
-        await noFailUnlink(filePath + '.gzip')
+        // be preferred by retrieve() and serve stale bytes over the content just stored (intent-
+        // journaled so even a crash mid-cleanup cannot leave the stale gzip preferred).
+        await commitRepresentation('raw', id, tempPath, filePath, filePath + '.gzip', rename)
         // The canonical path now holds primary content: drop any stale decompress-cache tracking so
         // eviction can never delete it, and tell an in-flight decompression its output is outdated.
         forgetCacheEntry(filePath)
@@ -487,22 +545,21 @@ export async function createFolderBasedFileSystemContentStorage(
               if (!gzipItem) {
                 return
               }
-              // Stage the inflation in the temp dir when rename is available, so a process killed
-              // mid-decompress can never leave a partial file at the canonical uncompressed path —
-              // a later range request would silently serve its truncated bytes as valid content.
-              // Without rename (legacy custom fs adapter) fall back to writing in place.
               const { rename } = components.fs
-              const writePath = rename ? newTempPath() : uncompressedPath
-              try {
-                // Cap how much the gzip may inflate to so a decompression bomb cannot write an
-                // unbounded file to disk. The gzip trailer's declared size is attacker-controllable,
-                // so the limit is enforced on the actual inflated bytes, not a declared value.
-                await pipe(
-                  await gzipItem.asStream(),
-                  createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
-                  components.fs.createWriteStream(writePath)
-                )
-                if (rename) {
+              if (rename) {
+                // Stage the inflation in the temp dir so a process killed mid-decompress can never
+                // leave a partial file at the canonical uncompressed path — a later range request
+                // would silently serve its truncated bytes as valid content.
+                const writePath = newTempPath()
+                try {
+                  // Cap how much the gzip may inflate to so a decompression bomb cannot write an
+                  // unbounded file to disk. The gzip trailer's declared size is attacker-
+                  // controllable, so the limit is enforced on the actual inflated bytes.
+                  await pipe(
+                    await gzipItem.asStream(),
+                    createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
+                    components.fs.createWriteStream(writePath)
+                  )
                   // Commit under the path lock so this rename can never interleave with a store or
                   // delete on the same canonical path; discard when the source gzip was replaced or
                   // the id deleted while inflating.
@@ -517,18 +574,35 @@ export async function createFolderBasedFileSystemContentStorage(
                   if (!committed) {
                     await noFailUnlink(writePath)
                   }
-                  return
+                } catch (err) {
+                  // Remove the partial staged file; the canonical path was never touched.
+                  await noFailUnlink(writePath)
+                  throw err
                 }
-              } catch (err) {
-                // Remove partial file to prevent serving corrupt data (or a partially-written bomb)
-                await noFailUnlink(writePath)
-                throw err
+                return
               }
 
-              // In-place (no rename) legacy path: register the cache entry as before.
-              const stat = await components.fs.stat(uncompressedPath)
-              decompressCache.set(uncompressedPath, { size: stat.size, lastAccess: Date.now() })
-              totalCacheSize += stat.size
+              // In-place (no rename) legacy path: there is no staging, so the ENTIRE inflate/
+              // register sequence runs under the path lock and honors the invalidation token — a
+              // concurrent store/delete completing first must not be overwritten by a stale
+              // decompression, and the cleanup of a failed inflation must not race a newer writer.
+              await withPathLock(uncompressedPath, async () => {
+                if (token.invalidated) return
+                try {
+                  await pipe(
+                    await gzipItem.asStream(),
+                    createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
+                    components.fs.createWriteStream(uncompressedPath)
+                  )
+                } catch (err) {
+                  // Under the lock the partial file is provably ours to remove.
+                  await noFailUnlink(uncompressedPath)
+                  throw err
+                }
+                const stat = await components.fs.stat(uncompressedPath)
+                decompressCache.set(uncompressedPath, { size: stat.size, lastAccess: Date.now() })
+                totalCacheSize += stat.size
+              })
             } finally {
               if (inflightDecompressionTokens.get(uncompressedPath) === token) {
                 inflightDecompressionTokens.delete(uncompressedPath)
@@ -650,6 +724,70 @@ export async function createFolderBasedFileSystemContentStorage(
     return removed
   }
 
+  // Resolves mixed raw/gzip states left by a crash between a commit rename and its counterpart
+  // cleanup. Each surviving intent names the representation that was being committed for an id;
+  // when both representations exist, the counterpart is removed so reads can never prefer the stale
+  // one. Only the NEWEST intent per id is applied (a crash can leave several from re-attempts). An
+  // intent whose id is in a consistent state is simply discharged. Runs at construction, before any
+  // operation can observe the storage.
+  async function reconcileIntents(): Promise<void> {
+    let entries: string[]
+    try {
+      entries = await components.fs.readdir(tempDir)
+    } catch {
+      return
+    }
+    const intentNames = entries.filter((entry) => INTENT_FILE_NAME.test(entry)).sort()
+    if (intentNames.length === 0) return
+
+    const newestById = new Map<string, { op: string; mtimeMs: number; paths: string[] }>()
+    for (const name of intentNames) {
+      const intentPath = path.join(tempDir, name)
+      try {
+        const body = await components.fs.readFile(intentPath, 'utf8')
+        const separator = body.indexOf('\n')
+        const op = separator === -1 ? '' : body.slice(0, separator)
+        const id = separator === -1 ? '' : body.slice(separator + 1)
+        if ((op !== 'raw' && op !== 'gzip') || id === '') {
+          // A partial intent means its commit never started (intents are written first): discard.
+          await noFailUnlink(intentPath)
+          continue
+        }
+        const { mtimeMs } = await components.fs.stat(intentPath)
+        const known = newestById.get(id)
+        if (!known) {
+          newestById.set(id, { op, mtimeMs, paths: [intentPath] })
+        } else {
+          known.paths.push(intentPath)
+          if (mtimeMs >= known.mtimeMs) {
+            known.op = op
+            known.mtimeMs = mtimeMs
+          }
+        }
+      } catch {
+        // Unreadable right now: leave it for the next construction.
+      }
+    }
+
+    for (const [id, intent] of newestById) {
+      try {
+        const filePath = await getFilePath(id)
+        const gzipPath = filePath + '.gzip'
+        if ((await components.fs.existPath(filePath)) && (await components.fs.existPath(gzipPath))) {
+          await noFailUnlink(intent.op === 'raw' ? gzipPath : filePath)
+        }
+        for (const intentPath of intent.paths) {
+          await noFailUnlink(intentPath)
+        }
+        logger.info(`Reconciled an interrupted ${intent.op} commit`, { id })
+      } catch {
+        // Leave the intent in place; the next construction retries the reconciliation.
+      }
+    }
+  }
+
+  await reconcileIntents()
+
   return {
     async start(_startOptions: any) {
       // Idempotent: clear any existing timer first so a repeated start() doesn't leak intervals.
@@ -719,12 +857,12 @@ export async function createFolderBasedFileSystemContentStorage(
         await pipe(stream, components.fs.createWriteStream(stagedRawPath))
         const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath)
         await withPathLock(filePath, async () => {
+          // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
+          // reconciled at next construction, never leaving mixed versions for reads to prefer.
           if (compressed) {
-            await rename(stagedGzipPath, filePath + '.gzip')
-            await noFailUnlink(filePath)
+            await commitRepresentation('gzip', id, stagedGzipPath, filePath + '.gzip', filePath, rename)
           } else {
-            await rename(stagedRawPath, filePath)
-            await noFailUnlink(filePath + '.gzip')
+            await commitRepresentation('raw', id, stagedRawPath, filePath, filePath + '.gzip', rename)
           }
           forgetCacheEntry(filePath)
           invalidateInflightDecompression(filePath)
