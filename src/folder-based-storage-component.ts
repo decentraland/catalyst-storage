@@ -582,7 +582,17 @@ export async function createFolderBasedFileSystemContentStorage(
           await pipe(stream, components.fs.createWriteStream(filePath))
           // The raw and its .gzip are one versioned object: a gzip left from a previous version
           // would be preferred by retrieve() and serve stale bytes over the content just stored.
+          // The same successful-write invariant as the atomic path applies: never resolve while the
+          // preferred counterpart survives. There is no journal in this mode, so the throw below
+          // rolls back through the catch — the previous gzip version stays cleanly intact (the raw
+          // overwritten by the pipe can only have been that gzip's own re-derivable cache).
           await noFailUnlink(filePath + '.gzip')
+          if (await existsForInvariant(filePath + '.gzip')) {
+            throw new Error(
+              `Failed to remove the previous gzip representation of ${id}; the in-place store was rolled back ` +
+                `and reads keep serving the previous version.`
+            )
+          }
           forgetCacheEntry(filePath)
           invalidateInflightDecompression(filePath)
         } catch (err) {
@@ -961,7 +971,14 @@ export async function createFolderBasedFileSystemContentStorage(
         await withPathLock(filePath, async () => {
           try {
             await pipe(stream, components.fs.createWriteStream(filePath))
+            // Same successful-write invariant and rollback semantics as the storeStream fallback.
             await noFailUnlink(filePath + '.gzip')
+            if (await existsForInvariant(filePath + '.gzip')) {
+              throw new Error(
+                `Failed to remove the previous gzip representation of ${id}; the in-place store was rolled back ` +
+                  `and reads keep serving the previous version.`
+              )
+            }
             forgetCacheEntry(filePath)
             invalidateInflightDecompression(filePath)
           } catch (err) {

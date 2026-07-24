@@ -2464,6 +2464,65 @@ describe('fileSystemContentStorage', () => {
         })
       })
 
+      describe('and the gzip cleanup of an in-place store fails', () => {
+        let legacyRoot: string
+        let originalBytes: Buffer
+        let storeOutcome: 'resolved' | Error
+        let legacyStorage: IContentStorageComponent
+
+        beforeEach(async () => {
+          // The in-place store must never resolve while the preferred gzip counterpart survives.
+          // With no journal in this mode, the failed store rolls back and the previous version
+          // stays cleanly intact.
+          legacyRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-legacy-gzip-fail-'))
+          const gzipPath = path.join(legacyRoot, '9584', id) + '.gzip'
+          const realFs = createFsComponent()
+          let armed = false
+          const failingFs: IFileSystemComponent = {
+            ...realFs,
+            rename: undefined,
+            unlink: (async (target: any) => {
+              if (armed && String(target) === gzipPath) {
+                armed = false
+                throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+              }
+              return realFs.unlink(target)
+            }) as typeof realFs.unlink
+          }
+          legacyStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: failingFs, logs: await createLogComponent({}) },
+            legacyRoot
+          )
+          originalBytes = Buffer.from(new Uint8Array(100).fill(0))
+          await legacyStorage.storeStreamAndCompress(id, bufferToStream(originalBytes))
+          armed = true
+          storeOutcome = await legacyStorage.storeStream(id, bufferToStream(content)).then(
+            () => 'resolved' as const,
+            (error: Error) => error
+          )
+        })
+
+        afterEach(async () => {
+          await legacyStorage.stop?.()
+          rmSync(legacyRoot, { recursive: true, force: true })
+        })
+
+        it('should reject instead of resolving while the old gzip is preferred', () => {
+          expect((storeOutcome as Error).message).toContain('rolled back')
+        })
+
+        it('should keep serving the previous version', async () => {
+          const item = await legacyStorage.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(originalBytes)
+        })
+
+        it('should succeed on a retry once the cleanup can complete', async () => {
+          await legacyStorage.storeStream(id, bufferToStream(content))
+          const item = await legacyStorage.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+        })
+      })
+
       describe('and an in-place range decompression is followed by a queued store for the same id', () => {
         let gatedStorage: IContentStorageComponent
 
