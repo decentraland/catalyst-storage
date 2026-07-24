@@ -533,6 +533,9 @@ export async function createFolderBasedFileSystemContentStorage(
     await withPathLock(filePath, async () => {
       if (decompressCache.get(filePath) !== entry) return
       await noFailUnlink(filePath)
+      // Keep the tracking when the file survives the unlink, so the next eviction tick retries it
+      // instead of leaving an untracked (unaccounted, never-retried) cache file on disk.
+      if (await existsForInvariant(filePath)) return
       totalCacheSize -= entry.size
       decompressCache.delete(filePath)
     })
@@ -708,13 +711,17 @@ export async function createFolderBasedFileSystemContentStorage(
 
   async function removeCacheEntry(filePath: string): Promise<boolean> {
     const entry = decompressCache.get(filePath)
-    if (entry) {
-      await noFailUnlink(filePath)
-      totalCacheSize -= entry.size
-      decompressCache.delete(filePath)
-      return true
+    if (!entry) return false
+    await noFailUnlink(filePath)
+    // Verify before dropping the tracking: reporting the cached raw as handled while it survives
+    // would let delete() remove the gzip and resolve — resurrecting the untracked cache file as
+    // readable primary content after a "successful" delete.
+    if (await existsForInvariant(filePath)) {
+      throw new Error(`Failed to remove the cached decompressed content at ${filePath}`)
     }
-    return false
+    totalCacheSize -= entry.size
+    decompressCache.delete(filePath)
+    return true
   }
 
   function touchCacheEntry(filePath: string) {
@@ -1131,11 +1138,21 @@ export async function createFolderBasedFileSystemContentStorage(
           if (ATOMIC_MODE && (await existsForInvariant(pendingIntentPath))) {
             await applyPendingIntent(pendingIntentPath)
           }
+          // Every removal below is verified: a delete that resolves while ANY representation
+          // survives (cached raw, primary raw, or gzip) would leave the id readable after a
+          // "successful" delete. Failures abort before touching the next representation, so a
+          // failed delete always leaves a complete, readable version behind and rejects loudly.
           const wasCached = await removeCacheEntry(filePath)
           if (!wasCached) {
             await noFailUnlink(filePath)
+            if (await existsForInvariant(filePath)) {
+              throw new Error(`Failed to delete ${id}: its raw representation could not be removed`)
+            }
           }
           await noFailUnlink(filePath + '.gzip')
+          if (await existsForInvariant(filePath + '.gzip')) {
+            throw new Error(`Failed to delete ${id}: its gzip representation could not be removed`)
+          }
           if (ATOMIC_MODE) {
             // Defensive: applyPendingIntent already discharged any journal; verify none remains.
             await removeIntentOrThrow(pendingIntentPath, `Deleted ${id} but could not remove its intent journal`)

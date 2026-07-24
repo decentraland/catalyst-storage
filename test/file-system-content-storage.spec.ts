@@ -195,6 +195,23 @@ describe('fileSystemContentStorage', () => {
     await expect(fileSystemContentStorage.retrieve(id, { start: -1, end: 2 })).rejects.toThrow(RangeError)
   })
 
+  it(`When a range with a NaN bound is requested, then it throws a RangeError`, async () => {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+    await expect(fileSystemContentStorage.retrieve(id, { start: Number.NaN, end: 2 })).rejects.toThrow(RangeError)
+  })
+
+  it(`When a range with a non-integer bound is requested, then it throws a RangeError`, async () => {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+    await expect(fileSystemContentStorage.retrieve(id, { start: 0, end: 1.5 })).rejects.toThrow(RangeError)
+  })
+
+  it(`When a range with an Infinity bound is requested, then it throws a RangeError`, async () => {
+    await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+    await expect(fileSystemContentStorage.retrieve(id, { start: 0, end: Number.POSITIVE_INFINITY })).rejects.toThrow(
+      RangeError
+    )
+  })
+
   it(`When a range with start past end of file is requested, then it throws a RangeError`, async () => {
     await fileSystemContentStorage.storeStream(id, bufferToStream(content))
     await expect(fileSystemContentStorage.retrieve(id, { start: 10, end: 20 })).rejects.toThrow(RangeError)
@@ -1902,6 +1919,64 @@ describe('fileSystemContentStorage', () => {
         } finally {
           await repaired.stop?.()
         }
+      })
+    })
+
+    describe('when deleting an id whose cached raw cannot be removed', () => {
+      let cacheDeleteRoot: string
+      let gzipPath: string
+      let deleteOutcome: 'resolved' | Error
+      let failingStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The cached decompressed raw survives its unlink during delete(): the delete must reject
+        // BEFORE removing the gzip — resolving would leave the untracked cache file readable as
+        // primary content after a "successful" delete.
+        cacheDeleteRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-cache-delete-'))
+        const cachedFilePath = path.join(cacheDeleteRoot, '9584', id)
+        gzipPath = cachedFilePath + '.gzip'
+        const realFs = createFsComponent()
+        let armed = false
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          unlink: (async (target: any) => {
+            if (armed && String(target) === cachedFilePath) {
+              armed = false
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          cacheDeleteRoot
+        )
+        await failingStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(0))))
+        // Materialize the decompressed raw cache alongside the gzip.
+        await failingStorage.retrieve(id, { start: 0, end: 9 })
+        armed = true
+        deleteOutcome = await failingStorage.delete([id]).then(
+          () => 'resolved' as const,
+          (error: Error) => error
+        )
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(cacheDeleteRoot, { recursive: true, force: true })
+      })
+
+      it('should reject the delete instead of resurrecting the cache as primary', () => {
+        expect((deleteOutcome as Error).message).toContain('cached decompressed content')
+      })
+
+      it('should keep the gzip representation untouched', async () => {
+        expect(await fs.existPath(gzipPath)).toBe(true)
+      })
+
+      it('should delete fully on a retry once the cleanup can complete', async () => {
+        await failingStorage.delete([id])
+        expect(await failingStorage.exist(id)).toBe(false)
       })
     })
 
