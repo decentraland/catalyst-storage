@@ -1,7 +1,9 @@
 import { Readable } from 'stream'
 
 function abortReasonOf(signal: AbortSignal): unknown {
-  return signal.reason ?? new Error('The store operation was aborted.')
+  // `??` would also replace an explicit `null` abort reason; the caller must observe their own
+  // cancellation cause, so only default when no reason was provided at all.
+  return signal.reason === undefined ? new Error('The store operation was aborted.') : signal.reason
 }
 
 /**
@@ -28,12 +30,27 @@ export async function runStoreWithSignal<T>(
     return operation()
   }
   if (signal.aborted) {
-    stream.destroy()
+    try {
+      stream.destroy()
+    } catch {
+      // teardown is best-effort; the abort reason below must win
+    }
     throw abortReasonOf(signal)
   }
   const abort = (): void => {
-    stream.destroy()
-    onAbort?.()
+    // Exception-safe: this runs inside the signal's event dispatch, where a throw would escape as
+    // an uncaught exception — and a failing stream teardown must not prevent the backend hook from
+    // running (nor vice versa). The operation's rejection path owns error reporting.
+    try {
+      stream.destroy()
+    } catch {
+      // best-effort
+    }
+    try {
+      onAbort?.()
+    } catch {
+      // best-effort
+    }
   }
   signal.addEventListener('abort', abort, { once: true })
   try {

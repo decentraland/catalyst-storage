@@ -564,9 +564,18 @@ export async function createFolderBasedFileSystemContentStorage(
   // while the preferred gzip counterpart survives. There is no journal in this mode, so a surviving
   // gzip rolls the in-place store back through the catch — the previous gzip version stays cleanly
   // intact (the raw overwritten by the pipe can only have been that gzip's own re-derivable cache).
-  async function writeRawInPlaceLocked(id: string, filePath: string, stream: Readable): Promise<void> {
+  async function writeRawInPlaceLocked(
+    id: string,
+    filePath: string,
+    stream: Readable,
+    signal?: AbortSignal
+  ): Promise<void> {
     try {
       await pipe(stream, components.fs.createWriteStream(filePath))
+      // An abort observed once the source is consumed must still cancel the store: without this
+      // checkpoint the in-place write would be committed for a cancelled request. Throwing here
+      // rolls back through the catch below, so nothing is stored.
+      signal?.throwIfAborted()
       await noFailUnlink(filePath + '.gzip')
       if (await existsForInvariant(filePath + '.gzip')) {
         throw new Error(
@@ -722,14 +731,14 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  const doStoreStream = async (id: string, stream: Readable): Promise<void> => {
+  const doStoreStream = async (id: string, stream: Readable, signal?: AbortSignal): Promise<void> => {
     const filePath = await getFilePath(id)
     const { rename } = components.fs
     // A custom fs adapter that predates the optional `rename` falls back to the original direct
     // write. It isn't crash-atomic, but keeps the public IFileSystemComponent backward-compatible;
     // the bundled createFsComponent provides rename and so takes the atomic path below.
     if (!rename) {
-      await withPathLock(filePath, () => writeRawInPlaceLocked(id, filePath, stream))
+      await withPathLock(filePath, () => writeRawInPlaceLocked(id, filePath, stream, signal))
       return
     }
     // Stage the write in the reserved temp dir under a random name, then atomically rename it into
@@ -743,6 +752,9 @@ export async function createFolderBasedFileSystemContentStorage(
     const tempPath = newTempPath()
     try {
       await pipe(stream, components.fs.createWriteStream(tempPath))
+      // An abort observed once the source is consumed must still cancel the store before the
+      // commit; the catch below removes the staged file and the canonical path stays untouched.
+      signal?.throwIfAborted()
       await withPathLock(filePath, async () => {
         try {
           // The raw and its .gzip are one versioned object: a gzip left from a previous version
@@ -1071,7 +1083,7 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  const doStoreStreamAndCompress = async (id: string, stream: Readable): Promise<void> => {
+  const doStoreStreamAndCompress = async (id: string, stream: Readable, signal?: AbortSignal): Promise<void> => {
     const filePath = await getFilePath(id)
     const { rename } = components.fs
     // Without rename (legacy custom fs adapter) everything is necessarily in place, so the whole
@@ -1080,8 +1092,11 @@ export async function createFolderBasedFileSystemContentStorage(
     // newer writer's file). Not crash-atomic, like the rest of the no-rename mode.
     if (!rename) {
       await withPathLock(filePath, async () => {
-        await writeRawInPlaceLocked(id, filePath, stream)
-        if (await compressContentFile(filePath, logger)) {
+        await writeRawInPlaceLocked(id, filePath, stream, signal)
+        // An abort observed here arrives after the in-place raw was committed (the previous version
+        // is already gone): the store is complete and allowed to succeed, but the optional
+        // compression is skipped rather than doing further expensive work for a cancelled request.
+        if (!signal?.aborted && (await compressContentFile(filePath, logger))) {
           // The in-place compression succeeded: the gzip exists at its canonical path and, under
           // the lock, the raw is provably still the bytes that were compressed.
           await noFailUnlink(filePath)
@@ -1101,7 +1116,13 @@ export async function createFolderBasedFileSystemContentStorage(
     let preservedStagedPath: string | undefined
     try {
       await pipe(stream, components.fs.createWriteStream(stagedRawPath))
+      // An abort observed once the source is consumed must still cancel the store: without these
+      // checkpoints a cancelled request would keep paying for the compression and even commit the
+      // object. Nothing has touched the canonical paths yet — the finally below removes the staged
+      // residue and the previous version stays fully intact.
+      signal?.throwIfAborted()
       const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath)
+      signal?.throwIfAborted()
       await withPathLock(filePath, async () => {
         try {
           // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
@@ -1174,11 +1195,11 @@ export async function createFolderBasedFileSystemContentStorage(
       }
     },
     storeStream: (id: string, stream: Readable, signal?: AbortSignal): Promise<void> =>
-      runStoreWithSignal(stream, signal, () => doStoreStream(id, stream)),
+      runStoreWithSignal(stream, signal, () => doStoreStream(id, stream, signal)),
     retrieve,
     exist,
     storeStreamAndCompress: (id: string, stream: Readable, signal?: AbortSignal): Promise<void> =>
-      runStoreWithSignal(stream, signal, () => doStoreStreamAndCompress(id, stream)),
+      runStoreWithSignal(stream, signal, () => doStoreStreamAndCompress(id, stream, signal)),
     async delete(ids: string[]): Promise<void> {
       for (const id of ids) {
         const filePath = await getFilePath(id)

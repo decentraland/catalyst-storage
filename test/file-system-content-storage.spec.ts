@@ -1076,6 +1076,50 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the signal aborts after the source was fully consumed', () => {
+      let compressSpy: jest.SpyInstance
+      let reason: Error
+      let storeOutcome: 'resolved' | unknown
+
+      beforeEach(async () => {
+        // The source has been consumed, so destroying it does nothing — the abort is observed
+        // during the compression phase. The store must stop at the next checkpoint and reject with
+        // the caller's reason instead of continuing the expensive work and committing the object.
+        reason = new Error('cancelled after the source ended')
+        const controller = new AbortController()
+        compressSpy = jest.spyOn(compressionModule, 'compressContentFile').mockImplementationOnce(async () => {
+          controller.abort(reason)
+          return true
+        })
+        storeOutcome = await fileSystemContentStorage
+          .storeStreamAndCompress(
+            'signal-consumed',
+            bufferToStream(Buffer.from(new Uint8Array(100).fill(0))),
+            controller.signal
+          )
+          .then(
+            () => 'resolved' as const,
+            (error: unknown) => error
+          )
+      })
+
+      afterEach(() => {
+        compressSpy.mockRestore()
+      })
+
+      it('should reject with the abort reason', () => {
+        expect(storeOutcome).toBe(reason)
+      })
+
+      it('should not commit the object', async () => {
+        expect(await fileSystemContentStorage.exist('signal-consumed')).toBe(false)
+      })
+
+      it('should leave no staging residue', async () => {
+        expect(await nodeFs.readdir(path.join(tmpRootDir, '.tmp-writes'))).toEqual([])
+      })
+    })
+
     describe('when the compression of a staged store fails', () => {
       let compressSpy: jest.SpyInstance
       let storeOutcome: 'resolved' | Error
