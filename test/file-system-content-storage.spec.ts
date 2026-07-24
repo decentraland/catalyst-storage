@@ -2015,6 +2015,57 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the reserved temp path is a symbolic link', () => {
+      let symlinkRoot: string
+      let outsideDir: string
+      let constructionError: Error | undefined
+
+      beforeEach(async () => {
+        // stat() follows symlinks, so without an lstat check a symlinked reserved path would pass
+        // the directory check and route staged writes and the sweep outside the storage root.
+        symlinkRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-symlink-root-'))
+        outsideDir = mkdtempSync(path.join(os.tmpdir(), 'cs-symlink-target-'))
+        await nodeFs.symlink(outsideDir, path.join(symlinkRoot, '.tmp-writes'))
+        constructionError = undefined
+        try {
+          await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, symlinkRoot)
+        } catch (error: any) {
+          constructionError = error
+        }
+      })
+
+      afterEach(async () => {
+        rmSync(symlinkRoot, { recursive: true, force: true })
+        rmSync(outsideDir, { recursive: true, force: true })
+      })
+
+      it('should refuse to start', () => {
+        expect(constructionError?.message).toContain('is a symbolic link')
+      })
+
+      it('should not write anything through the symlink', async () => {
+        expect(await nodeFs.readdir(outsideDir)).toEqual([])
+      })
+    })
+
+    describe('when an invalid configuration is rejected', () => {
+      it('should fail before any filesystem mutation', async () => {
+        const parent = mkdtempSync(path.join(os.tmpdir(), 'cs-no-side-effects-'))
+        const root = path.join(parent, 'never-created-root')
+        try {
+          await expect(
+            createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, root, {
+              disablePrefixHash: false,
+              decompressCacheTTL: 0
+            })
+          ).rejects.toThrow(/positive safe integer/)
+          expect(await fs.existPath(root)).toBe(false)
+        } finally {
+          rmSync(parent, { recursive: true, force: true })
+        }
+      })
+    })
+
     describe('when a numeric cache option is not a positive safe integer', () => {
       it('should reject a NaN decompressMaxFileSize', async () => {
         const badRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-bad-cap-'))

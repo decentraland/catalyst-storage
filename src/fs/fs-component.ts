@@ -23,6 +23,7 @@ export function createFsComponent(): IFileSystemComponent {
     stat: fsPromises.stat,
     unlink: fsPromises.unlink,
     rename: fsPromises.rename,
+    lstat: fsPromises.lstat,
     mkdir: fsPromises.mkdir,
     readdir: fsPromises.readdir,
     readFile: fsPromises.readFile,

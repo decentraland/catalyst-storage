@@ -115,8 +115,6 @@ export async function createFolderBasedFileSystemContentStorage(
     root = root.slice(0, -1)
   }
 
-  await components.fs.mkdir(root, { recursive: true })
-
   const USE_HASH_PREFIX = !(options?.disablePrefixHash ?? false)
 
   // Atomic-write support requires `rename` on the filesystem component. Without it (legacy custom
@@ -125,14 +123,9 @@ export async function createFolderBasedFileSystemContentStorage(
   // deployment that stored ids under the default reserved name keeps working unchanged, it just
   // gets none of the crash-atomicity or reconciliation guarantees.
   const ATOMIC_MODE = !!components.fs.rename
-  if (!ATOMIC_MODE) {
-    logger.warn(
-      'The filesystem component does not provide rename: writes will NOT be crash-atomic, and the reserved ' +
-        'staging directory, orphan sweep and crash reconciliation are disabled (legacy direct-write mode).'
-    )
-  }
 
-  // Created up front so storeStream can stage into it without a per-write mkdir.
+  // ALL configuration validation happens before the first filesystem mutation, so an invalid
+  // configuration fails without side effects (no root creation, no reserved dir, no marker write).
   const tempDirName = options?.tempDirectoryName ?? TEMP_DIR_NAME
   const tempDir = path.join(root, tempDirName)
   if (ATOMIC_MODE) {
@@ -143,6 +136,49 @@ export async function createFolderBasedFileSystemContentStorage(
       throw new Error(
         `tempDirectoryName must not look like a shard directory (4 hex characters) when hash prefixes are enabled, got: ${JSON.stringify(tempDirName)}`
       )
+    }
+  }
+  // NaN/Infinity/non-positive values would silently disable the decompression-bomb cap, or create
+  // tight eviction loops and pathological cache behavior.
+  for (const [optionName, value] of Object.entries({
+    decompressCacheTTL: options?.decompressCacheTTL,
+    decompressCacheMaxSize: options?.decompressCacheMaxSize,
+    decompressCacheEvictionInterval: options?.decompressCacheEvictionInterval,
+    decompressMaxFileSize: options?.decompressMaxFileSize
+  })) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
+      throw new Error(`${optionName} must be a positive safe integer, got: ${String(value)}`)
+    }
+  }
+
+  if (!ATOMIC_MODE) {
+    logger.warn(
+      'The filesystem component does not provide rename: writes will NOT be crash-atomic, and the reserved ' +
+        'staging directory, orphan sweep and crash reconciliation are disabled (legacy direct-write mode).'
+    )
+  }
+
+  await components.fs.mkdir(root, { recursive: true })
+
+  if (ATOMIC_MODE) {
+    // stat() follows symlinks, so a pre-existing symlink at the reserved path would pass the
+    // directory check below and route staged writes and the startup sweep OUTSIDE the storage
+    // root. Refuse it when the fs component can detect it (lstat is optional for custom adapters;
+    // without it, the documented exclusive-root operational model is the guarantee).
+    if (components.fs.lstat) {
+      let linkStat
+      try {
+        linkStat = await components.fs.lstat(tempDir)
+      } catch {
+        linkStat = undefined
+      }
+      if (linkStat?.isSymbolicLink()) {
+        throw new Error(
+          `Refusing to start: the reserved temp path '${tempDirName}' is a symbolic link; staged writes and the ` +
+            `startup sweep would operate outside the storage root. Replace it with a real directory or configure ` +
+            `a different tempDirectoryName.`
+        )
+      }
     }
     // A legacy flat-mode content id could live exactly AT the reserved path as a file; mkdir would
     // then fail with a low-level filesystem error. Detect it first and give the same actionable
@@ -156,6 +192,7 @@ export async function createFolderBasedFileSystemContentStorage(
         )
       }
     }
+    // Created up front so storeStream can stage into it without a per-write mkdir.
     await components.fs.mkdir(tempDir, { recursive: true })
   }
 
@@ -328,18 +365,6 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  // NaN/Infinity/non-positive values would silently disable the decompression-bomb cap, or create
-  // tight eviction loops and pathological cache behavior.
-  for (const [optionName, value] of Object.entries({
-    decompressCacheTTL: options?.decompressCacheTTL,
-    decompressCacheMaxSize: options?.decompressCacheMaxSize,
-    decompressCacheEvictionInterval: options?.decompressCacheEvictionInterval,
-    decompressMaxFileSize: options?.decompressMaxFileSize
-  })) {
-    if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
-      throw new Error(`${optionName} must be a positive safe integer, got: ${String(value)}`)
-    }
-  }
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
   const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
