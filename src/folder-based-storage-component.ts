@@ -511,15 +511,19 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  let evicting = false
-  async function evictCache() {
-    if (evicting) return
-    evicting = true
-    try {
-      await runEviction()
-    } finally {
-      evicting = false
-    }
+  // Returns the CURRENT in-flight eviction when one is already running, instead of a resolved
+  // no-op: the interval callback assigns this to the tracked tick, so a tick firing during a slow
+  // eviction must hand back the real promise — otherwise stop() would await the no-op and could
+  // resolve while the actual eviction is still unlinking files.
+  let inflightEviction: Promise<void> | undefined
+  function evictCache(): Promise<void> {
+    if (inflightEviction) return inflightEviction
+    inflightEviction = runEviction()
+      .catch((error) => logger.warn(`Cache eviction failed: ${error}`))
+      .finally(() => {
+        inflightEviction = undefined
+      })
+    return inflightEviction
   }
 
   // Unlinks an evicted cache file under the path lock, re-checking the entry is still current: a
@@ -1000,9 +1004,10 @@ export async function createFolderBasedFileSystemContentStorage(
       if (evictionTimer) {
         clearInterval(evictionTimer)
       }
-      // Track the in-flight eviction tick so stop() can await one that is already running.
+      // Track the in-flight eviction tick so stop() can await one that is already running; a tick
+      // firing during a slow eviction receives that same in-flight promise from evictCache().
       evictionTimer = setInterval(() => {
-        evictionTick = evictCache().catch((error) => logger.warn(`Cache eviction failed: ${error}`))
+        evictionTick = evictCache()
       }, CACHE_EVICTION_INTERVAL)
       evictionTimer.unref()
       // Detached best-effort cleanup of temp files orphaned by an interrupted write in a prior run.

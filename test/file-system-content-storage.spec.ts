@@ -477,6 +477,69 @@ describe('fileSystemContentStorage', () => {
       }
     })
 
+    describe('when stop is called while an eviction tick is still running', () => {
+      let gatedRoot: string
+      let cachedFilePath: string
+      let stopSettledBeforeRelease: boolean
+      let gatedStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // A second interval tick fires while the first eviction is blocked mid-unlink: evictCache()
+        // must hand the in-flight promise to the tracked tick, so stop() awaits the REAL eviction
+        // instead of the second tick's no-op.
+        gatedRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-eviction-gate-'))
+        cachedFilePath = path.join(gatedRoot, '9584', id)
+        const realFs = createFsComponent()
+        let releaseUnlink: () => void = () => undefined
+        const unlinkGate = new Promise<void>((res) => (releaseUnlink = res))
+        let gateArmed = false
+        const gatedFs: IFileSystemComponent = {
+          ...realFs,
+          unlink: (async (target: any) => {
+            if (gateArmed && String(target) === cachedFilePath) {
+              gateArmed = false
+              await unlinkGate
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        gatedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: gatedFs, logs: await createLogComponent({}) },
+          gatedRoot,
+          { decompressCacheTTL: 10000, decompressCacheEvictionInterval: 30000 }
+        )
+        await gatedStorage.start?.({} as any)
+        await gatedStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(0))))
+        await gatedStorage.retrieve(id, { start: 0, end: 9 })
+        gateArmed = true
+        // Tick 1: the entry is past its TTL, the eviction starts and blocks on the gated unlink.
+        await jest.advanceTimersByTimeAsync(30000)
+        // Tick 2 fires while the first eviction is still in flight.
+        await jest.advanceTimersByTimeAsync(30000)
+        let stopSettled = false
+        const stopPromise = gatedStorage.stop!().then(() => {
+          stopSettled = true
+        })
+        // Flush microtasks: a stop() wrongly awaiting the second tick's no-op would settle here.
+        await jest.advanceTimersByTimeAsync(0)
+        stopSettledBeforeRelease = stopSettled
+        releaseUnlink()
+        await stopPromise
+      })
+
+      afterEach(async () => {
+        rmSync(gatedRoot, { recursive: true, force: true })
+      })
+
+      it('should not settle stop before the in-flight eviction completes', () => {
+        expect(stopSettledBeforeRelease).toBe(false)
+      })
+
+      it('should have completed the eviction by the time stop resolves', async () => {
+        expect(await fs.existPath(cachedFilePath)).toBe(false)
+      })
+    })
+
     describe('when a cached path is promoted to primary content before the eviction fires', () => {
       let promotedStorage: IContentStorageComponent
       let promotedRoot: string
