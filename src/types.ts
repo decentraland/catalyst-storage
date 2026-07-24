@@ -20,7 +20,14 @@ export type IContentStorageComponent = IBaseComponent & {
    * @param signal Optional cancellation signal. When it aborts, the store stops consuming the
    * stream, tears down any in-flight transport (e.g. the S3 upload), and rejects with the
    * signal's reason. A store that completes before observing the abort is allowed to succeed;
-   * either way no partial content is ever observable under the id.
+   * either way no partial content is ever observable under the id, and in atomic mode the
+   * previous version of the id stays intact on cancellation.
+   *
+   * Legacy no-rename folder mode (a filesystem component without `rename`) writes in place, so
+   * cancellation there is only honored before the destructive write begins: an abort observed
+   * after the write completes the store, and an abort mid-write follows the mode's usual
+   * non-atomic semantics — the partial overwrite is removed, but the previous version of an
+   * overwritten id cannot be preserved.
    */
   storeStream(fileId: string, content: Readable, signal?: AbortSignal): Promise<void>
   /**

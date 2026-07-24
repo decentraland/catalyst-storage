@@ -570,12 +570,16 @@ export async function createFolderBasedFileSystemContentStorage(
     stream: Readable,
     signal?: AbortSignal
   ): Promise<void> {
+    // Cancellation is only honored BEFORE the destructive in-place write begins — outside the
+    // rollback path below, since nothing has been touched yet. Once the pipe has replaced the
+    // canonical raw, the previous version is already gone (in-place semantics): an abort observed
+    // after that point treats the store as completed, because "rolling back" would unlink the only
+    // committed object rather than restore anything. A mid-write abort destroys the source, and the
+    // resulting pipe failure follows this mode's usual non-atomic handling (the partial overwrite
+    // is removed; the previous raw version cannot be preserved without rename support).
+    signal?.throwIfAborted()
     try {
       await pipe(stream, components.fs.createWriteStream(filePath))
-      // An abort observed once the source is consumed must still cancel the store: without this
-      // checkpoint the in-place write would be committed for a cancelled request. Throwing here
-      // rolls back through the catch below, so nothing is stored.
-      signal?.throwIfAborted()
       await noFailUnlink(filePath + '.gzip')
       if (await existsForInvariant(filePath + '.gzip')) {
         throw new Error(
@@ -756,6 +760,11 @@ export async function createFolderBasedFileSystemContentStorage(
       // commit; the catch below removes the staged file and the canonical path stays untouched.
       signal?.throwIfAborted()
       await withPathLock(filePath, async () => {
+        // Re-check INSIDE the lock: an abort landing while this store was queued on the path lock
+        // (after the checkpoint above, with the source already consumed) must still cancel before
+        // the irreversible commit below. Nothing has touched the canonical paths yet, so throwing
+        // here is handled exactly like the pre-lock throw.
+        signal?.throwIfAborted()
         try {
           // The raw and its .gzip are one versioned object: a gzip left from a previous version
           // would be preferred by retrieve() and serve stale bytes over the content just stored
@@ -1124,6 +1133,11 @@ export async function createFolderBasedFileSystemContentStorage(
       const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath)
       signal?.throwIfAborted()
       await withPathLock(filePath, async () => {
+        // Re-check INSIDE the lock: an abort landing while this store was queued on the path lock
+        // (after the checkpoints above, with the source already consumed) must still cancel before
+        // the irreversible commit below. Nothing has touched the canonical paths yet, so throwing
+        // here is handled exactly like the pre-lock throws.
+        signal?.throwIfAborted()
         try {
           // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
           // reconciled at next construction, never leaving mixed versions for reads to prefer.

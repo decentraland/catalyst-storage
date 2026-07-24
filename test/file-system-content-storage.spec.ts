@@ -1076,6 +1076,86 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the signal aborts while the store is queued on the path lock', () => {
+      let lockRoot: string
+      let firstWriterBytes: Buffer
+      let reason: Error
+      let queuedOutcome: 'resolved' | unknown
+      let lockedStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // Writer A holds the path lock (its commit rename is gated); writer B consumes its source,
+        // passes the pre-lock checkpoint and queues on the lock. The abort lands while B is queued
+        // — with the source already consumed, only the inside-lock checkpoint can stop the commit.
+        lockRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-lock-abort-'))
+        const rawPath = path.join(lockRoot, '9584', id)
+        const realFs = createFsComponent()
+        let releaseRename: () => void = () => undefined
+        const renameGate = new Promise<void>((res) => (releaseRename = res))
+        let renameStarted: () => void = () => undefined
+        const renameStartedPromise = new Promise<void>((res) => (renameStarted = res))
+        let holdNextRename = true
+        const gatedFs: IFileSystemComponent = {
+          ...realFs,
+          rename: (async (from: any, to: any) => {
+            if (String(to) === rawPath && holdNextRename) {
+              holdNextRename = false
+              renameStarted()
+              await renameGate
+            }
+            return realFs.rename!(from, to)
+          }) as typeof realFs.rename
+        }
+        lockedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: gatedFs, logs: await createLogComponent({}) },
+          lockRoot
+        )
+        firstWriterBytes = Buffer.from('first writer bytes')
+        const firstStore = lockedStorage.storeStream(id, bufferToStream(firstWriterBytes))
+        await renameStartedPromise
+        reason = new Error('cancelled while queued on the lock')
+        const controller = new AbortController()
+        const queuedStore = lockedStorage.storeStream(id, bufferToStream(content), controller.signal)
+        // Let the queued store consume its source and reach the lock queue.
+        const tempDirPath = path.join(lockRoot, '.tmp-writes')
+        for (let i = 0; i < 1000; i++) {
+          const staged = (await nodeFs.readdir(tempDirPath)).filter((entry) =>
+            /^[0-9a-f]{16}-[0-9a-f]{32}$/.test(entry)
+          )
+          if (staged.length >= 2) break
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        controller.abort(reason)
+        releaseRename()
+        await firstStore
+        queuedOutcome = await queuedStore.then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
+      })
+
+      afterEach(async () => {
+        await lockedStorage.stop?.()
+        rmSync(lockRoot, { recursive: true, force: true })
+      })
+
+      it('should reject the queued store with the abort reason', () => {
+        expect(queuedOutcome).toBe(reason)
+      })
+
+      it('should keep the first writer content as the committed version', async () => {
+        const item = await lockedStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(firstWriterBytes)
+      })
+
+      it('should leave no staging residue', async () => {
+        const staged = (await nodeFs.readdir(path.join(lockRoot, '.tmp-writes'))).filter((entry) =>
+          /^[0-9a-f]{16}-[0-9a-f]{32}$/.test(entry)
+        )
+        expect(staged).toEqual([])
+      })
+    })
+
     describe('when the signal aborts after the source was fully consumed', () => {
       let compressSpy: jest.SpyInstance
       let reason: Error
@@ -3160,6 +3240,101 @@ describe('fileSystemContentStorage', () => {
 
         it('should not leave the compressed store gzip shadowing the later raw', async () => {
           expect(await fs.existPath(filePath2 + '.gzip')).toBe(false)
+        })
+      })
+
+      describe('and the signal aborts after the in-place write has replaced the previous raw', () => {
+        let inPlaceRoot: string
+        let newBytes: Buffer
+        let storeOutcome: 'resolved' | unknown
+        let inPlaceStorage: IContentStorageComponent
+
+        beforeEach(async () => {
+          // The in-place pipe has already overwritten the previous raw when the abort is observed:
+          // "rolling back" would unlink the only committed object (the previous version is
+          // unrecoverable without rename support), so the store must be treated as COMPLETED — the
+          // regression was cancellation deleting an existing raw-backed id entirely.
+          inPlaceRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-inplace-abort-'))
+          const gzipPath = path.join(inPlaceRoot, '9584', id) + '.gzip'
+          const realFs = createFsComponent()
+          const controller = new AbortController()
+          let armed = false
+          const abortingFs: IFileSystemComponent = {
+            ...realFs,
+            rename: undefined,
+            unlink: (async (target: any) => {
+              // The gzip cleanup runs right after the pipe: abort exactly there (post-write).
+              if (armed && String(target) === gzipPath) {
+                armed = false
+                controller.abort(new Error('cancelled after the in-place write'))
+              }
+              return realFs.unlink(target)
+            }) as typeof realFs.unlink
+          }
+          inPlaceStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: abortingFs, logs: await createLogComponent({}) },
+            inPlaceRoot
+          )
+          await inPlaceStorage.storeStream(id, bufferToStream(Buffer.from('previous raw version')))
+          newBytes = Buffer.from('new raw version')
+          armed = true
+          storeOutcome = await inPlaceStorage.storeStream(id, bufferToStream(newBytes), controller.signal).then(
+            () => 'resolved' as const,
+            (error: unknown) => error
+          )
+        })
+
+        afterEach(async () => {
+          await inPlaceStorage.stop?.()
+          rmSync(inPlaceRoot, { recursive: true, force: true })
+        })
+
+        it('should treat the store as completed', () => {
+          expect(storeOutcome).toBe('resolved')
+        })
+
+        it('should keep the id readable with the new content instead of deleting it', async () => {
+          const item = await inPlaceStorage.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(newBytes)
+        })
+      })
+
+      describe('and the signal aborts while an in-place store is queued on the path lock', () => {
+        let previousBytes: Buffer
+        let reason: Error
+        let queuedOutcome: 'resolved' | unknown
+
+        beforeEach(async () => {
+          // Cancellation in no-rename mode is honored BEFORE the destructive write begins: writer A
+          // holds the lock for its whole in-place write (gated source), writer B queues, the abort
+          // lands, and B must reject at the pre-write checkpoint with A's version intact.
+          previousBytes = Buffer.from(new Uint8Array(64).fill(3))
+          const gatedSource = new Readable({ read() {} })
+          const firstStore = storageWithoutRename.storeStream(id2, gatedSource)
+          // Wait until A has opened the destination — proof it holds the lock mid-write.
+          for (let i = 0; i < 1000 && !(await fs.existPath(filePath2)); i++) {
+            // each awaited existPath yields an event-loop turn
+          }
+          reason = new Error('cancelled while queued behind an in-place write')
+          const controller = new AbortController()
+          const queuedStore = storageWithoutRename.storeStream(id2, bufferToStream(content2), controller.signal)
+          controller.abort(reason)
+          gatedSource.push(previousBytes)
+          gatedSource.push(null)
+          await firstStore
+          queuedOutcome = await queuedStore.then(
+            () => 'resolved' as const,
+            (error: unknown) => error
+          )
+        })
+
+        it('should reject the queued store with the abort reason', () => {
+          expect(queuedOutcome).toBe(reason)
+        })
+
+        it('should keep the previous version intact', async () => {
+          const item = await storageWithoutRename.retrieve(id2)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(previousBytes)
         })
       })
 
