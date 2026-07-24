@@ -37,6 +37,24 @@ export function isAbortError(error: unknown): boolean {
   return err?.name === 'AbortError' || err?.code === 'ABORT_ERR'
 }
 
+/**
+ * True only for rejections provably produced by this module's abort teardown: the signal's own
+ * reason (checkpoint throws), abort errors (signalled pipelines, `throwIfAborted` defaults), a
+ * prematurely closed stream (the destroyed source — including {@link streamToBuffer}'s close
+ * rejection, which carries the same code), or an aborted S3 managed upload. Anything else — fs,
+ * zlib, transport or logic errors that merely raced the abort — is NOT teardown-caused and must
+ * surface as itself.
+ */
+function isAbortTeardownError(error: unknown, signal: AbortSignal): boolean {
+  if (error === signal.reason) return true
+  if (isAbortError(error)) return true
+  const err = error as { name?: unknown; code?: unknown } | null
+  if (err?.code === 'ERR_STREAM_PREMATURE_CLOSE') return true
+  // aws-sdk v2 ManagedUpload.abort()
+  if (err?.code === 'RequestAbortedError' || err?.name === 'RequestAbortedError') return true
+  return false
+}
+
 function abortReasonOf(signal: AbortSignal): unknown {
   // `??` would also replace an explicit `null` abort reason; the caller must observe their own
   // cancellation cause, so only default when no reason was provided at all.
@@ -48,10 +66,12 @@ function abortReasonOf(signal: AbortSignal): unknown {
  *
  * On abort the source stream is destroyed — settling any consumer awaiting its data — and the
  * optional `onAbort` hook runs so callers can tear down transport that no longer depends on the
- * source (e.g. an S3 managed upload whose remaining parts are already buffered). The operation's
- * rejection is then surfaced as the signal's reason, so callers observe their own cancellation
- * cause rather than a transport-specific error. A store that completes before consuming the abort
- * is allowed to succeed: content is addressed by its id, so a committed write is never harmful.
+ * source (e.g. an S3 managed upload whose remaining parts are already buffered). A rejection that
+ * is provably caused by that teardown is surfaced as the signal's reason, so callers observe their
+ * own cancellation cause rather than a transport-specific error; a rejection that merely RACED the
+ * abort (fs, zlib, transport or logic failures) surfaces as itself — cancellation must never mask
+ * a real storage error. A store that completes before consuming the abort is allowed to succeed:
+ * content is addressed by its id, so a committed write is never harmful.
  *
  * The source is destroyed without an error: consumers observe a premature close, and an
  * already-ended (fully consumed) source is left untouched instead of emitting an 'error' that
@@ -93,10 +113,14 @@ export async function runStoreWithSignal<T>(
   try {
     return await operation()
   } catch (error) {
-    // Translate teardown-caused rejections (destroyed source, aborted transport) to the caller's
-    // cancellation reason — but NEVER errors marked as commit/cleanup-phase failures: those carry
-    // repair/quarantine information that the abort did not cause and must not hide.
-    throw signal.aborted && !isNonCancellationError(error) ? abortReasonOf(signal) : error
+    // Translate ONLY rejections provably caused by the abort teardown (destroyed source, aborted
+    // transport, checkpoint throws) to the caller's cancellation reason. Real backend/storage
+    // failures that merely raced the abort — an S3 rejection, ENOSPC on a staged write, a zlib
+    // error — surface as themselves; the marker check is a hard override guaranteeing commit-phase
+    // errors are never translated even if one ever matched a teardown shape.
+    throw signal.aborted && isAbortTeardownError(error, signal) && !isNonCancellationError(error)
+      ? abortReasonOf(signal)
+      : error
   } finally {
     signal.removeEventListener('abort', abort)
   }

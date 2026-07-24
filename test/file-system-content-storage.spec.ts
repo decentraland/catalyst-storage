@@ -2,7 +2,7 @@ import { createHash } from 'crypto'
 import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { PassThrough, Readable } from 'stream'
+import { PassThrough, Readable, Writable } from 'stream'
 import { gzipSync } from 'zlib'
 import {
   createFolderBasedFileSystemContentStorage,
@@ -1073,6 +1073,59 @@ describe('fileSystemContentStorage', () => {
         await customStorage.storeStream('.tmp-writes', bufferToStream(content))
         const item = await customStorage.retrieve('.tmp-writes')
         expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+    })
+
+    describe('when the staged write fails for a real reason while the caller aborts', () => {
+      let enospcRoot: string
+      let diskFullError: Error
+      let storeOutcome: 'resolved' | unknown
+      let enospcStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The staged write fails with ENOSPC while the caller happens to abort: the real storage
+        // error is not teardown-caused and must surface as itself, not as the cancellation reason.
+        enospcRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-enospc-race-'))
+        diskFullError = Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+        const controller = new AbortController()
+        const realFs = createFsComponent()
+        let armed = true
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          createWriteStream: ((target: any, opts?: any) => {
+            if (armed && /[0-9a-f]{16}-[0-9a-f]{32}$/.test(String(target))) {
+              armed = false
+              return new Writable({
+                write(_chunk, _encoding, callback) {
+                  controller.abort(new Error('cancelled while the disk was filling up'))
+                  callback(diskFullError)
+                }
+              }) as any
+            }
+            return realFs.createWriteStream(target, opts)
+          }) as typeof realFs.createWriteStream
+        }
+        enospcStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          enospcRoot
+        )
+        storeOutcome = await enospcStorage.storeStream(id, bufferToStream(content), controller.signal).then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
+      })
+
+      afterEach(async () => {
+        await enospcStorage.stop?.()
+        rmSync(enospcRoot, { recursive: true, force: true })
+      })
+
+      it('should surface the real storage error instead of the cancellation reason', () => {
+        expect(storeOutcome).toBe(diskFullError)
+      })
+
+      it('should not commit anything', async () => {
+        expect(await enospcStorage.exist(id)).toBe(false)
       })
     })
 

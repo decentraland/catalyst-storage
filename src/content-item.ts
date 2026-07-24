@@ -65,7 +65,10 @@ export function streamToBuffer(stream: Readable): Promise<Buffer> {
     stream.on('end', () => resolve(Buffer.concat(buffers)))
     // A stream destroyed without an error emits neither 'end' nor 'error' — only 'close'. Without
     // this the returned promise would never settle. On the graceful path 'close' arrives after
-    // 'end'/'error', where this rejection is a no-op.
-    stream.on('close', () => reject(new Error('Stream closed before it ended.')))
+    // 'end'/'error', where this rejection is a no-op. Carries the standard premature-close code so
+    // cancellation handling can recognize it as teardown-caused rather than a real failure.
+    stream.on('close', () =>
+      reject(Object.assign(new Error('Stream closed before it ended.'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }))
+    )
   })
 }
