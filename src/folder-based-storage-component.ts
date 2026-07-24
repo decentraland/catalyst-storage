@@ -4,7 +4,7 @@ import { pipeline, Readable, Transform } from 'stream'
 import { promisify } from 'util'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
-import { markAsNonCancellationError, runStoreWithSignal } from './cancellation'
+import { isAbortError, markAsNonCancellationError, runStoreWithSignal } from './cancellation'
 import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
@@ -1133,10 +1133,31 @@ export async function createFolderBasedFileSystemContentStorage(
           try {
             compressed = await compressContentFile(filePath, logger, undefined, signal)
           } catch (err) {
-            // An abort-caused pipeline teardown is not a failure of this (already completed) store:
-            // the partial canonical gzip was removed by the compression's own cleanup and the raw
-            // stays primary. Genuine compression failures still propagate as before.
-            if (!signal?.aborted) throw err
+            // The compression failed (or was torn down): its own cleanup of the partial canonical
+            // output is best-effort, so VERIFY none survived — in this mode the compression writes
+            // to the canonical `.gzip` directly, reads prefer `.gzip`, and a surviving partial
+            // would be served as corrupt content over the just-committed raw. Failures here are
+            // post-commit storage errors, never abort-caused, so they must stay visible.
+            try {
+              await noFailUnlink(filePath + '.gzip')
+              if (await existsForInvariant(filePath + '.gzip')) {
+                throw new Error(
+                  `Compression of ${id} failed and its partial gzip output could not be removed; ` +
+                    `reads would prefer the corrupt gzip over the committed raw.`
+                )
+              }
+            } catch (invariantErr) {
+              throw markAsNonCancellationError(invariantErr)
+            }
+            if (signal?.aborted && isAbortError(err)) {
+              // Provably abort-caused pipeline teardown of an optional post-commit compression:
+              // not a failure of this (already completed) store — the raw stays primary.
+            } else {
+              // A real compression/storage failure that merely RACED the abort (ENOSPC, EACCES,
+              // zlib errors, …): resolving would hide it as a successful store, and unmarked it
+              // would be translated to the cancellation reason. Surface it as-is.
+              throw markAsNonCancellationError(err)
+            }
           }
           if (compressed) {
             // The in-place compression succeeded: the gzip exists at its canonical path and, under

@@ -3430,6 +3430,102 @@ describe('fileSystemContentStorage', () => {
         })
       })
 
+      describe('and a real compression failure races a caller abort', () => {
+        let rawBytes: Buffer
+        let diskFullError: Error
+        let compressSpy: jest.SpyInstance
+        let storeOutcome: 'resolved' | unknown
+
+        beforeEach(async () => {
+          // The compression fails for a real reason (ENOSPC) while the caller happens to abort:
+          // suppressing it would misreport a failed compressed store as success, and leaving it
+          // unmarked would hide it behind the cancellation reason. It must surface as-is.
+          rawBytes = Buffer.from(new Uint8Array(64).fill(7))
+          diskFullError = Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+          const controller = new AbortController()
+          compressSpy = jest.spyOn(compressionModule, 'compressContentFile').mockImplementationOnce(async () => {
+            controller.abort(new Error('cancelled while compression was failing'))
+            throw diskFullError
+          })
+          storeOutcome = await storageWithoutRename
+            .storeStreamAndCompress(id2, bufferToStream(rawBytes), controller.signal)
+            .then(
+              () => 'resolved' as const,
+              (error: unknown) => error
+            )
+        })
+
+        afterEach(() => {
+          compressSpy.mockRestore()
+        })
+
+        it('should reject with the real storage error, not resolve and not the abort reason', () => {
+          expect(storeOutcome).toBe(diskFullError)
+        })
+
+        it('should keep the committed raw readable', async () => {
+          const item = await storageWithoutRename.retrieve(id2)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(rawBytes)
+        })
+      })
+
+      describe('and an aborted compression leaves a partial gzip that cannot be removed', () => {
+        let partialRoot: string
+        let gzipPath: string
+        let compressSpy: jest.SpyInstance
+        let storeOutcome: 'resolved' | unknown
+        let partialStorage: IContentStorageComponent
+
+        beforeEach(async () => {
+          // The teardown is abort-caused, but the partial canonical gzip survives its cleanup:
+          // resolving would let reads prefer the corrupt gzip over the committed raw, so the store
+          // must fail loudly with the invariant error — visible even past the abort translation.
+          partialRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-partial-gzip-'))
+          gzipPath = path.join(partialRoot, '9584', id) + '.gzip'
+          const realFs = createFsComponent()
+          let unlinkFails = false
+          const failingFs: IFileSystemComponent = {
+            ...realFs,
+            rename: undefined,
+            unlink: (async (target: any) => {
+              if (unlinkFails && String(target) === gzipPath) {
+                throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+              }
+              return realFs.unlink(target)
+            }) as typeof realFs.unlink
+          }
+          partialStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: failingFs, logs: await createLogComponent({}) },
+            partialRoot
+          )
+          const controller = new AbortController()
+          compressSpy = jest.spyOn(compressionModule, 'compressContentFile').mockImplementationOnce(async () => {
+            // Simulate a torn-down pipeline whose partial-output cleanup failed: the partial
+            // canonical gzip is left behind and stays unremovable for the store's verification.
+            await nodeFs.writeFile(gzipPath, Buffer.from('partial gzip bytes'))
+            unlinkFails = true
+            controller.abort(new Error('cancelled mid-compression'))
+            throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
+          })
+          storeOutcome = await partialStorage
+            .storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(64).fill(1))), controller.signal)
+            .then(
+              () => 'resolved' as const,
+              (error: unknown) => error
+            )
+        })
+
+        afterEach(async () => {
+          compressSpy.mockRestore()
+          await partialStorage.stop?.()
+          rmSync(partialRoot, { recursive: true, force: true })
+        })
+
+        it('should reject with the invariant error instead of resolving over a corrupt gzip', () => {
+          expect((storeOutcome as Error).message).toContain('could not be removed')
+        })
+      })
+
       describe('and the gzip cleanup of an in-place store fails', () => {
         let legacyRoot: string
         let originalBytes: Buffer

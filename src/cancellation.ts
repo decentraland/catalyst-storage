@@ -26,6 +26,17 @@ function isNonCancellationError(error: unknown): boolean {
   return error !== null && typeof error === 'object' && NON_CANCELLATION_ERROR in error
 }
 
+/**
+ * True for the rejection shape a signalled `stream/promises` pipeline (or `throwIfAborted`)
+ * produces on abort. Used to distinguish an abort-caused teardown from a real failure that merely
+ * RACED the abort (ENOSPC, EACCES, zlib errors, …): only the former may be suppressed or
+ * reinterpreted as a cancellation outcome.
+ */
+export function isAbortError(error: unknown): boolean {
+  const err = error as { name?: unknown; code?: unknown } | null
+  return err?.name === 'AbortError' || err?.code === 'ABORT_ERR'
+}
+
 function abortReasonOf(signal: AbortSignal): unknown {
   // `??` would also replace an explicit `null` abort reason; the caller must observe their own
   // cancellation cause, so only default when no reason was provided at all.
