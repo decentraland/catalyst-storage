@@ -1212,7 +1212,19 @@ export async function createFolderBasedFileSystemContentStorage(
       // The signal also aborts the compression pipeline itself mid-flight (its partial staged
       // output is removed before the rejection propagates), so a cancelled request stops paying
       // CPU/disk immediately instead of only at the next checkpoint.
-      const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath, signal)
+      let compressed: boolean
+      try {
+        compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath, signal)
+      } catch (err) {
+        // This call site is the one place that hands a signal to an abortable pipeline, so it is
+        // where an abort-shaped rejection is provably our own teardown rather than a coincidence:
+        // convert it to the caller's reason here, which lets the generic translation stay strict
+        // about abort shapes it cannot attribute. Any other failure surfaces as itself.
+        if (signal?.aborted && isAbortError(err)) {
+          signal.throwIfAborted()
+        }
+        throw err
+      }
       signal?.throwIfAborted()
       await withPathLock(filePath, async () => {
         // Re-check INSIDE the lock: an abort landing while this store was queued on the path lock

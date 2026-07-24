@@ -145,7 +145,13 @@ export async function createS3BasedFileSystemContentStorage(
         // it would complete and commit content for an already-cancelled store. Re-check here, where
         // the ManagedUpload provably exists, and tear it down ourselves.
         if (signal?.aborted) {
-          upload.abort?.()
+          // Guarded like the listener's hook: a custom S3-compatible abort() that throws must not
+          // replace the caller's cancellation reason thrown below.
+          try {
+            upload.abort?.()
+          } catch {
+            // best-effort teardown
+          }
           signal.throwIfAborted()
         }
         try {

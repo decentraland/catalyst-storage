@@ -46,17 +46,17 @@ type TeardownProvenance = {
 }
 
 /**
- * True only for rejections provably produced by this module's abort teardown. Both stream and
- * transport shapes are public — a source can close prematurely, and an SDK can report an aborted
- * request, for reasons of their own that merely race the cancellation — so each is credited only
- * when this run's teardown actually performed the corresponding action. The signal's own reason and
- * abort errors need no provenance: they can only come from our checkpoints or a signalled pipeline.
- * Anything else — fs, zlib, transport or logic errors — is NOT teardown-caused and surfaces as
- * itself.
+ * True only for rejections provably produced by this module's abort teardown. Every shape a store
+ * can reject with is public — a source can close prematurely, an SDK can report an aborted request,
+ * a custom stream or transport can raise an `AbortError` of its own — so no shape is credited on
+ * appearance alone. The signal's own reason needs no provenance (only our checkpoints throw it, and
+ * the one place that hands a signal to an abortable pipeline converts that pipeline's abort into the
+ * reason at its call site, where the attribution is known); the remaining shapes are credited only
+ * when this run's teardown actually performed the corresponding action. Anything else — fs, zlib,
+ * transport or logic errors — is NOT teardown-caused and surfaces as itself.
  */
 function isAbortTeardownError(error: unknown, signal: AbortSignal, teardown: TeardownProvenance): boolean {
   if (error === signal.reason) return true
-  if (isAbortError(error)) return true
   const err = error as { name?: unknown; code?: unknown } | null
   if (teardown.destroyedSource && err?.code === 'ERR_STREAM_PREMATURE_CLOSE') return true
   // aws-sdk v2 ManagedUpload.abort()

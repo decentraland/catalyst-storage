@@ -481,6 +481,30 @@ describe('S3 Storage upload cancellation', () => {
     await expect(storage.storeStream('destroy-throws-id', source)).rejects.toBe(uploadFault)
   })
 
+  it(`When an S3-compatible abort() throws during upload creation, then the caller still sees the reason`, async () => {
+    // The manual teardown in the post-creation checkpoint must be as exception-safe as the listener's
+    // hook: a throwing abort() cannot be allowed to replace the caller's cancellation reason.
+    const logs = await createLogComponent({})
+    const controller = new AbortController()
+    const reason = new Error('cancelled during upload creation')
+    const promiseSpy = jest.fn(() => new Promise<never>(() => undefined))
+    const upload = jest.fn(() => {
+      controller.abort(reason)
+      return {
+        promise: promiseSpy,
+        abort: () => {
+          throw new Error('abort exploded')
+        }
+      }
+    })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+
+    await expect(
+      storage.storeStream('abort-throws-id', bufferToStream(Buffer.from('small')), controller.signal)
+    ).rejects.toBe(reason)
+    expect(promiseSpy).not.toHaveBeenCalled()
+  })
+
   it(`When the signal aborts during upload creation, then the upload is torn down before it is awaited`, async () => {
     // The abort listener can only call ManagedUpload.abort() once the upload variable is assigned:
     // an abort firing during s3.upload(...) itself finds it undefined, and with a small source

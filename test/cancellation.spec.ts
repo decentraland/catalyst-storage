@@ -161,6 +161,38 @@ describe('runStoreWithSignal', () => {
     })
   })
 
+  describe('when an operation raises an abort-shaped error of its own', () => {
+    let foreignAbortError: Error
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // A custom stream or transport can raise an AbortError for reasons of its own that merely
+      // coincide with the caller's cancellation. Nothing here handed it this signal, so the shape
+      // alone must not earn translation — the caller needs to see the real failure.
+      foreignAbortError = Object.assign(new Error('The custom transport aborted internally'), {
+        name: 'AbortError',
+        code: 'ABORT_ERR'
+      })
+      const controller = new AbortController()
+      const source = new Readable({ read() {} })
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      const pending = runStoreWithSignal(source, controller.signal, () => operation)
+      controller.abort(new Error('cancelled'))
+      rejectOperation(foreignAbortError)
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should surface the foreign abort error instead of the cancellation reason', () => {
+      expect(outcome).toBe(foreignAbortError)
+    })
+  })
+
   describe('when the abort reason is an explicit null', () => {
     let outcome: 'resolved' | unknown
 

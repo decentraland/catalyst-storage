@@ -1434,6 +1434,47 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the signalled compression pipeline is torn down by the abort', () => {
+      let compressSpy: jest.SpyInstance
+      let reason: Error
+      let storeOutcome: 'resolved' | unknown
+
+      beforeEach(async () => {
+        // The staged path hands the signal to the compression pipeline, so an abort-shaped rejection
+        // from it is provably this cancellation's own teardown: the caller must observe THEIR reason,
+        // not the pipeline's AbortError — this is the attribution the generic translation no longer
+        // makes on shape alone.
+        reason = new Error('cancelled mid-compression pipeline')
+        const controller = new AbortController()
+        compressSpy = jest.spyOn(compressionModule, 'compressContentFile').mockImplementationOnce(async () => {
+          controller.abort(reason)
+          throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })
+        })
+        storeOutcome = await fileSystemContentStorage
+          .storeStreamAndCompress(
+            'signalled-compression',
+            bufferToStream(Buffer.from(new Uint8Array(100).fill(0))),
+            controller.signal
+          )
+          .then(
+            () => 'resolved' as const,
+            (error: unknown) => error
+          )
+      })
+
+      afterEach(() => {
+        compressSpy.mockRestore()
+      })
+
+      it('should reject with the caller reason rather than the pipeline abort error', () => {
+        expect(storeOutcome).toBe(reason)
+      })
+
+      it('should not commit the object', async () => {
+        expect(await fileSystemContentStorage.exist('signalled-compression')).toBe(false)
+      })
+    })
+
     describe('when the compression of a staged store fails', () => {
       let compressSpy: jest.SpyInstance
       let storeOutcome: 'resolved' | Error
