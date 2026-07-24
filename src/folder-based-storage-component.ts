@@ -245,6 +245,38 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  // Ids whose post-rename counterpart cleanup failed in THIS process: the on-disk state is mixed
+  // (new primary + stale counterpart) with the intent preserved, and live reads must not serve it —
+  // non-range reads would prefer the stale counterpart while range reads see the new bytes. Reads
+  // check this set (an O(1) lookup, no syscalls — the hot path is untouched when it is empty) and,
+  // for a quarantined id, repair under the path lock or report the id unavailable. Entries clear on
+  // any successful repair (read-triggered, retried store, delete) and do not survive restarts,
+  // where construction-time reconciliation takes over.
+  const unreconciledIds = new Set<string>()
+
+  // Repair gate for reads of a quarantined id: applies the pending intent under the path lock and
+  // reports whether the id is safe to serve. Never throws — an unrepairable id stays quarantined
+  // and the caller reports no result rather than exposing a known-mixed state.
+  async function ensureReconciled(id: string): Promise<boolean> {
+    if (!unreconciledIds.has(id)) return true
+    const filePath = await getFilePath(id)
+    return withPathLock(filePath, async () => {
+      if (!unreconciledIds.has(id)) return true
+      try {
+        const intentPath = intentPathFor(id)
+        if (await existsForInvariant(intentPath)) {
+          await applyPendingIntent(intentPath)
+        } else {
+          // No journal left: the mixed state was repaired elsewhere (retried store, delete).
+          unreconciledIds.delete(id)
+        }
+        return !unreconciledIds.has(id)
+      } catch {
+        return false
+      }
+    })
+  }
+
   // After a FAILED commit rename, the pre-rename intent must be PROVABLY gone before the staged
   // proof may be discarded. Both "the journal survived" and "the journal cannot be proven gone"
   // (the verification stat itself fails) preserve the proof via the typed error — otherwise a raw
@@ -310,7 +342,15 @@ export async function createFolderBasedFileSystemContentStorage(
     } catch {
       op = id = staged = ''
     }
-    if ((op !== 'raw' && op !== 'gzip') || !id || !STAGED_FILE_NAME.test(staged ?? '')) {
+    if (
+      (op !== 'raw' && op !== 'gzip') ||
+      !id ||
+      !STAGED_FILE_NAME.test(staged ?? '') ||
+      // The intent path is a deterministic function of the id: a body whose id does not hash to
+      // this filename is corruption or operator error, and applying it would reconcile the WRONG
+      // id. Treat it as malformed.
+      intentPathFor(id) !== intentPath
+    ) {
       // A partial/malformed intent means its commit never started (intents are written before
       // renames): discard it; an orphaned staged file, if any, is handled by the sweep.
       await removeIntentOrThrow(intentPath, 'Discarding a malformed intent journal failed')
@@ -325,6 +365,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // committed transition and delete the valid counterpart.
       await removeIntentOrThrow(intentPath, `Cannot discard the uncommitted ${op} intent for ${id}`)
       await noFailUnlink(stagedPath)
+      unreconciledIds.delete(id)
       logger.info(`Discarded a prepared but uncommitted ${op} transition`, { id })
       return
     }
@@ -350,6 +391,7 @@ export async function createFolderBasedFileSystemContentStorage(
       logger.info(`Reconciled an interrupted ${op} commit`, { id })
     }
     await removeIntentOrThrow(intentPath, `Reconciled ${id} but could not discharge its intent journal`)
+    unreconciledIds.delete(id)
   }
 
   // Construction invariant: the storage never runs in a state where the reserved staging namespace
@@ -488,19 +530,31 @@ export async function createFolderBasedFileSystemContentStorage(
     }
     if (hadCounterpart) {
       await noFailUnlink(counterpartPath)
-      if (await existsForInvariant(counterpartPath)) {
-        // The new version is committed, but the stale counterpart could not be removed and reads in
-        // THIS process would keep preferring it. Fail the store loudly instead of resolving with a
-        // lie: the intent survives, so the next construction finishes the cleanup, and a retried
-        // store re-attempts it immediately.
+      let counterpartGone: boolean
+      try {
+        counterpartGone = !(await existsForInvariant(counterpartPath))
+      } catch (verifyErr) {
+        // Possibly mixed and unprovable: quarantine so reads repair-or-refuse instead of serving it.
+        unreconciledIds.add(id)
+        throw verifyErr
+      }
+      if (!counterpartGone) {
+        // The new version is committed, but the stale counterpart could not be removed. The
+        // on-disk state is MIXED: without a guard, non-range reads would keep preferring the stale
+        // counterpart while range reads see the new bytes — two versions of one id from the same
+        // process. Quarantine the id (reads repair-or-refuse, see ensureReconciled) and fail the
+        // store loudly; the intent survives, so a retried store, a read-triggered repair or the
+        // next construction finishes the cleanup.
+        unreconciledIds.add(id)
         throw new Error(
           `Stored ${id} but failed to remove its previous ${op === 'raw' ? 'gzip' : 'raw'} representation; ` +
-            `reads may serve the previous version until a retry or restart completes the cleanup.`
+            `the id is quarantined from reads until a retry, read-triggered repair or restart completes the cleanup.`
         )
       }
       if (intentPath) {
         await removeIntentOrThrow(intentPath, `Committed ${id} but could not discharge its intent journal`)
       }
+      unreconciledIds.delete(id)
     }
   }
 
@@ -744,9 +798,15 @@ export async function createFolderBasedFileSystemContentStorage(
   // after a store/delete promise resolves observe that operation's outcome. The returned
   // ContentItem opens its stream LAZILY: a store/delete landing between retrieve() and asStream()
   // can unlink the observed file, making asStream() fail (typically ENOENT) — callers should treat
-  // that as a retryable miss, exactly like retrieve() having returned undefined.
+  // that as a retryable miss, exactly like retrieve() having returned undefined. Ids quarantined by
+  // a failed post-rename cleanup are repaired before serving or reported as absent — a read never
+  // exposes a known-mixed state (see unreconciledIds).
   const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
     if (range) validateRange(range)
+    if (unreconciledIds.has(id) && !(await ensureReconciled(id))) {
+      logger.warn(`Refusing to serve a quarantined mixed-state id`, { id })
+      return undefined
+    }
     try {
       let contentItem: ContentItem | undefined = undefined
       if (!range) contentItem = await retrieveWithEncoding(id, 'gzip')
@@ -881,6 +941,7 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   async function exist(id: string): Promise<boolean> {
+    if (unreconciledIds.has(id) && !(await ensureReconciled(id))) return false
     const filePath = await getFilePath(id)
     return (await components.fs.existPath(filePath + '.gzip')) || (await components.fs.existPath(filePath))
   }
@@ -925,6 +986,7 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   async function fileInfo(id: string): Promise<FileInfo | undefined> {
+    if (unreconciledIds.has(id) && !(await ensureReconciled(id))) return undefined
     const possibleEncondings = ['gzip', null]
     const baseFilePath = await getFilePath(id)
 

@@ -1389,6 +1389,121 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when a failed post-rename cleanup quarantines the id', () => {
+      let quarantineRoot: string
+      let gzipPath: string
+      let intentPath: string
+      let storeOutcome: 'resolved' | Error
+      let failingStorage: IContentStorageComponent
+      let disarm: () => void
+
+      beforeEach(async () => {
+        // A raw commit lands but the stale gzip cannot be removed: without a guard, full reads
+        // would keep serving the OLD gzip while range reads see the NEW raw — two versions of one
+        // id from the same process. The id must be quarantined: reads repair-or-refuse, never
+        // exposing the mixed state.
+        quarantineRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-quarantine-'))
+        gzipPath = path.join(quarantineRoot, '9584', id) + '.gzip'
+        intentPath = path.join(quarantineRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        const realFs = createFsComponent()
+        let armed = true
+        disarm = () => {
+          armed = false
+        }
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          unlink: (async (target: any) => {
+            if (armed && String(target) === gzipPath) {
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          quarantineRoot
+        )
+        await failingStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(5))))
+        storeOutcome = await failingStorage.storeStream(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: Error) => error
+        )
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(quarantineRoot, { recursive: true, force: true })
+      })
+
+      it('should fail the store and announce the quarantine', () => {
+        expect((storeOutcome as Error).message).toContain('quarantined')
+      })
+
+      it('should not expose the new bytes through range reads while quarantined', async () => {
+        expect(await failingStorage.retrieve(id, { start: 0, end: 2 })).toBeUndefined()
+      })
+
+      it('should not expose the old version through full reads while quarantined', async () => {
+        expect(await failingStorage.retrieve(id)).toBeUndefined()
+      })
+
+      it('should report the id as unavailable while quarantined', async () => {
+        expect(await failingStorage.exist(id)).toBe(false)
+      })
+
+      it('should repair through a read once the cleanup can complete', async () => {
+        disarm()
+        const item = await failingStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+        expect(await fs.existPath(gzipPath)).toBe(false)
+        expect(await fs.existPath(intentPath)).toBe(false)
+        expect(await failingStorage.exist(id)).toBe(true)
+      })
+    })
+
+    describe('when an intent body names a different id than its filename', () => {
+      let mismatchRoot: string
+      let victimGzipPath: string
+      let mismatchStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // Valid-JSON corruption or an operator mistake: the intent file for one id names another.
+        // Applying it would reconcile the WRONG id (deleting the victim's valid gzip); it must be
+        // treated as malformed and discarded.
+        mismatchRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-mismatch-'))
+        const victimShard = path.join(mismatchRoot, 'ea6c')
+        await nodeFs.mkdir(victimShard, { recursive: true })
+        victimGzipPath = path.join(victimShard, id2) + '.gzip'
+        await nodeFs.writeFile(path.join(victimShard, id2), Buffer.from('victim raw'))
+        await nodeFs.writeFile(victimGzipPath, Buffer.from('victim gzip'))
+        await nodeFs.mkdir(path.join(mismatchRoot, '.tmp-writes'), { recursive: true })
+        await nodeFs.writeFile(
+          path.join(mismatchRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
+          Buffer.from(
+            JSON.stringify({ op: 'raw', id: id2, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' })
+          )
+        )
+        mismatchStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          mismatchRoot
+        )
+      })
+
+      afterEach(async () => {
+        await mismatchStorage.stop?.()
+        rmSync(mismatchRoot, { recursive: true, force: true })
+      })
+
+      it('should discard the mismatched intent instead of applying it', async () => {
+        const entries = await nodeFs.readdir(path.join(mismatchRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => entry.endsWith('.intent'))).toEqual([])
+      })
+
+      it('should leave the named id untouched', async () => {
+        expect(await fs.existPath(victimGzipPath)).toBe(true)
+      })
+    })
+
     describe('when the commit rename fails and the intent cannot be cleared', () => {
       let doubleFailRoot: string
       let gzipPath: string
