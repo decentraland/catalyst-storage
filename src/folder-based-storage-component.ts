@@ -343,7 +343,26 @@ export async function createFolderBasedFileSystemContentStorage(
     }
     const hadCounterpart = await components.fs.existPath(counterpartPath)
     const intentPath = hadCounterpart ? await writeIntent(op, id) : undefined
-    await rename(stagedPath, primaryPath)
+    try {
+      await rename(stagedPath, primaryPath)
+    } catch (err) {
+      // The commit did not happen, so the intent must not survive it: a later repair would treat
+      // the failed commit as successful and remove the counterpart — e.g. delete a valid gzip
+      // primary in favor of its own decompressed raw cache.
+      if (intentPath) {
+        await noFailUnlink(intentPath)
+        if (await components.fs.existPath(intentPath)) {
+          // Double filesystem failure: the stale intent could later be applied as if the commit
+          // succeeded. Escalate with explicit manual guidance instead of the bare rename error.
+          throw new Error(
+            `Failed to commit ${id} AND failed to clear its intent journal — remove '${intentPath}' manually ` +
+              `before restarting, or the failed commit may be applied as if it had succeeded. ` +
+              `Original error: ${err instanceof Error ? err.message : String(err)}`
+          )
+        }
+      }
+      throw err
+    }
     if (hadCounterpart) {
       await noFailUnlink(counterpartPath)
       if (await components.fs.existPath(counterpartPath)) {
@@ -648,6 +667,11 @@ export async function createFolderBasedFileSystemContentStorage(
                 } catch (err) {
                   // Remove the partial staged file; the canonical path was never touched.
                   await noFailUnlink(writePath)
+                  // An invalidated token means the id was overwritten/deleted while inflating —
+                  // the failure belongs to the replaced gzip, not to the caller's request.
+                  // Resolving lets the retry loop observe the new representation instead of the
+                  // error bubbling into a spurious undefined for a valid id.
+                  if (token.invalidated) return
                   throw err
                 }
                 return
@@ -668,6 +692,9 @@ export async function createFolderBasedFileSystemContentStorage(
                 } catch (err) {
                   // Under the lock the partial file is provably ours to remove.
                   await noFailUnlink(uncompressedPath)
+                  // Defensive symmetry with the staged branch: writers take this same lock, so the
+                  // token cannot flip mid-section today.
+                  if (token.invalidated) return
                   throw err
                 }
                 const stat = await components.fs.stat(uncompressedPath)

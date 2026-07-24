@@ -1239,6 +1239,126 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the commit rename fails after the intent is written', () => {
+      let renameFailRoot: string
+      let gzipPath: string
+      let originalBytes: Buffer
+      let storeOutcome: 'resolved' | Error
+      let failingStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The intent is journaled, then the rename itself fails: the commit never happened, so the
+        // intent must not survive — a later repair would otherwise treat the failed commit as
+        // successful and delete the valid gzip primary in favor of its own decompressed raw cache.
+        renameFailRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-rename-fail-'))
+        const rawPath = path.join(renameFailRoot, '9584', id)
+        gzipPath = rawPath + '.gzip'
+        const realFs = createFsComponent()
+        let armed = false
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          rename: (async (from: any, to: any) => {
+            if (armed && String(to) === rawPath) {
+              armed = false
+              throw Object.assign(new Error('EIO: rename failed'), { code: 'EIO' })
+            }
+            return realFs.rename!(from, to)
+          }) as typeof realFs.rename
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          renameFailRoot
+        )
+        originalBytes = Buffer.from(new Uint8Array(100).fill(5))
+        await failingStorage.storeStreamAndCompress(id, bufferToStream(originalBytes))
+        // Materialize the decompressed raw cache so BOTH representations legitimately exist.
+        await failingStorage.retrieve(id, { start: 0, end: 9 })
+        armed = true
+        storeOutcome = await failingStorage.storeStream(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: Error) => error
+        )
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(renameFailRoot, { recursive: true, force: true })
+      })
+
+      it('should reject the failed store', () => {
+        expect((storeOutcome as Error).message).toContain('EIO')
+      })
+
+      it('should clear the intent so the failed commit can never be applied', async () => {
+        const entries = await nodeFs.readdir(path.join(renameFailRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => entry.endsWith('.intent'))).toEqual([])
+      })
+
+      it('should keep serving the original version after a restart', async () => {
+        const restarted = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          renameFailRoot
+        )
+        try {
+          expect(await fs.existPath(gzipPath)).toBe(true)
+          const item = await restarted.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(originalBytes)
+        } finally {
+          await restarted.stop?.()
+        }
+      })
+    })
+
+    describe('when an invalidated decompression fails to read the replaced gzip', () => {
+      let overwriteStorage: IContentStorageComponent
+      let newContent: Buffer
+      let rangeResult: Buffer | undefined
+
+      beforeEach(async () => {
+        // The overwrite invalidates the in-flight decompression AND its source stream then errors:
+        // the failure belongs to the replaced gzip, so the range request must retry against the new
+        // representation instead of surfacing a spurious undefined.
+        const realFs = createFsComponent()
+        const gzipPath = filePath + '.gzip'
+        let gatedStream: PassThrough | undefined
+        let gzipReadStarted: () => void = () => undefined
+        const gzipReadStartedPromise = new Promise<void>((res) => (gzipReadStarted = res))
+        let holdNextGzipRead = true
+        const gatedFs: IFileSystemComponent = {
+          ...realFs,
+          createReadStream: ((target: any, opts?: any) => {
+            if (String(target) !== gzipPath || !holdNextGzipRead) return realFs.createReadStream(target, opts)
+            holdNextGzipRead = false
+            gatedStream = new PassThrough()
+            gzipReadStarted()
+            return gatedStream
+          }) as typeof realFs.createReadStream
+        }
+        overwriteStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: gatedFs, logs: await createLogComponent({}) },
+          tmpRootDir
+        )
+        newContent = Buffer.from(new Uint8Array(100).fill(9))
+        await overwriteStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(7))))
+        const rangePromise = overwriteStorage.retrieve(id, { start: 0, end: 2 })
+        await gzipReadStartedPromise
+        await overwriteStorage.storeStreamAndCompress(id, bufferToStream(newContent))
+        // End the gated stream truncated: the gunzip inside the decompression pipeline fails with a
+        // genuine read error for the replaced gzip.
+        gatedStream!.end()
+        const item = await rangePromise
+        rangeResult = item ? await streamToBuffer(await item.asStream()) : undefined
+      })
+
+      afterEach(async () => {
+        await overwriteStorage.stop?.()
+      })
+
+      it('should serve the range from the new content via the retry', () => {
+        expect(rangeResult).toEqual(newContent.subarray(0, 3))
+      })
+    })
+
     describe('when reconciliation cannot remove the stale counterpart', () => {
       let mixedRoot: string
       let gzipPath: string
