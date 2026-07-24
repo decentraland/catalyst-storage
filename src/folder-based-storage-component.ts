@@ -176,35 +176,63 @@ export async function createFolderBasedFileSystemContentStorage(
   const intentPathFor = (id: string): string =>
     path.join(tempDir, `${createHash('sha1').update(id).digest('hex')}.intent`)
 
-  async function writeIntent(op: 'raw' | 'gzip', id: string): Promise<string> {
+  async function writeIntent(op: 'raw' | 'gzip', id: string, stagedPath: string): Promise<string> {
     const intentPath = intentPathFor(id)
-    await pipe(Readable.from([Buffer.from(`${op}\n${id}`)]), components.fs.createWriteStream(intentPath))
+    // The staged BASENAME lets reconciliation prove whether the commit rename landed: renames
+    // consume the staged file, so "staged still present" means the rename provably never happened.
+    // Stored as a basename (not an absolute path) so a root remount cannot poison the journal.
+    const body = JSON.stringify({ op, id, staged: path.basename(stagedPath) })
+    await pipe(Readable.from([Buffer.from(body)]), components.fs.createWriteStream(intentPath))
     return intentPath
   }
 
-  // Applies a pending intent: when both representations of its id exist, removes the stale
-  // counterpart the intent identifies, and discharges the intent once the state is consistent.
-  // THROWS when the stale counterpart cannot be removed — callers must never proceed over a mixed
-  // state, because live reads do not consult intents and would keep serving the stale
-  // representation. Used by construction-time reconciliation and by commits that find a pending
-  // intent for their id (a failed cleanup earlier in this process), so an unapplied repair
-  // instruction is never overwritten.
+  // Applies a pending intent, distinguishing the two crash windows by the staged file the intent
+  // names (reconciliation runs before the sweep, so a crashed boot's staged file is still there):
+  // - staged file present  → the rename never happened: discard the staged file and the intent; the
+  //   previous representation(s) stay untouched. A pre-rename intent can therefore NEVER delete the
+  //   previous primary (e.g. a valid gzip alongside its own decompressed raw cache).
+  // - staged gone, primary present → the rename landed: remove the stale counterpart (throwing when
+  //   it cannot be removed — live reads do not consult intents and would keep serving it), then
+  //   discharge the intent.
+  // - neither → nothing can be proven: refuse, manual repair required.
+  // Used by construction-time reconciliation and by commits that find a pending intent for their id
+  // (a failed cleanup earlier in this process), so an unapplied repair instruction is never
+  // overwritten.
   async function applyPendingIntent(intentPath: string): Promise<void> {
     const body = await components.fs.readFile(intentPath, 'utf8')
-    const separator = body.indexOf('\n')
-    const op = separator === -1 ? '' : body.slice(0, separator)
-    const id = separator === -1 ? '' : body.slice(separator + 1)
-    if ((op !== 'raw' && op !== 'gzip') || id === '') {
-      // A partial intent means its commit never started (intents are written before renames): discard.
+    let op: string, id: string, staged: string
+    try {
+      ;({ op, id, staged } = JSON.parse(body))
+    } catch {
+      op = id = staged = ''
+    }
+    if ((op !== 'raw' && op !== 'gzip') || !id || !STAGED_FILE_NAME.test(staged ?? '')) {
+      // A partial/malformed intent means its commit never started (intents are written before
+      // renames): discard it; an orphaned staged file, if any, is handled by the sweep.
       await noFailUnlink(intentPath)
+      return
+    }
+    const stagedPath = path.join(tempDir, staged)
+    if (await components.fs.existPath(stagedPath)) {
+      // Prepared but never renamed: the commit did not happen.
+      await noFailUnlink(stagedPath)
+      await noFailUnlink(intentPath)
+      logger.info(`Discarded a prepared but uncommitted ${op} transition`, { id })
       return
     }
     const filePath = await getFilePath(id)
     const gzipPath = filePath + '.gzip'
-    if ((await components.fs.existPath(filePath)) && (await components.fs.existPath(gzipPath))) {
-      const stalePath = op === 'raw' ? gzipPath : filePath
-      await noFailUnlink(stalePath)
-      if (await components.fs.existPath(stalePath)) {
+    const primaryPath = op === 'raw' ? filePath : gzipPath
+    const counterpartPath = op === 'raw' ? gzipPath : filePath
+    if (!(await components.fs.existPath(primaryPath))) {
+      throw new Error(
+        `Cannot reconcile the interrupted ${op} commit for ${id}: neither its staged file nor its committed ` +
+          `representation exists.`
+      )
+    }
+    if (await components.fs.existPath(counterpartPath)) {
+      await noFailUnlink(counterpartPath)
+      if (await components.fs.existPath(counterpartPath)) {
         throw new Error(
           `Cannot repair the interrupted ${op} commit for ${id}: its stale ${
             op === 'raw' ? 'gzip' : 'raw'
@@ -271,14 +299,17 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  if (
-    options?.decompressMaxFileSize !== undefined &&
-    (!Number.isSafeInteger(options.decompressMaxFileSize) || options.decompressMaxFileSize <= 0)
-  ) {
-    // NaN/Infinity/non-positive values would silently disable the decompression-bomb cap.
-    throw new Error(
-      `decompressMaxFileSize must be a positive safe integer, got: ${String(options.decompressMaxFileSize)}`
-    )
+  // NaN/Infinity/non-positive values would silently disable the decompression-bomb cap, or create
+  // tight eviction loops and pathological cache behavior.
+  for (const [optionName, value] of Object.entries({
+    decompressCacheTTL: options?.decompressCacheTTL,
+    decompressCacheMaxSize: options?.decompressCacheMaxSize,
+    decompressCacheEvictionInterval: options?.decompressCacheEvictionInterval,
+    decompressMaxFileSize: options?.decompressMaxFileSize
+  })) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
+      throw new Error(`${optionName} must be a positive safe integer, got: ${String(value)}`)
+    }
   }
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
   const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
@@ -342,7 +373,7 @@ export async function createFolderBasedFileSystemContentStorage(
       await applyPendingIntent(intentPathFor(id))
     }
     const hadCounterpart = await components.fs.existPath(counterpartPath)
-    const intentPath = hadCounterpart ? await writeIntent(op, id) : undefined
+    const intentPath = hadCounterpart ? await writeIntent(op, id, stagedPath) : undefined
     try {
       await rename(stagedPath, primaryPath)
     } catch (err) {

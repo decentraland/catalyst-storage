@@ -1093,7 +1093,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
           path.join(mixedRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
-          Buffer.from(`raw\n${id}`)
+          Buffer.from(JSON.stringify({ op: 'raw', id, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' }))
         )
         mixedStorage = await createFolderBasedFileSystemContentStorage(
           { fs, logs: await createLogComponent({}) },
@@ -1141,7 +1141,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
           path.join(mixedRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
-          Buffer.from(`gzip\n${id}`)
+          Buffer.from(JSON.stringify({ op: 'gzip', id, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' }))
         )
         mixedStorage = await createFolderBasedFileSystemContentStorage(
           { fs, logs: await createLogComponent({}) },
@@ -1379,7 +1379,10 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.writeFile(gzipPath, Buffer.from('stale gzip of the previous version'))
         await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
         intentPath = path.join(mixedRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
-        await nodeFs.writeFile(intentPath, Buffer.from(`raw\n${id}`))
+        await nodeFs.writeFile(
+          intentPath,
+          Buffer.from(JSON.stringify({ op: 'raw', id, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' }))
+        )
         const realFs = createFsComponent()
         let failuresLeft = 1
         const failingFs: IFileSystemComponent = {
@@ -1471,25 +1474,23 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
-    describe('when construction finds an intent for an id in a consistent state', () => {
+    describe('when construction finds an intent whose commit and cleanup both completed', () => {
       let consistentRoot: string
-      let gzipPath: string
-      let oldBytes: Buffer
+      let newBytes: Buffer
       let consistentStorage: IContentStorageComponent
 
       beforeEach(async () => {
-        // A crash after writing the intent but before the commit rename: the previous version is
-        // whole (gzip only) and must be left exactly as it is; the intent is just discharged.
+        // A crash after the rename AND the counterpart cleanup, but before the intent discharge:
+        // the state is already consistent (raw only) and must be left exactly as it is.
         consistentRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-consistent-'))
         const shardDir = path.join(consistentRoot, '9584')
         await nodeFs.mkdir(shardDir, { recursive: true })
-        oldBytes = Buffer.from(new Uint8Array(100).fill(3))
-        gzipPath = path.join(shardDir, id) + '.gzip'
-        await nodeFs.writeFile(gzipPath, gzipSync(oldBytes))
+        newBytes = Buffer.from(new Uint8Array(100).fill(3))
+        await nodeFs.writeFile(path.join(shardDir, id), newBytes)
         await nodeFs.mkdir(path.join(consistentRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
           path.join(consistentRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
-          Buffer.from(`raw\n${id}`)
+          Buffer.from(JSON.stringify({ op: 'raw', id, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' }))
         )
         consistentStorage = await createFolderBasedFileSystemContentStorage(
           { fs, logs: await createLogComponent({}) },
@@ -1502,13 +1503,73 @@ describe('fileSystemContentStorage', () => {
         rmSync(consistentRoot, { recursive: true, force: true })
       })
 
-      it('should keep the previous version untouched', async () => {
+      it('should keep the committed version untouched', async () => {
         const item = await consistentStorage.retrieve(id)
-        expect(await streamToBuffer(await item!.asStream())).toEqual(oldBytes)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(newBytes)
       })
 
       it('should discharge the intent', async () => {
         const entries = await nodeFs.readdir(path.join(consistentRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => entry.endsWith('.intent'))).toEqual([])
+      })
+    })
+
+    describe('when a commit crashed after writing the intent but before the rename', () => {
+      let crashRoot: string
+      let gzipPath: string
+      let stagedPath: string
+      let originalBytes: Buffer
+      let restartedStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The exact hazard: a gzip primary alongside its own decompressed raw cache (both exist,
+        // legitimately), plus a pre-rename intent and its staged file. The intent must NOT be
+        // applied as a completed commit — the staged file proves the rename never happened, so the
+        // valid gzip primary stays and only the staged file and intent are discarded.
+        crashRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-crash-pre-rename-'))
+        originalBytes = Buffer.from(new Uint8Array(100).fill(5))
+        const preparer = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          crashRoot
+        )
+        await preparer.storeStreamAndCompress(id, bufferToStream(originalBytes))
+        // Materialize the decompressed raw cache so BOTH representations legitimately exist.
+        await preparer.retrieve(id, { start: 0, end: 9 })
+        await preparer.stop?.()
+        gzipPath = path.join(crashRoot, '9584', id) + '.gzip'
+        const stagedName = `deadbeefdeadbeef-${'a'.repeat(32)}`
+        stagedPath = path.join(crashRoot, '.tmp-writes', stagedName)
+        await nodeFs.writeFile(stagedPath, Buffer.from('the new raw bytes that never committed'))
+        await nodeFs.writeFile(
+          path.join(crashRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
+          Buffer.from(JSON.stringify({ op: 'raw', id, staged: stagedName }))
+        )
+        restartedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          crashRoot
+        )
+      })
+
+      afterEach(async () => {
+        await restartedStorage.stop?.()
+        rmSync(crashRoot, { recursive: true, force: true })
+      })
+
+      it('should keep the valid gzip primary', async () => {
+        expect(await fs.existPath(gzipPath)).toBe(true)
+      })
+
+      it('should keep serving the previous version', async () => {
+        const item = await restartedStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(originalBytes)
+      })
+
+      it('should discard the staged file of the uncommitted transition', async () => {
+        expect(await fs.existPath(stagedPath)).toBe(false)
+      })
+
+      it('should discharge the intent', async () => {
+        const entries = await nodeFs.readdir(path.join(crashRoot, '.tmp-writes'))
         expect(entries.filter((entry) => entry.endsWith('.intent'))).toEqual([])
       })
     })
@@ -1733,8 +1794,8 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
-    describe('when decompressMaxFileSize is not a positive safe integer', () => {
-      it('should reject creating the storage', async () => {
+    describe('when a numeric cache option is not a positive safe integer', () => {
+      it('should reject a NaN decompressMaxFileSize', async () => {
         const badRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-bad-cap-'))
         try {
           await expect(
@@ -1742,7 +1803,35 @@ describe('fileSystemContentStorage', () => {
               disablePrefixHash: false,
               decompressMaxFileSize: Number.NaN
             })
-          ).rejects.toThrow(/positive safe integer/)
+          ).rejects.toThrow(/decompressMaxFileSize must be a positive safe integer/)
+        } finally {
+          rmSync(badRoot, { recursive: true, force: true })
+        }
+      })
+
+      it('should reject a non-positive decompressCacheTTL', async () => {
+        const badRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-bad-ttl-'))
+        try {
+          await expect(
+            createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, badRoot, {
+              disablePrefixHash: false,
+              decompressCacheTTL: 0
+            })
+          ).rejects.toThrow(/decompressCacheTTL must be a positive safe integer/)
+        } finally {
+          rmSync(badRoot, { recursive: true, force: true })
+        }
+      })
+
+      it('should reject an Infinity decompressCacheEvictionInterval', async () => {
+        const badRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-bad-interval-'))
+        try {
+          await expect(
+            createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, badRoot, {
+              disablePrefixHash: false,
+              decompressCacheEvictionInterval: Number.POSITIVE_INFINITY
+            })
+          ).rejects.toThrow(/decompressCacheEvictionInterval must be a positive safe integer/)
         } finally {
           rmSync(badRoot, { recursive: true, force: true })
         }
