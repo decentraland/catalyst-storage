@@ -85,9 +85,12 @@ function createSizeLimitTransform(maxBytes: number): Transform {
  *   can never leave a partial file at a canonical path. Without `rename` (legacy custom adapters)
  *   writes fall back to non-atomic direct writes; a warning is logged at construction.
  * - **Atomicity covers process crashes, NOT power-loss durability** — staged data is deliberately
- *   not `fsync`'d before the commit rename. A power loss / kernel panic between write and flush may
- *   lose the file entirely (never a partial/mixed state); content is content-addressed and
- *   re-downloadable, so durability past process death is intentionally out of contract.
+ *   not `fsync`'d before the commit rename. Against process death this is airtight (a canonical path
+ *   holds the previous file or the complete new one, never a partial). Against a power loss / kernel
+ *   panic it is not: `rename` orders metadata, so the directory entry can survive while the staged
+ *   data blocks never reached the disk, leaving the file missing, zero-length or partial. Content is
+ *   content-addressed and re-downloadable, so durability past process death is intentionally out of
+ *   contract — but consumers must detect and discard unreadable content rather than trust presence.
  * - **Reserved staging namespace** — one directory name directly under the root (default
  *   `.tmp-writes`, see {@link FolderStorageOptions.tempDirectoryName}) is reserved; ids resolving
  *   into it are rejected. With `disablePrefixHash` the factory REFUSES TO START if that directory
