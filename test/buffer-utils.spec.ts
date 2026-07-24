@@ -1,4 +1,5 @@
 import { createReadStream, readFileSync } from 'fs'
+import { Readable } from 'stream'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 
 describe('Buffer utils', () => {
@@ -31,5 +32,17 @@ describe('Buffer utils', () => {
     const b = Buffer.from(new Uint8Array(1000000).fill(0))
     const s = bufferToStream(b)
     expect(await streamToBuffer(s)).toEqual(b)
+  })
+})
+
+describe('streamToBuffer premature close', () => {
+  it('rejects when the stream is destroyed without an error before ending', async () => {
+    const stream = new Readable({ read() {} })
+    stream.push(Buffer.from('123'))
+    const pending = streamToBuffer(stream)
+
+    stream.destroy()
+
+    await expect(pending).rejects.toThrow('Stream closed before it ended.')
   })
 })

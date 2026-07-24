@@ -1,6 +1,7 @@
 import { Readable } from 'stream'
 import { clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
+import { runStoreWithSignal } from './cancellation'
 
 /**
  * @public
@@ -13,16 +14,23 @@ export function createInMemoryStorage(): IContentStorageComponent {
     return buffer ? { encoding: null, size: buffer!.length, contentSize: buffer!.length } : undefined
   }
 
+  // Shared by both store methods (this backend does not compress). The checkpoint before the commit
+  // matters for the same reason it does in the other backends: once the source is consumed,
+  // destroying it cancels nothing, so without it an abort observed during the read would still
+  // commit content for a cancelled request.
+  const storeBuffered = (fileId: string, content: Readable, signal?: AbortSignal): Promise<void> =>
+    runStoreWithSignal(content, signal, async () => {
+      const buffer = await streamToBuffer(content)
+      signal?.throwIfAborted()
+      storage.set(fileId, buffer)
+    })
+
   return {
-    async storeStreamAndCompress(fileId: string, content: Readable): Promise<void> {
-      storage.set(fileId, await streamToBuffer(content))
-    },
+    storeStreamAndCompress: storeBuffered,
     async exist(fileId: string): Promise<boolean> {
       return storage.has(fileId)
     },
-    async storeStream(fileId: string, content: Readable): Promise<void> {
-      storage.set(fileId, await streamToBuffer(content))
-    },
+    storeStream: storeBuffered,
     async delete(ids: string[]): Promise<void> {
       ids.forEach((id) => storage.delete(id))
     },

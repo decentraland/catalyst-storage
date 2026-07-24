@@ -396,3 +396,135 @@ describe('S3 Storage retrieve error logging', () => {
     expect(logger.error.mock.calls[0][1]).toMatchObject({ key: 'some-key', code: 'InternalError' })
   })
 })
+
+describe('S3 Storage upload cancellation', () => {
+  it(`When the signal aborts while the upload is in flight, then the managed upload is aborted and the call rejects with the reason`, async () => {
+    const logs = await createLogComponent({})
+    let rejectUpload: (error: Error) => void = () => undefined
+    const abort = jest.fn(() =>
+      rejectUpload(Object.assign(new Error('Request aborted by user'), { code: 'RequestAbortedError' }))
+    )
+    const upload = jest.fn(() => ({
+      promise: () =>
+        new Promise<never>((_resolve, reject) => {
+          rejectUpload = reject
+        }),
+      abort
+    }))
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+    const controller = new AbortController()
+    const reason = new Error('deployment deadline exceeded')
+
+    // Larger than the MIME-detection window so the store is genuinely mid-upload when aborted, and
+    // fully buffered by the fake SDK, so destroying the source alone could never settle the call.
+    const pending = storage.storeStream('wedged-id', bufferToStream(Buffer.alloc(5000, 1)), controller.signal)
+    while (upload.mock.calls.length === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve))
+    }
+    controller.abort(reason)
+
+    await expect(pending).rejects.toBe(reason)
+    expect(abort).toHaveBeenCalledTimes(1)
+  })
+
+  it(`When the SDK reports an aborted request the hook did not cause, then the real error surfaces`, async () => {
+    // RequestAbortedError is a public SDK shape: an SDK-internal socket teardown can produce it and
+    // merely race the caller's cancellation. Without our own abort being the cause (this double has
+    // no abort(), so the hook tears nothing down), the real failure must not be reported as the
+    // caller's cancellation reason.
+    const logs = await createLogComponent({})
+    const controller = new AbortController()
+    const sdkFault = Object.assign(new Error('Request aborted by the socket'), { code: 'RequestAbortedError' })
+    let rejectUpload: (error: Error) => void = () => undefined
+    const upload = jest.fn(() => ({
+      promise: () =>
+        new Promise<never>((_resolve, reject) => {
+          rejectUpload = reject
+        })
+      // deliberately no abort(): the teardown hook cannot tear this upload down
+    }))
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+
+    const pending = storage.storeStream('sdk-fault-id', bufferToStream(Buffer.alloc(5000, 1)), controller.signal)
+    while (upload.mock.calls.length === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve))
+    }
+    controller.abort(new Error('cancelled while the socket was failing'))
+    rejectUpload(sdkFault)
+
+    await expect(pending).rejects.toBe(sdkFault)
+  })
+
+  it(`When the upload fails and the source destroy throws, then the upload error is preserved`, async () => {
+    const logs = await createLogComponent({})
+    const uploadFault = Object.assign(new Error('AccessDenied'), { code: 'AccessDenied' })
+    let uploadRejected = false
+    const upload = jest.fn(() => ({
+      promise: async () => {
+        uploadRejected = true
+        throw uploadFault
+      },
+      abort: jest.fn()
+    }))
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+    const source = bufferToStream(Buffer.from('some content'))
+    // Throw only for the cleanup destroy after the upload failed: an unconditional override would
+    // also break the async-iterator teardown the head read performs before the upload exists.
+    const realDestroy = source.destroy.bind(source)
+    source.destroy = ((...args: unknown[]) => {
+      if (uploadRejected) {
+        throw new Error('destroy exploded')
+      }
+      return (realDestroy as (...a: unknown[]) => Readable)(...args)
+    }) as typeof source.destroy
+
+    await expect(storage.storeStream('destroy-throws-id', source)).rejects.toBe(uploadFault)
+  })
+
+  it(`When an S3-compatible abort() throws during upload creation, then the caller still sees the reason`, async () => {
+    // The manual teardown in the post-creation checkpoint must be as exception-safe as the listener's
+    // hook: a throwing abort() cannot be allowed to replace the caller's cancellation reason.
+    const logs = await createLogComponent({})
+    const controller = new AbortController()
+    const reason = new Error('cancelled during upload creation')
+    const promiseSpy = jest.fn(() => new Promise<never>(() => undefined))
+    const upload = jest.fn(() => {
+      controller.abort(reason)
+      return {
+        promise: promiseSpy,
+        abort: () => {
+          throw new Error('abort exploded')
+        }
+      }
+    })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+
+    await expect(
+      storage.storeStream('abort-throws-id', bufferToStream(Buffer.from('small')), controller.signal)
+    ).rejects.toBe(reason)
+    expect(promiseSpy).not.toHaveBeenCalled()
+  })
+
+  it(`When the signal aborts during upload creation, then the upload is torn down before it is awaited`, async () => {
+    // The abort listener can only call ManagedUpload.abort() once the upload variable is assigned:
+    // an abort firing during s3.upload(...) itself finds it undefined, and with a small source
+    // already buffered into the head, the upload would otherwise complete for a cancelled store.
+    const logs = await createLogComponent({})
+    const controller = new AbortController()
+    const reason = new Error('cancelled during upload creation')
+    const abort = jest.fn()
+    const promiseSpy = jest.fn(() => new Promise<never>(() => undefined))
+    const upload = jest.fn(() => {
+      // Fires while the caller's `upload` variable is still unassigned.
+      controller.abort(reason)
+      return { promise: promiseSpy, abort }
+    })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+
+    const pending = storage.storeStream('creation-abort-id', bufferToStream(Buffer.from('small')), controller.signal)
+
+    await expect(pending).rejects.toBe(reason)
+    expect(abort).toHaveBeenCalledTimes(1)
+    expect(promiseSpy).not.toHaveBeenCalled()
+  })
+})

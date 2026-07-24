@@ -1,0 +1,251 @@
+import { Readable } from 'stream'
+import { runStoreWithSignal } from '../src/cancellation'
+
+describe('runStoreWithSignal', () => {
+  describe('when the abort hook throws', () => {
+    let reason: Error
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // The hook runs inside the signal's event dispatch: a teardown failure must neither escape
+      // as an uncaught exception nor replace the caller's cancellation reason.
+      reason = new Error('cancelled')
+      const controller = new AbortController()
+      const source = new Readable({ read() {} })
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      const failingHook = (): void => {
+        // A hook that throws never reports tearing transport down, so the rejection it causes is
+        // shaped like what the destroyed source produces (a premature close) — provenance for that
+        // comes from the listener's own destroy, not from the hook.
+        rejectOperation(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }))
+        throw new Error('teardown exploded')
+      }
+      const pending = runStoreWithSignal(source, controller.signal, () => operation, failingHook)
+      controller.abort(reason)
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should reject with the abort reason despite the hook failure', () => {
+      expect(outcome).toBe(reason)
+    })
+  })
+
+  describe('when destroying the source throws', () => {
+    let reason: Error
+    let hookCalled: jest.Mock
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // A failing stream teardown must not prevent the backend hook from running.
+      reason = new Error('cancelled')
+      const controller = new AbortController()
+      const source = new Readable({ read() {} })
+      source.destroy = (() => {
+        throw new Error('destroy exploded')
+      }) as typeof source.destroy
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      // A real hook reports that it tore the transport down, which is what credits the resulting
+      // transport-shaped rejection to this cancellation.
+      hookCalled = jest.fn(() => {
+        rejectOperation(Object.assign(new Error('transport torn down'), { code: 'RequestAbortedError' }))
+        return true
+      })
+      const pending = runStoreWithSignal(source, controller.signal, () => operation, hookCalled)
+      controller.abort(reason)
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should still run the abort hook', () => {
+      expect(hookCalled).toHaveBeenCalled()
+    })
+
+    it('should reject with the abort reason', () => {
+      expect(outcome).toBe(reason)
+    })
+  })
+
+  describe('when a real failure races the abort', () => {
+    let diskFullError: Error
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // The operation fails for a reason the teardown did not cause (ENOSPC) while the signal
+      // aborts: the real storage error must surface as itself, not as the cancellation reason.
+      diskFullError = Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+      const controller = new AbortController()
+      const source = new Readable({ read() {} })
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      const pending = runStoreWithSignal(source, controller.signal, () => operation)
+      controller.abort(new Error('cancelled'))
+      rejectOperation(diskFullError)
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should surface the real error instead of the cancellation reason', () => {
+      expect(outcome).toBe(diskFullError)
+    })
+  })
+
+  describe('when the destroyed source rejects with a premature close', () => {
+    let reason: Error
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // The teardown-caused rejection shape (a destroyed source) IS translated to the reason.
+      reason = new Error('cancelled')
+      const controller = new AbortController()
+      const source = new Readable({ read() {} })
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      const pending = runStoreWithSignal(source, controller.signal, () => operation)
+      controller.abort(reason)
+      rejectOperation(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }))
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should reject with the cancellation reason', () => {
+      expect(outcome).toBe(reason)
+    })
+  })
+
+  describe('when the source closed prematurely on its own before the abort', () => {
+    let upstreamFault: Error
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // The source died for a real upstream fault BEFORE the abort fired: the teardown destroyed
+      // nothing, so the premature-close failure belongs to that fault and must surface as itself —
+      // the public ERR_STREAM_PREMATURE_CLOSE shape alone is not proof of our teardown.
+      upstreamFault = Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' })
+      const controller = new AbortController()
+      const source = new Readable({ read() {} })
+      source.destroy()
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      const pending = runStoreWithSignal(source, controller.signal, () => operation)
+      controller.abort(new Error('cancelled'))
+      rejectOperation(upstreamFault)
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should surface the upstream fault instead of the cancellation reason', () => {
+      expect(outcome).toBe(upstreamFault)
+    })
+  })
+
+  describe('when the source had already ended but was not yet destroyed', () => {
+    let prematureClose: Error
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // An ended-but-undestroyed source (reachable with autoDestroy: false, or in the tick before an
+      // auto-destroy lands) cannot be made to close prematurely by our teardown — the consumer
+      // already got its 'end'. So a premature-close rejection here belongs to something else and
+      // must surface as itself, even though the teardown did call destroy() as cleanup.
+      prematureClose = Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' })
+      const source = new Readable({ read() {}, autoDestroy: false })
+      source.push(Buffer.from('fully-read'))
+      source.push(null)
+      source.resume()
+      await new Promise<void>((resolve) => source.once('end', () => resolve()))
+      expect(source.readableEnded).toBe(true)
+      expect(source.destroyed).toBe(false)
+
+      const controller = new AbortController()
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      const pending = runStoreWithSignal(source, controller.signal, () => operation)
+      controller.abort(new Error('cancelled'))
+      rejectOperation(prematureClose)
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should surface the premature close instead of the cancellation reason', () => {
+      expect(outcome).toBe(prematureClose)
+    })
+  })
+
+  describe('when an operation raises an abort-shaped error of its own', () => {
+    let foreignAbortError: Error
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // A custom stream or transport can raise an AbortError for reasons of its own that merely
+      // coincide with the caller's cancellation. Nothing here handed it this signal, so the shape
+      // alone must not earn translation — the caller needs to see the real failure.
+      foreignAbortError = Object.assign(new Error('The custom transport aborted internally'), {
+        name: 'AbortError',
+        code: 'ABORT_ERR'
+      })
+      const controller = new AbortController()
+      const source = new Readable({ read() {} })
+      let rejectOperation: (error: Error) => void = () => undefined
+      const operation = new Promise<never>((_, reject) => {
+        rejectOperation = reject
+      })
+      const pending = runStoreWithSignal(source, controller.signal, () => operation)
+      controller.abort(new Error('cancelled'))
+      rejectOperation(foreignAbortError)
+      outcome = await pending.then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should surface the foreign abort error instead of the cancellation reason', () => {
+      expect(outcome).toBe(foreignAbortError)
+    })
+  })
+
+  describe('when the abort reason is an explicit null', () => {
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // The docs promise the caller observes their own cancellation cause — including null.
+      const controller = new AbortController()
+      controller.abort(null)
+      const source = new Readable({ read() {} })
+      outcome = await runStoreWithSignal(source, controller.signal, () => new Promise<never>(() => undefined)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should reject with null instead of a synthesized error', () => {
+      expect(outcome).toBe(null)
+    })
+  })
+})
