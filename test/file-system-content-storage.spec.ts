@@ -1034,18 +1034,59 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
-    describe('when a flat-mode deployment holds a staged-shaped legacy id under the reserved directory', () => {
+    describe('when a flat-mode deployment holds legacy content under the reserved directory', () => {
       let flatRoot: string
       let legacyStagedShapedPath: string
-      let flatStorage: IContentStorageComponent
+      let constructionError: Error | undefined
 
       beforeEach(async () => {
-        // The directory pre-exists with content BEFORE the storage ever runs, so ownership is never
-        // claimed and the sweep must not run — even though the filename matches the staged shape.
+        // The directory pre-exists with content BEFORE the storage ever runs, so ownership cannot
+        // be proven — even a filename matching the staged shape may be a legacy content id. The
+        // factory must refuse to start rather than silently hide (or delete) that content.
         flatRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-flat-legacy-'))
         await nodeFs.mkdir(path.join(flatRoot, '.tmp-writes'), { recursive: true })
         legacyStagedShapedPath = path.join(flatRoot, '.tmp-writes', 'deadbeefdeadbeef-0123456789abcdef0123456789abcdef')
         await nodeFs.writeFile(legacyStagedShapedPath, Buffer.from('legacy'))
+        constructionError = undefined
+        try {
+          await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, flatRoot, {
+            disablePrefixHash: true
+          })
+        } catch (error: any) {
+          constructionError = error
+        }
+      })
+
+      afterEach(async () => {
+        rmSync(flatRoot, { recursive: true, force: true })
+      })
+
+      it('should refuse to start with an actionable message', () => {
+        expect(constructionError?.message).toContain('Refusing to start')
+      })
+
+      it('should point the operator at the migration options', () => {
+        expect(constructionError?.message).toContain('tempDirectoryName')
+      })
+
+      it('should leave the legacy file untouched', async () => {
+        expect(await fs.existPath(legacyStagedShapedPath)).toBe(true)
+      })
+    })
+
+    describe('when a flat-mode root has a previously claimed temp directory', () => {
+      let flatRoot: string
+      let orphanPath: string
+      let flatStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The ownership marker from an earlier run proves the directory is ours, so construction
+        // succeeds and the sweep may remove foreign staged-shape leftovers.
+        flatRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-flat-owned-'))
+        await nodeFs.mkdir(path.join(flatRoot, '.tmp-writes'), { recursive: true })
+        await nodeFs.writeFile(path.join(flatRoot, '.tmp-writes', '.owned-by-catalyst-storage'), Buffer.from(''))
+        orphanPath = path.join(flatRoot, '.tmp-writes', 'deadbeefdeadbeef-0123456789abcdef0123456789abcdef')
+        await nodeFs.writeFile(orphanPath, Buffer.from(''))
         flatStorage = await createFolderBasedFileSystemContentStorage(
           { fs, logs: await createLogComponent({}) },
           flatRoot,
@@ -1059,8 +1100,37 @@ describe('fileSystemContentStorage', () => {
         rmSync(flatRoot, { recursive: true, force: true })
       })
 
-      it('should not delete the staged-shaped legacy file', async () => {
-        expect(await fs.existPath(legacyStagedShapedPath)).toBe(true)
+      it('should sweep the foreign staged-shape leftover', async () => {
+        expect(await fs.existPath(orphanPath)).toBe(false)
+      })
+    })
+
+    describe('when the fs component lacks rename at construction', () => {
+      let warnings: string[]
+
+      beforeEach(async () => {
+        warnings = []
+        const recordingLogs = {
+          getLogger: () => ({
+            log: () => undefined,
+            debug: () => undefined,
+            info: () => undefined,
+            warn: (message: string) => {
+              warnings.push(message)
+            },
+            error: () => undefined
+          })
+        }
+        const fsWithoutRename: IFileSystemComponent = { ...createFsComponent(), rename: undefined }
+        const storage = await createFolderBasedFileSystemContentStorage(
+          { fs: fsWithoutRename, logs: recordingLogs as any },
+          tmpRootDir
+        )
+        await storage.stop?.()
+      })
+
+      it('should warn that writes are not crash-atomic', () => {
+        expect(warnings.some((message) => message.includes('NOT be crash-atomic'))).toBe(true)
       })
     })
 

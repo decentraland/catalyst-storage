@@ -14,3 +14,11 @@ The Catalyst Storage Library provides multiple implementations to handle file st
 - S3 Storage: Store and retrieve content from AWS S3 buckets.
 - Folder-based Storage: Local file storage on disk.
 - In-memory Storage: Temporary storage for testing or lightweight operations.
+
+## Folder-based storage: operational contract
+
+The folder-based storage stages writes through a reserved directory to make them crash-atomic. This comes with three explicit rules:
+
+- **One live instance per storage root.** In-memory coordination (path locks, decompress-cache tracking, staged-write ownership) is per-instance; two instances sharing a root can delete each other's staged files and race their caches. Shared roots are not supported.
+- **Crash-atomic writes require `rename` on the filesystem component.** The bundled `createFsComponent` provides it. Custom adapters without `rename` keep working through the legacy non-atomic direct write, and a warning is logged at construction — callers relying on atomicity should treat `rename` as a required capability.
+- **One directory name under the root is reserved** (default `.tmp-writes`, configurable via `tempDirectoryName`). Ids resolving into it are rejected. With `disablePrefixHash` (flat mode) the root is the content namespace, so the factory **refuses to start** if the reserved directory pre-exists with content it cannot prove it owns — pre-existing ids there would otherwise become silently unreachable after an upgrade. To resolve: migrate those files out, configure a different `tempDirectoryName`, or restore the ownership marker if they are staging leftovers from a previous run.

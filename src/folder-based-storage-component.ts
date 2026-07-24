@@ -73,6 +73,23 @@ function createSizeLimitTransform(maxBytes: number): Transform {
 }
 
 /**
+ * Filesystem-backed content storage.
+ *
+ * Operational contract:
+ * - **Exclusive root ownership** — a storage root must be owned by exactly one live storage
+ *   instance. In-memory state (path locks, decompress-cache tracking, staged-write ownership) is
+ *   per-instance; two instances over one root can delete each other's staged files and race their
+ *   caches. Shared roots are not supported.
+ * - **Crash-atomic writes require `fs.rename`** — when the filesystem component provides `rename`,
+ *   every write stages into a reserved directory and renames into place, so an interrupted write
+ *   can never leave a partial file at a canonical path. Without `rename` (legacy custom adapters)
+ *   writes fall back to non-atomic direct writes; a warning is logged at construction.
+ * - **Reserved staging namespace** — one directory name directly under the root (default
+ *   `.tmp-writes`, see {@link FolderStorageOptions.tempDirectoryName}) is reserved; ids resolving
+ *   into it are rejected. With `disablePrefixHash` the factory REFUSES TO START if that directory
+ *   pre-exists with content it cannot prove it owns, so an upgrade can never silently hide
+ *   pre-existing addressable content.
+ *
  * @public
  */
 export async function createFolderBasedFileSystemContentStorage(
@@ -117,37 +134,42 @@ export async function createFolderBasedFileSystemContentStorage(
   // ownership must be established explicitly: a marker written by us, or a directory found empty
   // (claimed by writing the marker). A pre-existing non-empty, unmarked flat-mode dir is never
   // swept; its files are preserved and surfaced via the warning below.
+  // Construction invariant: the storage never runs in a state where the reserved staging namespace
+  // could hide addressable content. With hash prefixes, ids can never resolve into the reserved dir
+  // (containment sends them under a shard), so everything inside is ours by construction. In flat
+  // (disablePrefixHash) mode the root IS the content namespace, so ownership must be proven: a
+  // marker written by this storage, or a directory found empty and claimed by writing the marker.
+  // Anything else — a pre-existing unmarked directory with content, or a failure to establish
+  // ownership — REFUSES TO START instead of warning-and-hiding: pre-existing ids under the reserved
+  // name would otherwise be silently unreachable through retrieve()/exist()/allFileIds() after an
+  // upgrade. This also means the orphan sweep never needs a runtime ownership check.
   const OWNERSHIP_MARKER = '.owned-by-catalyst-storage'
-  let sweepAllowed = USE_HASH_PREFIX
   if (!USE_HASH_PREFIX) {
     const markerPath = path.join(tempDir, OWNERSHIP_MARKER)
-    if (await components.fs.existPath(markerPath)) {
-      sweepAllowed = true
-    } else {
-      try {
-        const entries = await components.fs.readdir(tempDir)
-        if (entries.length === 0) {
-          await pipe(
-            Readable.from([Buffer.from('reserved by catalyst-storage for atomic write staging\n')]),
-            components.fs.createWriteStream(markerPath)
-          )
-          sweepAllowed = true
-        } else {
-          // In flat mode the root is the content namespace, so a deployment that predates the
-          // reservation may hold content ids under the reserved directory. They are preserved (the
-          // sweep is disabled without ownership) but are not addressable while the reservation
-          // holds — surface them loudly so the operator can migrate them or pick a different
-          // tempDirectoryName.
-          logger.warn(
-            `Found ${entries.length} pre-existing file(s) under the reserved temp directory '${tempDirName}'. ` +
-              `They are preserved on disk (the orphan sweep stays disabled) but are not addressable as content ids; ` +
-              `migrate them out or configure a different tempDirectoryName.`
-          )
-        }
-      } catch {
-        // best-effort: ownership could not be established, so the sweep stays disabled
+    if (!(await components.fs.existPath(markerPath))) {
+      const entries = await components.fs.readdir(tempDir)
+      if (entries.length > 0) {
+        throw new Error(
+          `Refusing to start: the reserved temp directory '${tempDirName}' under the storage root already contains ` +
+            `${entries.length} file(s) that this storage cannot prove it owns. In disablePrefixHash mode these may be ` +
+            `pre-existing content ids that the reservation would hide from retrieval and enumeration. ` +
+            `Migrate them out of '${tempDirName}', configure a different tempDirectoryName, or restore the ` +
+            `'${OWNERSHIP_MARKER}' marker if they are staging leftovers from a previous run.`
+        )
       }
+      await pipe(
+        Readable.from([Buffer.from('reserved by catalyst-storage for atomic write staging\n')]),
+        components.fs.createWriteStream(markerPath)
+      )
     }
+  }
+
+  // Make the degraded compatibility mode visible: without `rename` on the fs component every write
+  // falls back to the legacy non-atomic direct write (see IFileSystemComponent.rename).
+  if (!components.fs.rename) {
+    logger.warn(
+      'The filesystem component does not provide rename: writes will NOT be crash-atomic (legacy direct-write mode).'
+    )
   }
   const CACHE_TTL = options?.decompressCacheTTL ?? ONE_HOUR_IN_MS
   const CACHE_MAX_SIZE = options?.decompressCacheMaxSize ?? FIVE_GB_IN_BYTES
@@ -612,10 +634,8 @@ export async function createFolderBasedFileSystemContentStorage(
   // leftover of an earlier process — a write racing this sweep stages under the current bootId and
   // is never touched. Best-effort: a missing dir or a failed unlink is ignored.
   const sweepOrphanedTempFiles = async (): Promise<number> => {
-    // Never delete anything in a directory whose ownership was not established (see the
-    // OWNERSHIP_MARKER logic above): flat-mode legacy content could coincidentally match the
-    // staged-name shape.
-    if (!sweepAllowed) return 0
+    // Ownership of the reserved dir is a construction invariant (see the OWNERSHIP_MARKER logic in
+    // the factory): if this storage is running, everything staged-shaped in there is ours.
     let entries: string[]
     try {
       entries = await components.fs.readdir(tempDir)
