@@ -22,6 +22,8 @@ export function createFsComponent(): IFileSystemComponent {
     opendir: fsPromises.opendir,
     stat: fsPromises.stat,
     unlink: fsPromises.unlink,
+    rename: fsPromises.rename,
+    lstat: fsPromises.lstat,
     mkdir: fsPromises.mkdir,
     readdir: fsPromises.readdir,
     readFile: fsPromises.readFile,

@@ -20,9 +20,16 @@ export type CompressionResult = {
  */
 export async function compressContentFile(
   contentFilePath: string,
-  logger?: ILoggerComponent.ILogger
+  logger?: ILoggerComponent.ILogger,
+  output?: string
 ): Promise<boolean> {
-  const result = await gzipCompressFile(contentFilePath, contentFilePath + '.gzip', logger)
+  // NOTE: compression operates through native node `fs` on LOCAL filesystem paths, not through the
+  // injected IFileSystemComponent — custom adapters that virtualize paths get atomic raw writes but
+  // must not rely on storeStreamAndCompress unless their paths are real local files.
+  // `output` lets callers stage the compressed file elsewhere (e.g. a temp dir) and rename it into
+  // place themselves, so a process killed mid-compression cannot leave a partial .gzip at the
+  // canonical path. Defaults to the in-place `<contentFilePath>.gzip` for backward compatibility.
+  const result = await gzipCompressFile(contentFilePath, output ?? contentFilePath + '.gzip', logger)
   return !!result
 }
 

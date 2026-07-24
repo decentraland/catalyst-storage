@@ -48,6 +48,11 @@ export type FileInfo = {
  * Validates that a range is well-formed (start >= 0 and start <= end).
  */
 export function validateRange(range: { start: number; end: number }): void {
+  // Safe integers only: NaN/Infinity/fractional bounds would otherwise surface as low-level stream
+  // errors or an invalid ContentItem.size instead of a clear RangeError.
+  if (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)) {
+    throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
+  }
   if (range.start < 0 || range.start > range.end) {
     throw new RangeError(`Invalid range: start=${range.start}, end=${range.end}`)
   }
