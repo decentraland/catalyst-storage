@@ -14,6 +14,36 @@ describe('compressContentFile', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
+  describe('when the signal is already aborted', () => {
+    let input: string
+    let outcome: 'resolved' | unknown
+
+    beforeEach(async () => {
+      // The signal reaches the read→gzip→write pipeline itself: an abort tears the streams down
+      // instead of letting the compression run to completion for a cancelled request.
+      input = path.join(dir, 'aborted-compressible')
+      await nodeFs.writeFile(input, Buffer.alloc(100000, 0))
+      const controller = new AbortController()
+      controller.abort()
+      outcome = await compressContentFile(input, undefined, undefined, controller.signal).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should reject with an abort error', () => {
+      expect((outcome as Error).name).toBe('AbortError')
+    })
+
+    it('should remove the partial output', () => {
+      expect(existsSync(input + '.gzip')).toBe(false)
+    })
+
+    it('should leave the input intact', async () => {
+      expect((await nodeFs.stat(input)).size).toBe(100000)
+    })
+  })
+
   it(`When the content compresses well, then a .gzip is produced`, async () => {
     const input = path.join(dir, 'compressible')
     await nodeFs.writeFile(input, Buffer.alloc(1000, 0))

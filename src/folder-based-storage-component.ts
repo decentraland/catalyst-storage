@@ -4,7 +4,7 @@ import { pipeline, Readable, Transform } from 'stream'
 import { promisify } from 'util'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
-import { runStoreWithSignal } from './cancellation'
+import { markAsNonCancellationError, runStoreWithSignal } from './cancellation'
 import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
@@ -505,6 +505,25 @@ export async function createFolderBasedFileSystemContentStorage(
     counterpartPath: string,
     rename: (from: string, to: string) => Promise<void>
   ): Promise<void> {
+    try {
+      await doCommitRepresentation(op, id, stagedPath, primaryPath, counterpartPath, rename)
+    } catch (err) {
+      // Nothing inside the commit phase can be caused by abort teardown (the source is fully
+      // consumed before any commit begins, and the folder backend has no abort hook), so every
+      // failure here — pending-intent repair, journal write, rename, counterpart cleanup,
+      // quarantine — is a real storage error that cancellation translation must never mask.
+      throw markAsNonCancellationError(err)
+    }
+  }
+
+  async function doCommitRepresentation(
+    op: 'raw' | 'gzip',
+    id: string,
+    stagedPath: string,
+    primaryPath: string,
+    counterpartPath: string,
+    rename: (from: string, to: string) => Promise<void>
+  ): Promise<void> {
     // A pending intent means a previous commit for this id failed its cleanup in this process:
     // repair first (throws if impossible), so the intent written below always describes a
     // transition from a consistent state and never overwrites an unapplied repair instruction.
@@ -582,9 +601,12 @@ export async function createFolderBasedFileSystemContentStorage(
       await pipe(stream, components.fs.createWriteStream(filePath))
       await noFailUnlink(filePath + '.gzip')
       if (await existsForInvariant(filePath + '.gzip')) {
-        throw new Error(
-          `Failed to remove the previous gzip representation of ${id}; the in-place store was rolled back ` +
-            `and reads keep serving the previous version.`
+        // A post-write invariant failure, never abort-caused: keep it visible past cancellation.
+        throw markAsNonCancellationError(
+          new Error(
+            `Failed to remove the previous gzip representation of ${id}; the in-place store was rolled back ` +
+              `and reads keep serving the previous version.`
+          )
         )
       }
       forgetCacheEntry(filePath)
@@ -1104,11 +1126,23 @@ export async function createFolderBasedFileSystemContentStorage(
         await writeRawInPlaceLocked(id, filePath, stream, signal)
         // An abort observed here arrives after the in-place raw was committed (the previous version
         // is already gone): the store is complete and allowed to succeed, but the optional
-        // compression is skipped rather than doing further expensive work for a cancelled request.
-        if (!signal?.aborted && (await compressContentFile(filePath, logger))) {
-          // The in-place compression succeeded: the gzip exists at its canonical path and, under
-          // the lock, the raw is provably still the bytes that were compressed.
-          await noFailUnlink(filePath)
+        // compression is skipped — or torn down mid-flight via the signal — rather than doing
+        // further expensive work for a cancelled request.
+        if (!signal?.aborted) {
+          let compressed = false
+          try {
+            compressed = await compressContentFile(filePath, logger, undefined, signal)
+          } catch (err) {
+            // An abort-caused pipeline teardown is not a failure of this (already completed) store:
+            // the partial canonical gzip was removed by the compression's own cleanup and the raw
+            // stays primary. Genuine compression failures still propagate as before.
+            if (!signal?.aborted) throw err
+          }
+          if (compressed) {
+            // The in-place compression succeeded: the gzip exists at its canonical path and, under
+            // the lock, the raw is provably still the bytes that were compressed.
+            await noFailUnlink(filePath)
+          }
         }
       })
       return
@@ -1130,7 +1164,10 @@ export async function createFolderBasedFileSystemContentStorage(
       // object. Nothing has touched the canonical paths yet — the finally below removes the staged
       // residue and the previous version stays fully intact.
       signal?.throwIfAborted()
-      const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath)
+      // The signal also aborts the compression pipeline itself mid-flight (its partial staged
+      // output is removed before the rejection propagates), so a cancelled request stops paying
+      // CPU/disk immediately instead of only at the next checkpoint.
+      const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath, signal)
       signal?.throwIfAborted()
       await withPathLock(filePath, async () => {
         // Re-check INSIDE the lock: an abort landing while this store was queued on the path lock

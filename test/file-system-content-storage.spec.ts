@@ -1076,6 +1076,61 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the signal aborts while the commit itself fails', () => {
+      let maskingRoot: string
+      let reason: Error
+      let storeOutcome: 'resolved' | unknown
+      let failingStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The abort lands DURING an irreversible commit whose counterpart cleanup fails: the
+        // resulting committed-but-unreconciled error (quarantine) is a real storage failure that
+        // operators need to see — the cancellation translation must not mask it behind the abort
+        // reason.
+        maskingRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-abort-masking-'))
+        const gzipPath = path.join(maskingRoot, '9584', id) + '.gzip'
+        const realFs = createFsComponent()
+        const controller = new AbortController()
+        reason = new Error('cancelled during the commit')
+        let armed = false
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          unlink: (async (target: any) => {
+            if (armed && String(target) === gzipPath) {
+              armed = false
+              // The abort arrives exactly while the commit's counterpart cleanup is failing.
+              controller.abort(reason)
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          maskingRoot
+        )
+        await failingStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(5))))
+        armed = true
+        storeOutcome = await failingStorage.storeStream(id, bufferToStream(content), controller.signal).then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(maskingRoot, { recursive: true, force: true })
+      })
+
+      it('should surface the quarantine error instead of the abort reason', () => {
+        expect((storeOutcome as Error).message).toContain('quarantined')
+      })
+
+      it('should not reject with the cancellation reason', () => {
+        expect(storeOutcome).not.toBe(reason)
+      })
+    })
+
     describe('when the signal aborts while the store is queued on the path lock', () => {
       let lockRoot: string
       let firstWriterBytes: Buffer
@@ -3335,6 +3390,43 @@ describe('fileSystemContentStorage', () => {
         it('should keep the previous version intact', async () => {
           const item = await storageWithoutRename.retrieve(id2)
           expect(await streamToBuffer(await item!.asStream())).toEqual(previousBytes)
+        })
+      })
+
+      describe('and the signal tears the compression down after the in-place raw commit', () => {
+        let rawBytes: Buffer
+        let compressSpy: jest.SpyInstance
+        let storeOutcome: 'resolved' | unknown
+
+        beforeEach(async () => {
+          // The abort tears the compression pipeline down mid-flight — but the in-place raw commit
+          // already completed, so the store must resolve with the raw as primary instead of
+          // rejecting an already-completed store.
+          rawBytes = Buffer.from(new Uint8Array(64).fill(9))
+          const controller = new AbortController()
+          compressSpy = jest.spyOn(compressionModule, 'compressContentFile').mockImplementationOnce(async () => {
+            controller.abort(new Error('cancelled mid-compression'))
+            throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
+          })
+          storeOutcome = await storageWithoutRename
+            .storeStreamAndCompress(id2, bufferToStream(rawBytes), controller.signal)
+            .then(
+              () => 'resolved' as const,
+              (error: unknown) => error
+            )
+        })
+
+        afterEach(() => {
+          compressSpy.mockRestore()
+        })
+
+        it('should treat the store as completed', () => {
+          expect(storeOutcome).toBe('resolved')
+        })
+
+        it('should keep the raw as the primary representation', async () => {
+          const item = await storageWithoutRename.retrieve(id2)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(rawBytes)
         })
       })
 

@@ -1,11 +1,9 @@
 import destroy from 'destroy'
 import * as fs from 'fs'
 import * as path from 'path'
-import { pipeline } from 'stream'
-import { promisify } from 'util'
+import { pipeline } from 'stream/promises'
 import { createGzip } from 'zlib'
 import { ILoggerComponent } from '@well-known-components/interfaces'
-const pipe = promisify(pipeline)
 
 /**
  * @public
@@ -21,7 +19,8 @@ export type CompressionResult = {
 export async function compressContentFile(
   contentFilePath: string,
   logger?: ILoggerComponent.ILogger,
-  output?: string
+  output?: string,
+  signal?: AbortSignal
 ): Promise<boolean> {
   // NOTE: compression operates through native node `fs` on LOCAL filesystem paths, not through the
   // injected IFileSystemComponent — custom adapters that virtualize paths get atomic raw writes but
@@ -29,7 +28,10 @@ export async function compressContentFile(
   // `output` lets callers stage the compressed file elsewhere (e.g. a temp dir) and rename it into
   // place themselves, so a process killed mid-compression cannot leave a partial .gzip at the
   // canonical path. Defaults to the in-place `<contentFilePath>.gzip` for backward compatibility.
-  const result = await gzipCompressFile(contentFilePath, output ?? contentFilePath + '.gzip', logger)
+  // `signal` aborts the read→gzip→write pipeline mid-flight (tearing its streams down) instead of
+  // letting a cancelled request keep paying CPU/disk until the compression completes; the partial
+  // output is removed before the rejection propagates.
+  const result = await gzipCompressFile(contentFilePath, output ?? contentFilePath + '.gzip', logger, signal)
   return !!result
 }
 
@@ -50,7 +52,8 @@ async function removeOutput(output: string, reason: string, logger?: ILoggerComp
 async function gzipCompressFile(
   input: string,
   output: string,
-  logger?: ILoggerComponent.ILogger
+  logger?: ILoggerComponent.ILogger,
+  signal?: AbortSignal
 ): Promise<CompressionResult | null> {
   if (path.resolve(input) === path.resolve(output)) {
     throw new Error("Can't compress a file using src==dst")
@@ -61,7 +64,13 @@ async function gzipCompressFile(
 
   try {
     try {
-      await pipe(source, gzip, destination)
+      // This @types/node version requires `signal` in PipelineOptions, so branch instead of
+      // passing an options object without one.
+      if (signal) {
+        await pipeline(source, gzip, destination, { signal })
+      } else {
+        await pipeline(source, gzip, destination)
+      }
     } finally {
       destroy(source)
       destroy(destination)

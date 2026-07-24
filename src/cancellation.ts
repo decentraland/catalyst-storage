@@ -1,5 +1,31 @@
 import { Readable } from 'stream'
 
+const NON_CANCELLATION_ERROR = Symbol('nonCancellationError')
+
+/**
+ * Marks an error as NOT being a consequence of cancellation, so `runStoreWithSignal` surfaces it
+ * as-is even when the signal has aborted. Backends use this for irreversible commit/cleanup-phase
+ * failures (e.g. a committed-but-unreconciled storage state): those are never caused by abort
+ * teardown — the source is fully consumed before the commit begins — and masking them behind the
+ * cancellation reason would hide the repair/quarantine signal from callers and operators.
+ * The marker preserves the error's identity and class, only tagging it.
+ */
+export function markAsNonCancellationError<T>(error: T): T {
+  if (error !== null && typeof error === 'object') {
+    try {
+      Object.defineProperty(error, NON_CANCELLATION_ERROR, { value: true, enumerable: false })
+    } catch {
+      // A frozen/sealed error cannot be tagged; it may then be translated on abort — acceptable
+      // degradation, and no storage code throws frozen errors.
+    }
+  }
+  return error
+}
+
+function isNonCancellationError(error: unknown): boolean {
+  return error !== null && typeof error === 'object' && NON_CANCELLATION_ERROR in error
+}
+
 function abortReasonOf(signal: AbortSignal): unknown {
   // `??` would also replace an explicit `null` abort reason; the caller must observe their own
   // cancellation cause, so only default when no reason was provided at all.
@@ -56,7 +82,10 @@ export async function runStoreWithSignal<T>(
   try {
     return await operation()
   } catch (error) {
-    throw signal.aborted ? abortReasonOf(signal) : error
+    // Translate teardown-caused rejections (destroyed source, aborted transport) to the caller's
+    // cancellation reason — but NEVER errors marked as commit/cleanup-phase failures: those carry
+    // repair/quarantine information that the abort did not cause and must not hide.
+    throw signal.aborted && !isNonCancellationError(error) ? abortReasonOf(signal) : error
   } finally {
     signal.removeEventListener('abort', abort)
   }
