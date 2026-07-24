@@ -1129,6 +1129,70 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the signal aborts during the pre-rename work inside the commit', () => {
+      let preRenameRoot: string
+      let previousBytes: Buffer
+      let reason: Error
+      let storeOutcome: 'resolved' | unknown
+      let preRenameStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The abort lands while the commit is journaling its intent — after every earlier
+        // checkpoint, with the source long consumed. The commit must still cancel before the
+        // irreversible rename, discarding the just-written journal so no repair can ever apply it.
+        preRenameRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-pre-rename-abort-'))
+        const realFs = createFsComponent()
+        const controller = new AbortController()
+        reason = new Error('cancelled while the intent was being journaled')
+        const abortingFs: IFileSystemComponent = {
+          ...realFs,
+          createWriteStream: ((target: any, opts?: any) => {
+            if (String(target).endsWith('.intent')) {
+              controller.abort(reason)
+            }
+            return realFs.createWriteStream(target, opts)
+          }) as typeof realFs.createWriteStream
+        }
+        preRenameStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: abortingFs, logs: await createLogComponent({}) },
+          preRenameRoot
+        )
+        // A gzip primary, so the raw commit below has a counterpart and journals an intent.
+        previousBytes = Buffer.from(new Uint8Array(100).fill(5))
+        await preRenameStorage.storeStreamAndCompress(id, bufferToStream(previousBytes))
+        storeOutcome = await preRenameStorage.storeStream(id, bufferToStream(content), controller.signal).then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
+      })
+
+      afterEach(async () => {
+        await preRenameStorage.stop?.()
+        rmSync(preRenameRoot, { recursive: true, force: true })
+      })
+
+      it('should reject with the abort reason instead of committing', () => {
+        expect(storeOutcome).toBe(reason)
+      })
+
+      it('should keep serving the previous version', async () => {
+        const item = await preRenameStorage.retrieve(id)
+        expect(await streamToBuffer(await item!.asStream())).toEqual(previousBytes)
+      })
+
+      it('should discard the just-written intent so no repair can apply it', async () => {
+        const entries = await nodeFs.readdir(path.join(preRenameRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => entry.endsWith('.intent'))).toEqual([])
+      })
+
+      it('should leave no staged residue', async () => {
+        const staged = (await nodeFs.readdir(path.join(preRenameRoot, '.tmp-writes'))).filter((entry) =>
+          /^[0-9a-f]{16}-[0-9a-f]{32}$/.test(entry)
+        )
+        expect(staged).toEqual([])
+      })
+    })
+
     describe('when the signal aborts while the commit itself fails', () => {
       let maskingRoot: string
       let reason: Error

@@ -426,4 +426,27 @@ describe('S3 Storage upload cancellation', () => {
     await expect(pending).rejects.toBe(reason)
     expect(abort).toHaveBeenCalledTimes(1)
   })
+
+  it(`When the signal aborts during upload creation, then the upload is torn down before it is awaited`, async () => {
+    // The abort listener can only call ManagedUpload.abort() once the upload variable is assigned:
+    // an abort firing during s3.upload(...) itself finds it undefined, and with a small source
+    // already buffered into the head, the upload would otherwise complete for a cancelled store.
+    const logs = await createLogComponent({})
+    const controller = new AbortController()
+    const reason = new Error('cancelled during upload creation')
+    const abort = jest.fn()
+    const promiseSpy = jest.fn(() => new Promise<never>(() => undefined))
+    const upload = jest.fn(() => {
+      // Fires while the caller's `upload` variable is still unassigned.
+      controller.abort(reason)
+      return { promise: promiseSpy, abort }
+    })
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, { upload } as any, { Bucket: 'example' })
+
+    const pending = storage.storeStream('creation-abort-id', bufferToStream(Buffer.from('small')), controller.signal)
+
+    await expect(pending).rejects.toBe(reason)
+    expect(abort).toHaveBeenCalledTimes(1)
+    expect(promiseSpy).not.toHaveBeenCalled()
+  })
 })

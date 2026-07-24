@@ -139,6 +139,15 @@ export async function createS3BasedFileSystemContentStorage(
           Body: body,
           ContentType: mimeType
         })
+        // The abort listener can only tear the upload down once `upload` is assigned: an abort
+        // landing before this point found `upload` undefined and did nothing, and — with a small
+        // source already fully buffered into the head — the upload no longer needs the source, so
+        // it would complete and commit content for an already-cancelled store. Re-check here, where
+        // the ManagedUpload provably exists, and tear it down ourselves.
+        if (signal?.aborted) {
+          upload.abort?.()
+          signal.throwIfAborted()
+        }
         try {
           await upload.promise()
         } catch (error) {

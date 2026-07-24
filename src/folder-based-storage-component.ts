@@ -503,10 +503,11 @@ export async function createFolderBasedFileSystemContentStorage(
     stagedPath: string,
     primaryPath: string,
     counterpartPath: string,
-    rename: (from: string, to: string) => Promise<void>
+    rename: (from: string, to: string) => Promise<void>,
+    signal?: AbortSignal
   ): Promise<void> {
     try {
-      await doCommitRepresentation(op, id, stagedPath, primaryPath, counterpartPath, rename)
+      await doCommitRepresentation(op, id, stagedPath, primaryPath, counterpartPath, rename, signal)
     } catch (err) {
       // Nothing inside the commit phase can be caused by abort teardown (the source is fully
       // consumed before any commit begins, and the folder backend has no abort hook), so every
@@ -522,7 +523,8 @@ export async function createFolderBasedFileSystemContentStorage(
     stagedPath: string,
     primaryPath: string,
     counterpartPath: string,
-    rename: (from: string, to: string) => Promise<void>
+    rename: (from: string, to: string) => Promise<void>,
+    signal?: AbortSignal
   ): Promise<void> {
     // A pending intent means a previous commit for this id failed its cleanup in this process:
     // repair first (throws if impossible), so the intent written below always describes a
@@ -530,8 +532,21 @@ export async function createFolderBasedFileSystemContentStorage(
     if (await existsForInvariant(intentPathFor(id))) {
       await applyPendingIntent(intentPathFor(id))
     }
+    // The pre-rename phase awaits repair, existence checks and the journal write: an abort landing
+    // during any of them (with the source long consumed) must still cancel before the irreversible
+    // rename. Here no commit artifact exists yet, so a plain throw suffices; a completed repair
+    // above is idempotent state that needs no undoing.
+    signal?.throwIfAborted()
     const hadCounterpart = await existsForInvariant(counterpartPath)
     const intentPath = hadCounterpart ? await writeIntent(op, id, stagedPath) : undefined
+    if (intentPath && signal?.aborted) {
+      // Cancelled after the intent was journaled but before the rename: the commit never happened,
+      // so the journal must not survive (a later repair would apply it as a completed transition).
+      // Clearing it is must-succeed — if it cannot be cleared, the staged file is preserved as the
+      // proof the rename never landed, exactly like a failed rename.
+      await clearIntentOrThrowPreservingProof(intentPath, stagedPath, id, signal.reason)
+      signal.throwIfAborted()
+    }
     try {
       await rename(stagedPath, primaryPath)
     } catch (err) {
@@ -791,7 +806,7 @@ export async function createFolderBasedFileSystemContentStorage(
           // The raw and its .gzip are one versioned object: a gzip left from a previous version
           // would be preferred by retrieve() and serve stale bytes over the content just stored
           // (intent-journaled so even a crash mid-cleanup cannot leave the stale gzip preferred).
-          await commitRepresentation('raw', id, tempPath, filePath, filePath + '.gzip', rename)
+          await commitRepresentation('raw', id, tempPath, filePath, filePath + '.gzip', rename, signal)
         } finally {
           // Run the bookkeeping even when the commit throws (a failed counterpart cleanup reports
           // failure AFTER the rename landed): drop any stale decompress-cache tracking so eviction
@@ -1200,9 +1215,9 @@ export async function createFolderBasedFileSystemContentStorage(
           // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
           // reconciled at next construction, never leaving mixed versions for reads to prefer.
           if (compressed) {
-            await commitRepresentation('gzip', id, stagedGzipPath, filePath + '.gzip', filePath, rename)
+            await commitRepresentation('gzip', id, stagedGzipPath, filePath + '.gzip', filePath, rename, signal)
           } else {
-            await commitRepresentation('raw', id, stagedRawPath, filePath, filePath + '.gzip', rename)
+            await commitRepresentation('raw', id, stagedRawPath, filePath, filePath + '.gzip', rename, signal)
           }
         } finally {
           // Run even when the commit throws post-rename (failed counterpart cleanup).
