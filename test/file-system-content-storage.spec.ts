@@ -1441,6 +1441,79 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when a failed cleanup leaves the counterpart unreadable', () => {
+      let unreadableRoot: string
+      let gzipPath: string
+      let intentPath: string
+      let storeOutcome: 'resolved' | Error
+      let failingStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // The unlink fails AND leaves the stale gzip unreadable (mode/ACL damage): an access-based
+        // existence check would read it as absent and falsely consider the cleanup complete,
+        // discharging the journal — the mixed state would resurface later with no repair signal.
+        // The invariant check must treat only ENOENT/ENOTDIR as absent and fail loudly here.
+        unreadableRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-unreadable-'))
+        gzipPath = path.join(unreadableRoot, '9584', id) + '.gzip'
+        intentPath = path.join(unreadableRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        const realFs = createFsComponent()
+        let gzipUnreadable = false
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          unlink: (async (target: any) => {
+            if (String(target) === gzipPath && !gzipUnreadable) {
+              gzipUnreadable = true
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink,
+          stat: (async (target: any) => {
+            if (String(target) === gzipPath && gzipUnreadable) {
+              throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+            }
+            return realFs.stat(target)
+          }) as typeof realFs.stat
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          unreadableRoot
+        )
+        await failingStorage.storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(0))))
+        storeOutcome = await failingStorage.storeStream(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: Error) => error
+        )
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(unreadableRoot, { recursive: true, force: true })
+      })
+
+      it('should fail the store instead of falsely considering the cleanup complete', () => {
+        expect((storeOutcome as Error).message).toContain('EACCES')
+      })
+
+      it('should keep the intent as the repair signal', async () => {
+        expect(await fs.existPath(intentPath)).toBe(true)
+      })
+
+      it('should repair once the counterpart is readable again', async () => {
+        const repaired = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          unreadableRoot
+        )
+        try {
+          expect(await fs.existPath(gzipPath)).toBe(false)
+          expect(await fs.existPath(intentPath)).toBe(false)
+          const item = await repaired.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+        } finally {
+          await repaired.stop?.()
+        }
+      })
+    })
+
     describe('when an id with a pending intent is deleted', () => {
       let deleteRoot: string
       let storeOutcome: 'resolved' | Error

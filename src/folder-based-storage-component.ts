@@ -176,12 +176,27 @@ export async function createFolderBasedFileSystemContentStorage(
   const intentPathFor = (id: string): string =>
     path.join(tempDir, `${createHash('sha1').update(id).digest('hex')}.intent`)
 
+  // Existence check for recovery invariants. existPath() tests F_OK|R_OK, so a file left behind by
+  // a failed unlink in an UNREADABLE state (mode/ACL damage, transient permission problem) would
+  // read as absent — letting a must-succeed cleanup be falsely considered complete, and the mixed
+  // state resurface later with no repair signal. Here only ENOENT/ENOTDIR mean absent; any other
+  // error fails the repair/commit path loudly.
+  async function existsForInvariant(target: string): Promise<boolean> {
+    try {
+      await components.fs.stat(target)
+      return true
+    } catch (err: any) {
+      if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false
+      throw err
+    }
+  }
+
   // Removing an intent journal is semantically must-succeed wherever it is called: a journal that
   // outlives its purpose is later interpreted as a pending repair instruction. Centralized so the
   // invariant cannot be accidentally weakened back into a best-effort unlink.
   async function removeIntentOrThrow(intentPath: string, context: string): Promise<void> {
     await noFailUnlink(intentPath)
-    if (await components.fs.existPath(intentPath)) {
+    if (await existsForInvariant(intentPath)) {
       throw new Error(`${context}: the intent journal '${intentPath}' could not be removed.`)
     }
   }
@@ -219,11 +234,11 @@ export async function createFolderBasedFileSystemContentStorage(
     if ((op !== 'raw' && op !== 'gzip') || !id || !STAGED_FILE_NAME.test(staged ?? '')) {
       // A partial/malformed intent means its commit never started (intents are written before
       // renames): discard it; an orphaned staged file, if any, is handled by the sweep.
-      await noFailUnlink(intentPath)
+      await removeIntentOrThrow(intentPath, 'Discarding a malformed intent journal failed')
       return
     }
     const stagedPath = path.join(tempDir, staged)
-    if (await components.fs.existPath(stagedPath)) {
+    if (await existsForInvariant(stagedPath)) {
       // Prepared but never renamed: the commit did not happen. The staged file is the PROOF of
       // that, and the intent is the dangerous artifact — remove the journal first (must succeed),
       // and only then the inert staged garbage. The reverse order could destroy the proof while the
@@ -238,15 +253,15 @@ export async function createFolderBasedFileSystemContentStorage(
     const gzipPath = filePath + '.gzip'
     const primaryPath = op === 'raw' ? filePath : gzipPath
     const counterpartPath = op === 'raw' ? gzipPath : filePath
-    if (!(await components.fs.existPath(primaryPath))) {
+    if (!(await existsForInvariant(primaryPath))) {
       throw new Error(
         `Cannot reconcile the interrupted ${op} commit for ${id}: neither its staged file nor its committed ` +
           `representation exists.`
       )
     }
-    if (await components.fs.existPath(counterpartPath)) {
+    if (await existsForInvariant(counterpartPath)) {
       await noFailUnlink(counterpartPath)
-      if (await components.fs.existPath(counterpartPath)) {
+      if (await existsForInvariant(counterpartPath)) {
         throw new Error(
           `Cannot repair the interrupted ${op} commit for ${id}: its stale ${
             op === 'raw' ? 'gzip' : 'raw'
@@ -383,10 +398,10 @@ export async function createFolderBasedFileSystemContentStorage(
     // A pending intent means a previous commit for this id failed its cleanup in this process:
     // repair first (throws if impossible), so the intent written below always describes a
     // transition from a consistent state and never overwrites an unapplied repair instruction.
-    if (await components.fs.existPath(intentPathFor(id))) {
+    if (await existsForInvariant(intentPathFor(id))) {
       await applyPendingIntent(intentPathFor(id))
     }
-    const hadCounterpart = await components.fs.existPath(counterpartPath)
+    const hadCounterpart = await existsForInvariant(counterpartPath)
     const intentPath = hadCounterpart ? await writeIntent(op, id, stagedPath) : undefined
     try {
       await rename(stagedPath, primaryPath)
@@ -396,7 +411,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // primary in favor of its own decompressed raw cache.
       if (intentPath) {
         await noFailUnlink(intentPath)
-        if (await components.fs.existPath(intentPath)) {
+        if (await existsForInvariant(intentPath)) {
           // Double filesystem failure: the stale intent could later be applied as if the commit
           // succeeded. Escalate with explicit manual guidance instead of the bare rename error.
           throw new Error(
@@ -410,7 +425,7 @@ export async function createFolderBasedFileSystemContentStorage(
     }
     if (hadCounterpart) {
       await noFailUnlink(counterpartPath)
-      if (await components.fs.existPath(counterpartPath)) {
+      if (await existsForInvariant(counterpartPath)) {
         // The new version is committed, but the stale counterpart could not be removed and reads in
         // THIS process would keep preferring it. Fail the store loudly instead of resolving with a
         // lie: the intent survives, so the next construction finishes the cleanup, and a retried
@@ -1006,7 +1021,7 @@ export async function createFolderBasedFileSystemContentStorage(
           // impossible), which discharges the journal; a crash mid-delete afterwards leaves at
           // worst a partial delete with NO journal, which construction accepts.
           const pendingIntentPath = intentPathFor(id)
-          if (ATOMIC_MODE && (await components.fs.existPath(pendingIntentPath))) {
+          if (ATOMIC_MODE && (await existsForInvariant(pendingIntentPath))) {
             await applyPendingIntent(pendingIntentPath)
           }
           const wasCached = await removeCacheEntry(filePath)
