@@ -241,6 +241,31 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  // After a FAILED commit rename, the pre-rename intent must be PROVABLY gone before the staged
+  // proof may be discarded. Both "the journal survived" and "the journal cannot be proven gone"
+  // (the verification stat itself fails) preserve the proof via the typed error — otherwise a raw
+  // EACCES would escape untyped, the callers' staging cleanup would destroy the staged file, and a
+  // later restart could misapply the surviving pre-rename intent as a committed transition.
+  async function clearIntentOrThrowPreservingProof(
+    intentPath: string,
+    stagedPath: string,
+    id: string,
+    originalError: unknown
+  ): Promise<void> {
+    await noFailUnlink(intentPath)
+    try {
+      if (!(await existsForInvariant(intentPath))) return
+    } catch {
+      // Could not prove the dangerous journal is gone; fall through and preserve the staged proof.
+    }
+    throw new UncommittedIntentSurvivedError(
+      stagedPath,
+      `Failed to commit ${id} AND failed to prove its intent journal was removed; the staged file is preserved ` +
+        `as proof the commit never landed, so a restart repairs this once the filesystem issue is fixed. ` +
+        `Original error: ${originalError instanceof Error ? originalError.message : String(originalError)}`
+    )
+  }
+
   // Removing an intent journal is semantically must-succeed wherever it is called: a journal that
   // outlives its purpose is later interpreted as a pending repair instruction. Centralized so the
   // invariant cannot be accidentally weakened back into a best-effort unlink.
@@ -448,20 +473,12 @@ export async function createFolderBasedFileSystemContentStorage(
       // the failed commit as successful and remove the counterpart — e.g. delete a valid gzip
       // primary in favor of its own decompressed raw cache.
       if (intentPath) {
-        await noFailUnlink(intentPath)
-        if (await existsForInvariant(intentPath)) {
-          // Double filesystem failure: the surviving intent could later be applied as if the commit
-          // succeeded. The staged file is the proof it did not — the typed error tells callers to
-          // preserve it, which also makes this state self-healing: the next construction sees the
-          // staged file, classifies the intent as pre-rename and discards both, previous
-          // representations untouched.
-          throw new UncommittedIntentSurvivedError(
-            stagedPath,
-            `Failed to commit ${id} AND failed to clear its intent journal; the staged file is preserved as ` +
-              `proof the commit never landed, so a restart repairs this once the filesystem issue is fixed. ` +
-              `Original error: ${err instanceof Error ? err.message : String(err)}`
-          )
-        }
+        // A surviving (or unprovably-removed) intent could later be applied as if the commit
+        // succeeded. The staged file is the proof it did not — the typed error tells callers to
+        // preserve it, which also makes this state self-healing: the next construction sees the
+        // staged file, classifies the intent as pre-rename and discards both, previous
+        // representations untouched.
+        await clearIntentOrThrowPreservingProof(intentPath, stagedPath, id, err)
       }
       throw err
     }

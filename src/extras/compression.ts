@@ -23,6 +23,9 @@ export async function compressContentFile(
   logger?: ILoggerComponent.ILogger,
   output?: string
 ): Promise<boolean> {
+  // NOTE: compression operates through native node `fs` on LOCAL filesystem paths, not through the
+  // injected IFileSystemComponent — custom adapters that virtualize paths get atomic raw writes but
+  // must not rely on storeStreamAndCompress unless their paths are real local files.
   // `output` lets callers stage the compressed file elsewhere (e.g. a temp dir) and rename it into
   // place themselves, so a process killed mid-compression cannot leave a partial .gzip at the
   // canonical path. Defaults to the in-place `<contentFilePath>.gzip` for backward compatibility.

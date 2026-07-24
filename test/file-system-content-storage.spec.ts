@@ -1400,6 +1400,243 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when the intent removal cannot even be verified after a failed rename', () => {
+      let unverifiableRoot: string
+      let gzipPath: string
+      let intentPath: string
+      let originalBytes: Buffer
+      let storeOutcome: 'resolved' | Error
+      let failingStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // rename fails, the intent unlink fails, AND the verification stat throws EACCES: not being
+        // able to PROVE the journal is gone must preserve the staged proof exactly like a proven
+        // survivor — an untyped EACCES escaping would let the caller cleanup destroy the proof.
+        unverifiableRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-unverifiable-'))
+        const rawPath = path.join(unverifiableRoot, '9584', id)
+        gzipPath = rawPath + '.gzip'
+        intentPath = path.join(unverifiableRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        const realFs = createFsComponent()
+        let armed = false
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          rename: (async (from: any, to: any) => {
+            if (armed && String(to) === rawPath) {
+              throw Object.assign(new Error('EIO: rename failed'), { code: 'EIO' })
+            }
+            return realFs.rename!(from, to)
+          }) as typeof realFs.rename,
+          unlink: (async (target: any) => {
+            if (armed && String(target) === intentPath) {
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink,
+          stat: (async (target: any) => {
+            if (armed && String(target) === intentPath) {
+              // Present but unstat-able: a missing file still reports ENOENT normally.
+              await realFs.stat(target)
+              throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+            }
+            return realFs.stat(target)
+          }) as typeof realFs.stat
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          unverifiableRoot
+        )
+        originalBytes = Buffer.from(new Uint8Array(100).fill(5))
+        await failingStorage.storeStreamAndCompress(id, bufferToStream(originalBytes))
+        await failingStorage.retrieve(id, { start: 0, end: 9 })
+        armed = true
+        storeOutcome = await failingStorage.storeStream(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: Error) => error
+        )
+        armed = false
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(unverifiableRoot, { recursive: true, force: true })
+      })
+
+      it('should fail the store explaining the journal removal could not be proven', () => {
+        expect((storeOutcome as Error).message).toContain('failed to prove its intent journal was removed')
+      })
+
+      it('should preserve the staged-file proof', async () => {
+        const entries = await nodeFs.readdir(path.join(unverifiableRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => /^[0-9a-f]{16}-[0-9a-f]{32}$/.test(entry))).toHaveLength(1)
+      })
+
+      it('should not apply the failed commit at the next construction', async () => {
+        const repaired = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          unverifiableRoot
+        )
+        try {
+          expect(await fs.existPath(gzipPath)).toBe(true)
+          const item = await repaired.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(originalBytes)
+        } finally {
+          await repaired.stop?.()
+        }
+      })
+    })
+
+    describe('when a compressed store hits the double failure on its gzip commit', () => {
+      let compressedFailRoot: string
+      let rawPath: string
+      let intentPath: string
+      let originalBytes: Buffer
+      let storeOutcome: 'resolved' | Error
+      let failingStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // Same double failure through storeStreamAndCompress's gzip commit: its own staging cleanup
+        // must preserve the staged gzip named by the typed error while removing the raw residue.
+        compressedFailRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-compress-double-'))
+        rawPath = path.join(compressedFailRoot, '9584', id)
+        const gzipPath = rawPath + '.gzip'
+        intentPath = path.join(compressedFailRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        const realFs = createFsComponent()
+        let armed = false
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          rename: (async (from: any, to: any) => {
+            if (armed && String(to) === gzipPath) {
+              throw Object.assign(new Error('EIO: rename failed'), { code: 'EIO' })
+            }
+            return realFs.rename!(from, to)
+          }) as typeof realFs.rename,
+          unlink: (async (target: any) => {
+            if (armed && String(target) === intentPath) {
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          compressedFailRoot
+        )
+        originalBytes = Buffer.from('raw primary content')
+        await failingStorage.storeStream(id, bufferToStream(originalBytes))
+        armed = true
+        storeOutcome = await failingStorage
+          .storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(9))))
+          .then(
+            () => 'resolved' as const,
+            (error: Error) => error
+          )
+        armed = false
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(compressedFailRoot, { recursive: true, force: true })
+      })
+
+      it('should fail the store explaining the proof is preserved', () => {
+        expect((storeOutcome as Error).message).toContain('preserved')
+      })
+
+      it('should preserve exactly the staged gzip proof', async () => {
+        const entries = await nodeFs.readdir(path.join(compressedFailRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => /^[0-9a-f]{16}-[0-9a-f]{32}$/.test(entry))).toHaveLength(1)
+      })
+
+      it('should keep the raw primary and heal at the next construction', async () => {
+        const repaired = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          compressedFailRoot
+        )
+        try {
+          expect(await fs.existPath(intentPath)).toBe(false)
+          const item = await repaired.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(originalBytes)
+        } finally {
+          await repaired.stop?.()
+        }
+      })
+    })
+
+    describe('when an incompressible store hits the double failure on its raw commit', () => {
+      let incompressibleFailRoot: string
+      let gzipPath: string
+      let intentPath: string
+      let originalBytes: Buffer
+      let storeOutcome: 'resolved' | Error
+      let failingStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        // Same double failure through storeStreamAndCompress's raw (not-beneficial) commit.
+        incompressibleFailRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-incompress-double-'))
+        const rawPath = path.join(incompressibleFailRoot, '9584', id)
+        gzipPath = rawPath + '.gzip'
+        intentPath = path.join(incompressibleFailRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        const realFs = createFsComponent()
+        let armed = false
+        const failingFs: IFileSystemComponent = {
+          ...realFs,
+          rename: (async (from: any, to: any) => {
+            if (armed && String(to) === rawPath) {
+              throw Object.assign(new Error('EIO: rename failed'), { code: 'EIO' })
+            }
+            return realFs.rename!(from, to)
+          }) as typeof realFs.rename,
+          unlink: (async (target: any) => {
+            if (armed && String(target) === intentPath) {
+              throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+            }
+            return realFs.unlink(target)
+          }) as typeof realFs.unlink
+        }
+        failingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingFs, logs: await createLogComponent({}) },
+          incompressibleFailRoot
+        )
+        originalBytes = Buffer.from(new Uint8Array(100).fill(5))
+        await failingStorage.storeStreamAndCompress(id, bufferToStream(originalBytes))
+        armed = true
+        storeOutcome = await failingStorage.storeStreamAndCompress(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: Error) => error
+        )
+        armed = false
+      })
+
+      afterEach(async () => {
+        await failingStorage.stop?.()
+        rmSync(incompressibleFailRoot, { recursive: true, force: true })
+      })
+
+      it('should fail the store explaining the proof is preserved', () => {
+        expect((storeOutcome as Error).message).toContain('preserved')
+      })
+
+      it('should preserve exactly the staged raw proof', async () => {
+        const entries = await nodeFs.readdir(path.join(incompressibleFailRoot, '.tmp-writes'))
+        expect(entries.filter((entry) => /^[0-9a-f]{16}-[0-9a-f]{32}$/.test(entry))).toHaveLength(1)
+      })
+
+      it('should keep the gzip primary and heal at the next construction', async () => {
+        const repaired = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          incompressibleFailRoot
+        )
+        try {
+          expect(await fs.existPath(gzipPath)).toBe(true)
+          expect(await fs.existPath(intentPath)).toBe(false)
+          const item = await repaired.retrieve(id)
+          expect(await streamToBuffer(await item!.asStream())).toEqual(originalBytes)
+        } finally {
+          await repaired.stop?.()
+        }
+      })
+    })
+
     describe('when an invalidated decompression fails to read the replaced gzip', () => {
       let overwriteStorage: IContentStorageComponent
       let newContent: Buffer
