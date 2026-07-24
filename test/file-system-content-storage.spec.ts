@@ -941,35 +941,192 @@ describe('fileSystemContentStorage', () => {
     expect(await fileSystemContentStorage.fileInfo('non-existent-id')).toBeUndefined()
   })
 
-  describe('when a custom adapter provides no lstat', () => {
-    let noLstatRoot: string
-    let noLstatStorage: IContentStorageComponent
-    const compressible = Buffer.from(new Uint8Array(4096).fill(4))
+  describe.each([
+    {
+      what: 'a compressed store',
+      store: (storage: IContentStorageComponent, target: string, bytes: Buffer) =>
+        storage.storeStreamAndCompress(target, bufferToStream(bytes))
+    },
+    {
+      what: 'a plain store',
+      store: (storage: IContentStorageComponent, target: string, bytes: Buffer) =>
+        storage.storeStream(target, bufferToStream(bytes))
+    }
+  ])('when a cached shard directory is removed before $what', ({ store }) => {
+    let healRoot: string
+    let healStorage: IContentStorageComponent
+    let firstOutcome: unknown
+    let secondOutcome: unknown
+    // Compressible, so the compressed variant genuinely commits a gzip.
+    const bytes = Buffer.from(new Uint8Array(4096).fill(8))
 
     beforeEach(async () => {
-      // `lstat` is optional on IFileSystemComponent, so the compression's size comparison has to fall
-      // back to `stat` — an adapter without it must still get compressed stores.
-      noLstatRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-no-lstat-'))
-      const noLstatFs: IFileSystemComponent = { ...createFsComponent(), lstat: undefined }
-      noLstatStorage = await createFolderBasedFileSystemContentStorage(
-        { fs: noLstatFs, logs: await createLogComponent({}) },
-        noLstatRoot
+      // Every write path resolves its target through the directory cache, so each one has to drop a
+      // stale entry when the directory turns out to be gone — otherwise the retry keeps skipping the
+      // mkdir and that shard fails permanently.
+      healRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-heal-'))
+      healStorage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        healRoot
       )
-      await noLstatStorage.storeStreamAndCompress(id, bufferToStream(compressible))
+      await healStorage.storeStream(id, bufferToStream(content))
+      rmSync(path.join(healRoot, '9584'), { recursive: true, force: true })
+      firstOutcome = await store(healStorage, id, bytes).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+      secondOutcome = await store(healStorage, id, bytes).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
     })
 
     afterEach(async () => {
-      await noLstatStorage.stop?.()
-      rmSync(noLstatRoot, { recursive: true, force: true })
+      await healStorage.stop?.()
+      rmSync(healRoot, { recursive: true, force: true })
     })
 
-    it('should still compress the store', async () => {
-      expect((await noLstatStorage.fileInfo(id))!.encoding).toEqual('gzip')
+    it('should fail the write that hit the missing directory', () => {
+      expect((firstOutcome as { code?: string }).code).toEqual('ENOENT')
     })
 
-    it('should serve the stored content', async () => {
-      const item = await noLstatStorage.retrieve(id)
-      expect(await streamToBuffer(await item!.asStream())).toEqual(compressible)
+    it('should recreate the directory on the retry', () => {
+      expect(secondOutcome).toEqual('resolved')
+    })
+
+    it('should serve the retried content', async () => {
+      const item = await healStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(bytes)
+    })
+  })
+
+  describe('when a cached shard directory is removed before a no-rename adapter writes', () => {
+    let legacyRoot: string
+    let legacyStorage: IContentStorageComponent
+    let firstOutcome: unknown
+    let secondOutcome: unknown
+
+    beforeEach(async () => {
+      // The legacy direct-write path returns before the atomic path's error handling, so it needs the
+      // same healing: its pipe writes straight to the canonical path under the cached directory.
+      legacyRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-heal-legacy-'))
+      const fsWithoutRename: IFileSystemComponent = { ...createFsComponent(), rename: undefined }
+      legacyStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: fsWithoutRename, logs: await createLogComponent({}) },
+        legacyRoot
+      )
+      await legacyStorage.storeStream(id, bufferToStream(content))
+      rmSync(path.join(legacyRoot, '9584'), { recursive: true, force: true })
+      firstOutcome = await legacyStorage.storeStream(id, bufferToStream(content2)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+      secondOutcome = await legacyStorage.storeStream(id, bufferToStream(content2)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await legacyStorage.stop?.()
+      rmSync(legacyRoot, { recursive: true, force: true })
+    })
+
+    it('should fail the write that hit the missing directory', () => {
+      expect((firstOutcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should recreate the directory on the retry', () => {
+      expect(secondOutcome).toEqual('resolved')
+    })
+
+    it('should serve the retried content', async () => {
+      const item = await legacyStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(content2)
+    })
+  })
+
+  describe('when a cached shard directory is replaced by a file', () => {
+    let obstructedRoot: string
+    let obstructedStorage: IContentStorageComponent
+    let obstructedShard: string
+    let whileObstructed: unknown
+    let afterRepair: unknown
+
+    beforeEach(async () => {
+      // A file at the shard path is not a directory writes can land in, so the cached entry is just as
+      // stale as a removed one. This storage will not clear the obstruction — deleting something it
+      // cannot prove it owns is what the reserved-namespace checks refuse to do — but once an operator
+      // does, the next write must be able to recreate the tree instead of failing on the stale entry.
+      obstructedRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-obstructed-'))
+      obstructedShard = path.join(obstructedRoot, '9584')
+      obstructedStorage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        obstructedRoot
+      )
+      await obstructedStorage.storeStream(id, bufferToStream(content))
+      rmSync(obstructedShard, { recursive: true, force: true })
+      await nodeFs.writeFile(obstructedShard, 'not a directory')
+      whileObstructed = await obstructedStorage.storeStream(id, bufferToStream(content)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+      rmSync(obstructedShard, { force: true })
+      afterRepair = await obstructedStorage.storeStream(id, bufferToStream(content)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await obstructedStorage.stop?.()
+      rmSync(obstructedRoot, { recursive: true, force: true })
+    })
+
+    it('should fail the write while the path is obstructed', () => {
+      expect(whileObstructed).not.toEqual('resolved')
+    })
+
+    it('should recreate the directory on the first write after the obstruction is cleared', () => {
+      expect(afterRepair).toEqual('resolved')
+    })
+
+    it('should serve the content stored after the repair', async () => {
+      const item = await obstructedStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+    })
+  })
+
+  describe('when a cached shard directory is removed underneath the storage', () => {
+    let firstOutcome: unknown
+    let secondOutcome: unknown
+
+    beforeEach(async () => {
+      // The directory cache assumes the documented exclusive root ownership. If a directory
+      // disappears anyway, the operation that needed it must fail loudly and drop the stale entry,
+      // so a retry recreates the tree instead of failing forever.
+      await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+      rmSync(path.dirname(filePath), { recursive: true, force: true })
+      const attempt = () =>
+        fileSystemContentStorage.storeStream(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
+      firstOutcome = await attempt()
+      secondOutcome = await attempt()
+    })
+
+    it('should fail the store that hit the missing directory', () => {
+      expect((firstOutcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should recreate the directory on the next store', () => {
+      expect(secondOutcome).toEqual('resolved')
+    })
+
+    it('should serve the content stored by the retry', async () => {
+      const item = await fileSystemContentStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(content)
     })
   })
 
@@ -1032,36 +1189,35 @@ describe('fileSystemContentStorage', () => {
     })
   })
 
-  describe('when a cached shard directory is removed underneath the storage', () => {
-    let firstOutcome: unknown
-    let secondOutcome: unknown
+  describe('when a custom adapter provides no lstat', () => {
+    let noLstatRoot: string
+    let noLstatStorage: IContentStorageComponent
+    const compressible = Buffer.from(new Uint8Array(4096).fill(4))
 
     beforeEach(async () => {
-      // The directory cache assumes the documented exclusive root ownership. If a directory
-      // disappears anyway, the operation that needed it must fail loudly and drop the stale entry,
-      // so a retry recreates the tree instead of failing forever.
-      await fileSystemContentStorage.storeStream(id, bufferToStream(content))
-      rmSync(path.dirname(filePath), { recursive: true, force: true })
-      const attempt = () =>
-        fileSystemContentStorage.storeStream(id, bufferToStream(content)).then(
-          () => 'resolved' as const,
-          (error: unknown) => error
-        )
-      firstOutcome = await attempt()
-      secondOutcome = await attempt()
+      // `lstat` is optional on IFileSystemComponent, so the compression's size comparison has to fall
+      // back to `stat` — an adapter without it must still get compressed stores.
+      noLstatRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-no-lstat-'))
+      const noLstatFs: IFileSystemComponent = { ...createFsComponent(), lstat: undefined }
+      noLstatStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: noLstatFs, logs: await createLogComponent({}) },
+        noLstatRoot
+      )
+      await noLstatStorage.storeStreamAndCompress(id, bufferToStream(compressible))
     })
 
-    it('should fail the store that hit the missing directory', () => {
-      expect((firstOutcome as { code?: string }).code).toEqual('ENOENT')
+    afterEach(async () => {
+      await noLstatStorage.stop?.()
+      rmSync(noLstatRoot, { recursive: true, force: true })
     })
 
-    it('should recreate the directory on the next store', () => {
-      expect(secondOutcome).toEqual('resolved')
+    it('should still compress the store', async () => {
+      expect((await noLstatStorage.fileInfo(id))!.encoding).toEqual('gzip')
     })
 
-    it('should serve the content stored by the retry', async () => {
-      const item = await fileSystemContentStorage.retrieve(id)
-      expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+    it('should serve the stored content', async () => {
+      const item = await noLstatStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(compressible)
     })
   })
 
