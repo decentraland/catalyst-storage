@@ -8,6 +8,19 @@ import { compressContentFile } from './extras/compression'
 
 const pipe = promisify(pipeline)
 
+// Thrown when a commit rename failed AND its pre-rename intent could not be cleared. The staged
+// file it names is then the only PROOF that the rename never landed: callers must preserve that
+// exact path (instead of their usual staging cleanup), so the next construction can discard the
+// intent as pre-rename instead of applying the failed commit as a completed transition.
+class UncommittedIntentSurvivedError extends Error {
+  constructor(
+    readonly stagedPath: string,
+    message: string
+  ) {
+    super(message)
+  }
+}
+
 // Reserved directory (under the storage root) where an atomic `storeStream` stages its temp file
 // before renaming it into place. Kept out of the content namespace — a shard is a 4-hex directory and
 // content lives in files, never here — so a temp can never collide with, hide, or be mistaken for an
@@ -437,11 +450,15 @@ export async function createFolderBasedFileSystemContentStorage(
       if (intentPath) {
         await noFailUnlink(intentPath)
         if (await existsForInvariant(intentPath)) {
-          // Double filesystem failure: the stale intent could later be applied as if the commit
-          // succeeded. Escalate with explicit manual guidance instead of the bare rename error.
-          throw new Error(
-            `Failed to commit ${id} AND failed to clear its intent journal — remove '${intentPath}' manually ` +
-              `before restarting, or the failed commit may be applied as if it had succeeded. ` +
+          // Double filesystem failure: the surviving intent could later be applied as if the commit
+          // succeeded. The staged file is the proof it did not — the typed error tells callers to
+          // preserve it, which also makes this state self-healing: the next construction sees the
+          // staged file, classifies the intent as pre-rename and discards both, previous
+          // representations untouched.
+          throw new UncommittedIntentSurvivedError(
+            stagedPath,
+            `Failed to commit ${id} AND failed to clear its intent journal; the staged file is preserved as ` +
+              `proof the commit never landed, so a restart repairs this once the filesystem issue is fixed. ` +
               `Original error: ${err instanceof Error ? err.message : String(err)}`
           )
         }
@@ -656,8 +673,12 @@ export async function createFolderBasedFileSystemContentStorage(
       })
     } catch (err) {
       // On a write error the temp file may be partial; on a rename error it still exists. Either way
-      // remove it so a failed store never leaves a stray file behind (the final path is untouched).
-      await noFailUnlink(tempPath)
+      // remove it so a failed store never leaves a stray file behind (the final path is untouched) —
+      // EXCEPT when the temp file is the preserved proof of an uncommitted intent that could not be
+      // cleared: destroying it would let the next reconciliation apply the failed commit.
+      if (!(err instanceof UncommittedIntentSurvivedError && err.stagedPath === tempPath)) {
+        await noFailUnlink(tempPath)
+      }
       throw err
     }
   }
@@ -1026,6 +1047,9 @@ export async function createFolderBasedFileSystemContentStorage(
       // stays fully intact; a process killed at any point leaves only sweepable staged files.
       const stagedRawPath = newTempPath()
       const stagedGzipPath = newTempPath()
+      // Set when a failed rename could not clear its intent: that exact staged path is the proof
+      // the commit never landed and must survive the staging cleanup below.
+      let preservedStagedPath: string | undefined
       try {
         await pipe(stream, components.fs.createWriteStream(stagedRawPath))
         const compressed = await compressContentFile(stagedRawPath, logger, stagedGzipPath)
@@ -1044,11 +1068,21 @@ export async function createFolderBasedFileSystemContentStorage(
             invalidateInflightDecompression(filePath)
           }
         })
+      } catch (err) {
+        if (err instanceof UncommittedIntentSurvivedError) {
+          preservedStagedPath = err.stagedPath
+        }
+        throw err
       } finally {
         // Whatever was not renamed into place is staging residue (the raw after a gzip-only commit,
-        // both files after a failure). The previous canonical version is untouched on any error.
-        await noFailUnlink(stagedRawPath)
-        await noFailUnlink(stagedGzipPath)
+        // both files after a failure) — except a preserved uncommitted-intent proof. The previous
+        // canonical version is untouched on any error.
+        if (stagedRawPath !== preservedStagedPath) {
+          await noFailUnlink(stagedRawPath)
+        }
+        if (stagedGzipPath !== preservedStagedPath) {
+          await noFailUnlink(stagedGzipPath)
+        }
       }
     },
     async delete(ids: string[]): Promise<void> {
