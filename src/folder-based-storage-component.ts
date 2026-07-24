@@ -555,8 +555,10 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   let evictionTimer: ReturnType<typeof setInterval> | undefined
+  // Tracks the in-flight eviction tick so `stop()` can await one that is already running.
+  let evictionTick: Promise<void> = Promise.resolve()
   // Tracks the detached startup temp-file sweep so `stop()` can await it (rather than leaving a
-  // promise dangling past shutdown).
+  // promise dangling past shutdown). Repeated start() calls CHAIN onto it instead of replacing it.
   let tempFileSweep: Promise<void> = Promise.resolve()
 
   async function getFilePath(id: string): Promise<string> {
@@ -998,11 +1000,17 @@ export async function createFolderBasedFileSystemContentStorage(
       if (evictionTimer) {
         clearInterval(evictionTimer)
       }
-      evictionTimer = setInterval(evictCache, CACHE_EVICTION_INTERVAL)
+      // Track the in-flight eviction tick so stop() can await one that is already running.
+      evictionTimer = setInterval(() => {
+        evictionTick = evictCache().catch((error) => logger.warn(`Cache eviction failed: ${error}`))
+      }, CACHE_EVICTION_INTERVAL)
       evictionTimer.unref()
       // Detached best-effort cleanup of temp files orphaned by an interrupted write in a prior run.
       // Runs in the background so it never delays startup; `stop()` awaits it once, at shutdown.
-      tempFileSweep = sweepOrphanedTempFiles()
+      // Chained onto any previous sweep so a repeated start() cannot replace a still-running sweep
+      // with a new promise (the older one would dangle past stop()) nor run two sweeps concurrently.
+      tempFileSweep = tempFileSweep
+        .then(() => sweepOrphanedTempFiles())
         .then((removed) => {
           if (removed > 0) logger.info(`Removed ${removed} orphaned temp file(s) at startup`)
         })
@@ -1013,8 +1021,9 @@ export async function createFolderBasedFileSystemContentStorage(
         clearInterval(evictionTimer)
         evictionTimer = undefined
       }
-      // Wait for the startup temp-file sweep and any inflight decompressions before cleaning up
-      await Promise.allSettled([tempFileSweep, ...inflightDecompressions.values()])
+      // Wait for the startup temp-file sweep, an in-flight eviction tick and any inflight
+      // decompressions before cleaning up
+      await Promise.allSettled([tempFileSweep, evictionTick, ...inflightDecompressions.values()])
       // Evict all cached files on shutdown to prevent disk leaks across restarts
       for (const [filePath, entry] of decompressCache) {
         await evictCacheEntry(filePath, entry)

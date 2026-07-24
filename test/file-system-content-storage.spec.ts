@@ -2671,6 +2671,29 @@ describe('fileSystemContentStorage', () => {
       })
     })
 
+    describe('when start is called repeatedly while a sweep may still be running', () => {
+      let orphanPath: string
+
+      beforeEach(async () => {
+        // Repeated start() chains onto the previous sweep instead of replacing its promise, so no
+        // sweep can dangle past stop() and the orphan is still removed.
+        await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+        orphanPath = path.join(tmpRootDir, '.tmp-writes', 'deadbeefdeadbeef-0123456789abcdef0123456789abcdef')
+        await nodeFs.writeFile(orphanPath, Buffer.from(''))
+        await fileSystemContentStorage.start?.({} as any)
+        await fileSystemContentStorage.start?.({} as any)
+        await fileSystemContentStorage.stop?.()
+      })
+
+      it('should still remove the orphaned temp file', async () => {
+        expect(await fs.existPath(orphanPath)).toBe(false)
+      })
+
+      it('should keep the real content file', async () => {
+        expect(await fs.existPath(path.join(tmpRootDir, '9584', id))).toBe(true)
+      })
+    })
+
     describe('when an orphaned temp file exists in the reserved temp directory', () => {
       let seenIds: string[]
 
