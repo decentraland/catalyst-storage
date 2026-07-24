@@ -10,6 +10,7 @@ import {
   IFileSystemComponent
 } from '../src'
 import { bufferToStream, streamToBuffer } from '../src'
+import * as compressionModule from '../src/extras/compression'
 import { createLogComponent } from '@well-known-components/logger'
 
 describe('fileSystemContentStorage', () => {
@@ -991,6 +992,45 @@ describe('fileSystemContentStorage', () => {
         await customStorage.storeStream('.tmp-writes', bufferToStream(content))
         const item = await customStorage.retrieve('.tmp-writes')
         expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+      })
+    })
+
+    describe('when a store is superseded by a delete while compressing', () => {
+      let supersededStorage: IContentStorageComponent
+      let compressSpy: jest.SpyInstance
+      let storeOutcome: 'resolved' | Error
+
+      beforeEach(async () => {
+        supersededStorage = await createFolderBasedFileSystemContentStorage(
+          { fs, logs: await createLogComponent({}) },
+          tmpRootDir
+        )
+        // Simulate a concurrent delete landing while the compression reads the canonical path: the
+        // source disappears mid-read and the compression fails — but the store itself has already
+        // committed its raw bytes and was merely superseded, so its promise must not reject.
+        compressSpy = jest.spyOn(compressionModule, 'compressContentFile').mockImplementationOnce(async () => {
+          await supersededStorage.delete([id])
+          throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' })
+        })
+        storeOutcome = await supersededStorage
+          .storeStreamAndCompress(id, bufferToStream(Buffer.from(new Uint8Array(100).fill(0))))
+          .then(
+            () => 'resolved' as const,
+            (error: Error) => error
+          )
+      })
+
+      afterEach(async () => {
+        compressSpy.mockRestore()
+        await supersededStorage.stop?.()
+      })
+
+      it('should not reject the superseded store', () => {
+        expect(storeOutcome).toBe('resolved')
+      })
+
+      it('should leave the id deleted by the newer operation', async () => {
+        expect(await supersededStorage.exist(id)).toBe(false)
       })
     })
 

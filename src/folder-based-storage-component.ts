@@ -418,6 +418,12 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  // Concurrent-read contract: reads are deliberately NOT serialized against writes (locking the hot
+  // read path would be far too costly). Every read observes some COMPLETE committed version of the
+  // id — commits are atomic renames and a version's raw/gzip transition happens under the path
+  // lock — but a read that overlaps a commit may still serve the previous version (e.g. its gzip,
+  // which retrieve prefers, in the instant before the committing section unlinks it). Reads started
+  // after a store/delete promise resolves observe that operation's outcome.
   const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
     if (range) validateRange(range)
     try {
@@ -674,8 +680,10 @@ export async function createFolderBasedFileSystemContentStorage(
       // The raw file and its .gzip are one versioned object, and retrieve() prefers the gzip. The
       // overwrite therefore commits in two locked steps:
       //   1. raw commit — rename the staged raw into place AND remove the previous version's gzip in
-      //      the same locked section, so no reader can ever pair the new raw with the old gzip and
-      //      no decompression of the old gzip can commit past this point.
+      //      the same locked section, so no decompression of the old gzip can commit past this
+      //      point. (Reads are not locked: one overlapping this section may still serve the
+      //      previous version's gzip — a complete older version, never a partial or mixed one; see
+      //      the read contract on retrieve().)
       //   2. gzip commit — after compressing (outside any lock), re-take the lock and, only if no
       //      other store/delete landed in between (compression token still fresh), rename the staged
       //      gzip into place and remove the now-redundant raw. If the token went stale, the staged
@@ -724,6 +732,15 @@ export async function createFolderBasedFileSystemContentStorage(
           // compressContentFile already removed its own (possibly partial) staged output on error;
           // this covers a failed rename, whose staged file would otherwise linger until the sweep.
           await noFailUnlink(stagedGzipPath)
+          // Compression reads the mutable canonical path outside the lock, so a concurrent
+          // store/delete can remove or replace it mid-read and make compression fail — but that is
+          // not a failure of THIS operation: its raw bytes were committed and a newer operation now
+          // owns the path. Rethrowing would make callers retry and potentially overwrite the newer
+          // content. The empty locked section is a barrier: the superseding commit (which unlinked
+          // the file compression was reading) marks the token inside its own locked section, so
+          // after the barrier the staleness answer is definitive.
+          const superseded = await withPathLock(filePath, async () => token.stale)
+          if (superseded) return
           throw err
         }
       } finally {
