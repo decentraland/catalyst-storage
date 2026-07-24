@@ -83,6 +83,24 @@ function createCommonSuite(components: { storage?: IContentStorageComponent }) {
     expect(await components.storage!.exist('signal/mid-aborted')).toBe(false)
   })
 
+  it(`When the signal aborts after the source was fully consumed, then the store rejects with the reason and stores nothing`, async () => {
+    // Every backend must honor an abort observed once the source is consumed: destroying the source
+    // no longer cancels anything, so without a checkpoint before the commit a cancelled request
+    // would still store content. The 'end' listener is registered before the store consumes the
+    // stream, so it aborts in the same event as the read completing.
+    const reason = new Error('cancelled after the source ended')
+    const controller = new AbortController()
+    const source = new Readable({ read() {} })
+    source.push(Buffer.from('fully-consumed-content'))
+    source.push(null)
+    source.on('end', () => controller.abort(reason))
+
+    await expect(components.storage!.storeStream('signal/post-consumption', source, controller.signal)).rejects.toBe(
+      reason
+    )
+    expect(await components.storage!.exist('signal/post-consumption')).toBe(false)
+  })
+
   it(`When the signal aborts while a compressed store is still streaming, then it rejects with the reason and stores nothing`, async () => {
     const reason = new Error('cancelled mid-compress')
     const controller = new AbortController()

@@ -509,10 +509,15 @@ export async function createFolderBasedFileSystemContentStorage(
     try {
       await doCommitRepresentation(op, id, stagedPath, primaryPath, counterpartPath, rename, signal)
     } catch (err) {
-      // Nothing inside the commit phase can be caused by abort teardown (the source is fully
-      // consumed before any commit begins, and the folder backend has no abort hook), so every
-      // failure here — pending-intent repair, journal write, rename, counterpart cleanup,
-      // quarantine — is a real storage error that cancellation translation must never mask.
+      // The commit phase's own cancellation checkpoints throw the caller's abort reason: pass those
+      // through untouched — they ARE cancellations, and marking would tag a caller-owned object
+      // with this module's internal symbol. Every other failure here — pending-intent repair,
+      // journal write, rename, counterpart cleanup, quarantine — cannot be caused by abort teardown
+      // (the source is fully consumed before any commit begins and this backend has no abort hook),
+      // so it is a real storage error that cancellation translation must never mask.
+      if (signal?.aborted && (err === signal.reason || isAbortError(err))) {
+        throw err
+      }
       throw markAsNonCancellationError(err)
     }
   }

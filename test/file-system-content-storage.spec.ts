@@ -1236,6 +1236,12 @@ describe('fileSystemContentStorage', () => {
         expect(await streamToBuffer(await item!.asStream())).toEqual(previousBytes)
       })
 
+      it('should not tag the caller-owned abort reason with internal markers', () => {
+        // The commit phase's checkpoints throw the caller's reason; the commit wrapper must not
+        // brand that caller-owned object with this module's internal non-cancellation symbol.
+        expect(Object.getOwnPropertySymbols(reason)).toEqual([])
+      })
+
       it('should discard the just-written intent so no repair can apply it', async () => {
         const entries = await nodeFs.readdir(path.join(preRenameRoot, '.tmp-writes'))
         expect(entries.filter((entry) => entry.endsWith('.intent'))).toEqual([])
