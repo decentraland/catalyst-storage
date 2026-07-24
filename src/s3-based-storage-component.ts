@@ -154,13 +154,25 @@ export async function createS3BasedFileSystemContentStorage(
           // Release the source stream if the upload stopped consuming the body (e.g. it failed
           // before reading anything, so peekHead's generator never started and can't self-clean).
           // Destroying the source releases its underlying resources (e.g. file descriptors).
-          // No-op if already ended/destroyed.
-          stream.destroy()
+          // No-op if already ended/destroyed. Guarded so a custom stream whose destroy() throws
+          // cannot replace the upload error the caller needs to see.
+          try {
+            stream.destroy()
+          } catch {
+            // best-effort cleanup; the upload error below is what matters
+          }
           throw error
         }
       },
-      // Optional call: S3-compatible test doubles may not implement ManagedUpload.abort().
-      () => upload?.abort?.()
+      // Reports whether the managed upload was actually torn down, so a `RequestAbortedError` is
+      // credited to this cancellation only when our abort caused it — the SDK can report an aborted
+      // request for reasons of its own (e.g. a socket teardown) that merely race the cancellation.
+      // The call is optional: S3-compatible test doubles may not implement ManagedUpload.abort().
+      () => {
+        if (!upload?.abort) return false
+        upload.abort()
+        return true
+      }
     )
   }
 

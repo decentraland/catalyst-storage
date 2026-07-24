@@ -17,8 +17,10 @@ describe('runStoreWithSignal', () => {
         rejectOperation = reject
       })
       const failingHook = (): void => {
-        // Teardown-shaped, as a real aborted transport rejects (e.g. S3 RequestAbortedError).
-        rejectOperation(Object.assign(new Error('transport torn down'), { code: 'RequestAbortedError' }))
+        // A hook that throws never reports tearing transport down, so the rejection it causes is
+        // shaped like what the destroyed source produces (a premature close) — provenance for that
+        // comes from the listener's own destroy, not from the hook.
+        rejectOperation(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }))
         throw new Error('teardown exploded')
       }
       const pending = runStoreWithSignal(source, controller.signal, () => operation, failingHook)
@@ -51,9 +53,12 @@ describe('runStoreWithSignal', () => {
       const operation = new Promise<never>((_, reject) => {
         rejectOperation = reject
       })
-      hookCalled = jest.fn(() =>
+      // A real hook reports that it tore the transport down, which is what credits the resulting
+      // transport-shaped rejection to this cancellation.
+      hookCalled = jest.fn(() => {
         rejectOperation(Object.assign(new Error('transport torn down'), { code: 'RequestAbortedError' }))
-      )
+        return true
+      })
       const pending = runStoreWithSignal(source, controller.signal, () => operation, hookCalled)
       controller.abort(reason)
       outcome = await pending.then(
