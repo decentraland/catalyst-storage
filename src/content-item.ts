@@ -1,4 +1,4 @@
-import { Readable } from 'stream'
+import { pipeline, Readable } from 'stream'
 import { createGunzip } from 'zlib'
 import { ContentItem } from './types'
 
@@ -24,7 +24,17 @@ export class SimpleContentItem implements ContentItem {
     const stream = await this.streamCreator()
 
     if (this.encoding === 'gzip') {
-      return stream.pipe(createGunzip())
+      const gunzip = createGunzip()
+      // `pipeline`, not `stream.pipe(gunzip)`: pipe forwards neither errors nor teardown between the
+      // two streams. A source that fails to open — the documented race where the file is deleted
+      // between retrieve() and this call — then emits an 'error' NOBODY listens to, which CRASHES
+      // the process instead of surfacing to the consumer; and a consumer that stops reading leaves
+      // the source open, leaking its file descriptor. pipeline propagates both directions, so the
+      // consumer sees the source's error and abandoning the returned stream destroys the source.
+      // The callback is required to keep pipeline from throwing on its own; the error reaches the
+      // consumer through the returned stream.
+      pipeline(stream, gunzip, () => undefined)
+      return gunzip
     }
 
     return stream

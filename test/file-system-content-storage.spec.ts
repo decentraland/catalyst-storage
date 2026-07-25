@@ -1,5 +1,5 @@
-import { createHash } from 'crypto'
-import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
+import { createHash, randomBytes } from 'crypto'
+import { mkdtempSync, promises as nodeFs, rmSync, writeFileSync } from 'fs'
 import os from 'os'
 import path from 'path'
 import { PassThrough, Readable, Writable } from 'stream'
@@ -7,6 +7,7 @@ import { gzipSync } from 'zlib'
 import {
   createFolderBasedFileSystemContentStorage,
   createFsComponent,
+  FileInfo,
   IContentStorageComponent,
   IFileSystemComponent
 } from '../src'
@@ -597,7 +598,7 @@ describe('fileSystemContentStorage', () => {
     })
   })
 
-  it(`When decompression fails due to a corrupt gzip file, then the partial file is cleaned up and retrieve returns undefined`, async () => {
+  it(`When decompression fails due to a corrupt gzip file, then the partial file is cleaned up and retrieve rejects`, async () => {
     const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'content-storage-corrupt-'))
     const storage = await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, tmpDir)
     const corruptId = 'corrupt-file'
@@ -611,9 +612,11 @@ describe('fileSystemContentStorage', () => {
       await fs.mkdir(path.join(tmpDir, hash), { recursive: true })
       await nodeFs.writeFile(gzipPath, Buffer.from('this is not valid gzip data'))
 
-      // Range request should trigger decompression which fails
-      const item = await storage.retrieve(corruptId, { start: 0, end: 4 })
-      expect(item).toBeUndefined()
+      // Range request should trigger decompression which fails. Corrupt STORED content is a local
+      // integrity failure, not a miss: `exist`/`fileInfo` both report the id present, so answering
+      // "not found" would hide unreadable content behind a 404 — the exact shape of failure that
+      // makes a poison-pill file invisible. It rejects, and the operator sees the zlib error.
+      await expect(storage.retrieve(corruptId, { start: 0, end: 4 })).rejects.toThrow()
 
       // The partial uncompressed file should have been cleaned up
       expect(await fs.existPath(uncompressedPath)).toBeFalsy()
@@ -939,6 +942,847 @@ describe('fileSystemContentStorage', () => {
     expect(await fileSystemContentStorage.fileInfo(id)).toEqual({ encoding: null, size: 3, contentSize: 3 })
     expect(await fileSystemContentStorage.fileInfo(id2)).toEqual({ encoding: null, size: 3, contentSize: 3 })
     expect(await fileSystemContentStorage.fileInfo('non-existent-id')).toBeUndefined()
+  })
+
+  describe.each([
+    {
+      what: 'a compressed store',
+      store: (storage: IContentStorageComponent, target: string, bytes: Buffer) =>
+        storage.storeStreamAndCompress(target, bufferToStream(bytes))
+    },
+    {
+      what: 'a plain store',
+      store: (storage: IContentStorageComponent, target: string, bytes: Buffer) =>
+        storage.storeStream(target, bufferToStream(bytes))
+    }
+  ])('when a cached shard directory is removed before $what', ({ store }) => {
+    let healRoot: string
+    let healStorage: IContentStorageComponent
+    let firstOutcome: unknown
+    let secondOutcome: unknown
+    // Compressible, so the compressed variant genuinely commits a gzip.
+    const bytes = Buffer.from(new Uint8Array(4096).fill(8))
+
+    beforeEach(async () => {
+      // Every write path resolves its target through the directory cache, so each one has to drop a
+      // stale entry when the directory turns out to be gone — otherwise the retry keeps skipping the
+      // mkdir and that shard fails permanently.
+      healRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-heal-'))
+      healStorage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        healRoot
+      )
+      await healStorage.storeStream(id, bufferToStream(content))
+      rmSync(path.join(healRoot, '9584'), { recursive: true, force: true })
+      firstOutcome = await store(healStorage, id, bytes).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+      secondOutcome = await store(healStorage, id, bytes).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await healStorage.stop?.()
+      rmSync(healRoot, { recursive: true, force: true })
+    })
+
+    it('should fail the write that hit the missing directory', () => {
+      expect((firstOutcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should recreate the directory on the retry', () => {
+      expect(secondOutcome).toEqual('resolved')
+    })
+
+    it('should serve the retried content', async () => {
+      const item = await healStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(bytes)
+    })
+  })
+
+  describe('when a cached shard directory is removed before a no-rename adapter writes', () => {
+    let legacyRoot: string
+    let legacyStorage: IContentStorageComponent
+    let firstOutcome: unknown
+    let secondOutcome: unknown
+
+    beforeEach(async () => {
+      // The legacy direct-write path returns before the atomic path's error handling, so it needs the
+      // same healing: its pipe writes straight to the canonical path under the cached directory.
+      legacyRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-heal-legacy-'))
+      const fsWithoutRename: IFileSystemComponent = { ...createFsComponent(), rename: undefined }
+      legacyStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: fsWithoutRename, logs: await createLogComponent({}) },
+        legacyRoot
+      )
+      await legacyStorage.storeStream(id, bufferToStream(content))
+      rmSync(path.join(legacyRoot, '9584'), { recursive: true, force: true })
+      firstOutcome = await legacyStorage.storeStream(id, bufferToStream(content2)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+      secondOutcome = await legacyStorage.storeStream(id, bufferToStream(content2)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await legacyStorage.stop?.()
+      rmSync(legacyRoot, { recursive: true, force: true })
+    })
+
+    it('should fail the write that hit the missing directory', () => {
+      expect((firstOutcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should recreate the directory on the retry', () => {
+      expect(secondOutcome).toEqual('resolved')
+    })
+
+    it('should serve the retried content', async () => {
+      const item = await legacyStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(content2)
+    })
+  })
+
+  describe('when a cached shard directory is replaced by a file', () => {
+    let obstructedRoot: string
+    let obstructedStorage: IContentStorageComponent
+    let obstructedShard: string
+    let whileObstructed: unknown
+    let afterRepair: unknown
+
+    beforeEach(async () => {
+      // A file at the shard path is not a directory writes can land in, so the cached entry is just as
+      // stale as a removed one. This storage will not clear the obstruction — deleting something it
+      // cannot prove it owns is what the reserved-namespace checks refuse to do — but once an operator
+      // does, the next write must be able to recreate the tree instead of failing on the stale entry.
+      obstructedRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-obstructed-'))
+      obstructedShard = path.join(obstructedRoot, '9584')
+      obstructedStorage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        obstructedRoot
+      )
+      await obstructedStorage.storeStream(id, bufferToStream(content))
+      rmSync(obstructedShard, { recursive: true, force: true })
+      await nodeFs.writeFile(obstructedShard, 'not a directory')
+      whileObstructed = await obstructedStorage.storeStream(id, bufferToStream(content)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+      rmSync(obstructedShard, { force: true })
+      afterRepair = await obstructedStorage.storeStream(id, bufferToStream(content)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await obstructedStorage.stop?.()
+      rmSync(obstructedRoot, { recursive: true, force: true })
+    })
+
+    it('should fail the write while the path is obstructed', () => {
+      expect(whileObstructed).not.toEqual('resolved')
+    })
+
+    it('should recreate the directory on the first write after the obstruction is cleared', () => {
+      expect(afterRepair).toEqual('resolved')
+    })
+
+    it('should serve the content stored after the repair', async () => {
+      const item = await obstructedStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+    })
+  })
+
+  describe('when a cached shard directory is removed underneath the storage', () => {
+    let firstOutcome: unknown
+    let secondOutcome: unknown
+
+    beforeEach(async () => {
+      // The directory cache assumes the documented exclusive root ownership. If a directory
+      // disappears anyway, the operation that needed it must fail loudly and drop the stale entry,
+      // so a retry recreates the tree instead of failing forever.
+      await fileSystemContentStorage.storeStream(id, bufferToStream(content))
+      rmSync(path.dirname(filePath), { recursive: true, force: true })
+      const attempt = () =>
+        fileSystemContentStorage.storeStream(id, bufferToStream(content)).then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
+      firstOutcome = await attempt()
+      secondOutcome = await attempt()
+    })
+
+    it('should fail the store that hit the missing directory', () => {
+      expect((firstOutcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should recreate the directory on the next store', () => {
+      expect(secondOutcome).toEqual('resolved')
+    })
+
+    it('should serve the content stored by the retry', async () => {
+      const item = await fileSystemContentStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+    })
+  })
+
+  describe('when the filesystem component is a custom adapter', () => {
+    let adapterRoot: string
+    let adapterStorage: IContentStorageComponent
+    let streamedThroughAdapter: string[]
+    const compressible = Buffer.from(new Uint8Array(4096).fill(3))
+
+    beforeEach(async () => {
+      // Compression reads and writes through the INJECTED component, so an adapter that instruments
+      // or virtualizes paths gets compressed stores too — not just atomic raw writes. Native `fs`
+      // would happily produce the same on-disk result here, so the assertions below check that the
+      // bytes travelled through the adapter, which is the part that a custom adapter depends on.
+      adapterRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-adapter-'))
+      streamedThroughAdapter = []
+      const realFs = createFsComponent()
+      const recordingFs: IFileSystemComponent = {
+        ...realFs,
+        createReadStream(target: any, options?: any) {
+          streamedThroughAdapter.push(`read:${target}`)
+          return realFs.createReadStream(target, options)
+        },
+        createWriteStream(target: any, options?: any) {
+          streamedThroughAdapter.push(`write:${target}`)
+          return realFs.createWriteStream(target, options)
+        }
+      }
+      adapterStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: recordingFs, logs: await createLogComponent({}) },
+        adapterRoot
+      )
+      await adapterStorage.storeStreamAndCompress(id, bufferToStream(compressible))
+    })
+
+    afterEach(async () => {
+      await adapterStorage.stop?.()
+      rmSync(adapterRoot, { recursive: true, force: true })
+    })
+
+    it('should compress the store', async () => {
+      expect((await adapterStorage.fileInfo(id))!.encoding).toEqual('gzip')
+    })
+
+    it('should read the staged raw back through the adapter to compress it', () => {
+      // The first write of a compressed store is the staged raw; the compression is the only thing
+      // that reads it back, so its presence here proves the compression used this component.
+      const stagedRaw = streamedThroughAdapter[0].replace(/^write:/, '')
+      expect(streamedThroughAdapter).toContain(`read:${stagedRaw}`)
+    })
+
+    it('should write the gzip output through the adapter', () => {
+      const writes = streamedThroughAdapter.filter((entry) => entry.startsWith('write:'))
+      expect(writes).toHaveLength(2)
+    })
+
+    it('should serve the stored content', async () => {
+      const item = await adapterStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(compressible)
+    })
+  })
+
+  describe('when a custom adapter provides no lstat', () => {
+    let noLstatRoot: string
+    let noLstatStorage: IContentStorageComponent
+    const compressible = Buffer.from(new Uint8Array(4096).fill(4))
+
+    beforeEach(async () => {
+      // `lstat` is optional on IFileSystemComponent, so the compression's size comparison has to fall
+      // back to `stat` — an adapter without it must still get compressed stores.
+      noLstatRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-no-lstat-'))
+      const noLstatFs: IFileSystemComponent = { ...createFsComponent(), lstat: undefined }
+      noLstatStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: noLstatFs, logs: await createLogComponent({}) },
+        noLstatRoot
+      )
+      await noLstatStorage.storeStreamAndCompress(id, bufferToStream(compressible))
+    })
+
+    afterEach(async () => {
+      await noLstatStorage.stop?.()
+      rmSync(noLstatRoot, { recursive: true, force: true })
+    })
+
+    it('should still compress the store', async () => {
+      expect((await noLstatStorage.fileInfo(id))!.encoding).toEqual('gzip')
+    })
+
+    it('should serve the stored content', async () => {
+      const item = await noLstatStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(compressible)
+    })
+  })
+
+  describe('when the storage itself cannot read a present id', () => {
+    let faultyRoot: string
+    let faultyStorage: IContentStorageComponent
+    let outcome: unknown
+
+    beforeEach(async () => {
+      // A fault in the storage's own tree is not a miss. Answering "not found" would make an
+      // unreadable disk look like an empty node — the caller stops retrying and starts serving 404s
+      // for content it has.
+      faultyRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-faulty-'))
+      const realFs = createFsComponent()
+      const faultyFs: IFileSystemComponent = {
+        ...realFs,
+        mkdir: (async (target: any, options?: any) => {
+          // Only the shard directory fails, so construction (root + reserved dir) still succeeds.
+          if (String(target).endsWith('9584')) {
+            throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
+          }
+          return realFs.mkdir(target, options)
+        }) as IFileSystemComponent['mkdir']
+      }
+      faultyStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: faultyFs, logs: await createLogComponent({}) },
+        faultyRoot
+      )
+      outcome = await faultyStorage.retrieve(id).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await faultyStorage.stop?.()
+      rmSync(faultyRoot, { recursive: true, force: true })
+    })
+
+    it('should reject with the underlying filesystem error', () => {
+      expect((outcome as { code?: string }).code).toEqual('EACCES')
+    })
+  })
+
+  describe('when the shard directory of a stored id is replaced by a file', () => {
+    let brokenRoot: string
+    let brokenStorage: IContentStorageComponent
+    let retrieveOutcome: unknown
+    let fileInfoOutcome: unknown
+    let storeWhileObstructed: unknown
+    let storeAfterRepair: unknown
+
+    beforeEach(async () => {
+      // An access check passes for a regular file sitting at the shard path, while every stat beneath
+      // it fails with ENOTDIR — so "the parent is present" is not enough to call this id absent. Two
+      // ids in different shards, because surfacing the fault also drops the cache entry.
+      brokenRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-shard-file-'))
+      brokenStorage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        brokenRoot
+      )
+      await brokenStorage.storeStream(id, bufferToStream(content))
+      await brokenStorage.storeStream(id2, bufferToStream(content2))
+      const obstruct = async (shard: string): Promise<void> => {
+        rmSync(path.join(brokenRoot, shard), { recursive: true, force: true })
+        await nodeFs.writeFile(path.join(brokenRoot, shard), 'not a directory')
+      }
+      await obstruct('9584')
+      await obstruct('ea6c')
+      retrieveOutcome = await brokenStorage.retrieve(id).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+      fileInfoOutcome = await brokenStorage.fileInfo(id2).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+      // The obstruction is NOT removed on our behalf: a write keeps failing while it is there.
+      storeWhileObstructed = await brokenStorage.storeStream(id, bufferToStream(content)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+      // Once an operator clears it, the dropped cache entry lets the tree be recreated.
+      rmSync(path.join(brokenRoot, '9584'), { force: true })
+      storeAfterRepair = await brokenStorage.storeStream(id, bufferToStream(content)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await brokenStorage.stop?.()
+      rmSync(brokenRoot, { recursive: true, force: true })
+    })
+
+    it('should reject the read rather than report the id absent', () => {
+      expect((retrieveOutcome as { code?: string }).code).toEqual('ENOTDIR')
+    })
+
+    it('should reject fileInfo as well', () => {
+      expect((fileInfoOutcome as { code?: string }).code).toEqual('ENOTDIR')
+    })
+
+    it('should keep failing writes while the path is obstructed', () => {
+      expect(storeWhileObstructed).not.toEqual('resolved')
+    })
+
+    it('should recreate the directory once the obstruction is cleared', () => {
+      expect(storeAfterRepair).toEqual('resolved')
+    })
+
+    it('should serve the content stored after the repair', async () => {
+      const item = await brokenStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(content)
+    })
+  })
+
+  describe('when the shard directory of a stored id is removed', () => {
+    let goneRoot: string
+    let goneStorage: IContentStorageComponent
+    let retrieveOutcome: unknown
+    let fileInfoOutcome: unknown
+    let laterStore: unknown
+
+    beforeEach(async () => {
+      // A stat ENOENT means "this id is absent" only while the shard directory is still there. If the
+      // directory this storage owns has been removed, every id inside it is gone: that is a storage
+      // fault, and answering "absent" would present a broken store as an empty one.
+      goneRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-shard-gone-'))
+      goneStorage = await createFolderBasedFileSystemContentStorage(
+        { fs, logs: await createLogComponent({}) },
+        goneRoot
+      )
+      // Two ids in different shards, because surfacing the fault also heals it: the failed read drops
+      // the stale cache entry, so the next call through that shard recreates the directory and then
+      // legitimately reports a miss. Each method therefore gets its own shard to fault on.
+      await goneStorage.storeStream(id, bufferToStream(content))
+      await goneStorage.storeStream(id2, bufferToStream(content2))
+      rmSync(path.join(goneRoot, '9584'), { recursive: true, force: true })
+      rmSync(path.join(goneRoot, 'ea6c'), { recursive: true, force: true })
+      retrieveOutcome = await goneStorage.retrieve(id).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+      fileInfoOutcome = await goneStorage.fileInfo(id2).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+      // The failed read also invalidated the cached directory, so a write heals the tree.
+      laterStore = await goneStorage.storeStream(id, bufferToStream(content)).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await goneStorage.stop?.()
+      rmSync(goneRoot, { recursive: true, force: true })
+    })
+
+    it('should reject the read rather than report the id absent', () => {
+      expect((retrieveOutcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should reject fileInfo as well', () => {
+      expect((fileInfoOutcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should let a later write recreate the directory', () => {
+      expect(laterStore).toEqual('resolved')
+    })
+
+    it('should report an id whose shard directory is intact as simply absent', async () => {
+      expect(await goneStorage.retrieve('never-stored-id')).toBeUndefined()
+      expect(await goneStorage.fileInfo('never-stored-id')).toBeUndefined()
+    })
+  })
+
+  describe('when the gzip trailer read fails with a storage error', () => {
+    let trailerRoot: string
+    let trailerStorage: IContentStorageComponent
+    let outcome: unknown
+    const compressible = Buffer.from(new Uint8Array(4096).fill(2))
+
+    beforeEach(async () => {
+      // `contentSize: null` legitimately means "the format cannot express this size", so it must not
+      // also mean "the read failed" — callers cannot tell those apart, and one of them bounds range
+      // requests with `contentSize ?? size`, which would silently substitute the compressed size.
+      jest.useRealTimers()
+      trailerRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-trailer-'))
+      const realFs = createFsComponent()
+      let failTrailer = false
+      const trailerFailingFs: IFileSystemComponent = {
+        ...realFs,
+        createReadStream(target: any, options?: any) {
+          // The trailer read is the only ranged read of a .gzip path.
+          if (failTrailer && String(target).endsWith('.gzip') && options?.start !== undefined) {
+            const stream = new Readable({ read() {} })
+            process.nextTick(() => stream.destroy(Object.assign(new Error('EIO: i/o error, read'), { code: 'EIO' })))
+            return stream as any
+          }
+          return realFs.createReadStream(target, options)
+        }
+      }
+      trailerStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: trailerFailingFs, logs: await createLogComponent({}) },
+        trailerRoot
+      )
+      await trailerStorage.storeStreamAndCompress(id, bufferToStream(compressible))
+      failTrailer = true
+      outcome = await trailerStorage.fileInfo(id).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await trailerStorage.stop?.()
+      rmSync(trailerRoot, { recursive: true, force: true })
+    })
+
+    it('should reject rather than report an unknown content size', () => {
+      expect((outcome as { code?: string }).code).toEqual('EIO')
+    })
+  })
+
+  describe('when the gzip vanishes between its stat and the trailer read', () => {
+    let raceRoot: string
+    let raceStorage: IContentStorageComponent
+    let outcome: FileInfo | undefined
+    const compressible = Buffer.from(new Uint8Array(4096).fill(1))
+
+    beforeEach(async () => {
+      // A store transitioning gzip -> raw lands exactly here, so the id is not absent: the raw
+      // representation must be reported instead of a file that is no longer there.
+      jest.useRealTimers()
+      raceRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-trailer-race-'))
+      const realFs = createFsComponent()
+      let armed = false
+      const racingFs: IFileSystemComponent = {
+        ...realFs,
+        createReadStream(target: any, options?: any) {
+          if (armed && String(target).endsWith('.gzip') && options?.start !== undefined) {
+            armed = false
+            // The gzip goes away and the raw takes over, as a gzip -> raw transition would leave it.
+            rmSync(String(target), { force: true })
+            writeFileSync(String(target).replace(/\.gzip$/, ''), content)
+          }
+          return realFs.createReadStream(target, options)
+        }
+      }
+      raceStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: racingFs, logs: await createLogComponent({}) },
+        raceRoot
+      )
+      await raceStorage.storeStreamAndCompress(id, bufferToStream(compressible))
+      armed = true
+      outcome = await raceStorage.fileInfo(id)
+    })
+
+    afterEach(async () => {
+      await raceStorage.stop?.()
+      rmSync(raceRoot, { recursive: true, force: true })
+    })
+
+    it('should report the raw representation instead', () => {
+      expect(outcome).toEqual({ encoding: null, size: content.length, contentSize: content.length })
+    })
+  })
+
+  describe('when stat fails with a non-miss error on a present file', () => {
+    let statFailRoot: string
+    let statFailStorage: IContentStorageComponent
+    let retrieveOutcome: unknown
+    let fileInfoOutcome: unknown
+
+    beforeEach(async () => {
+      // An unreadable file is not an absent one. Reporting it as missing is the "broken storage looks
+      // like a 404" behaviour this contract removes, so only ENOENT/ENOTDIR may answer "absent".
+      statFailRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-stat-fail-'))
+      const realFs = createFsComponent()
+      let failStats = false
+      const statFailingFs: IFileSystemComponent = {
+        ...realFs,
+        stat: (async (target: any, options?: any) => {
+          if (failStats && String(target).includes('9584')) {
+            throw Object.assign(new Error('EIO: i/o error, stat'), { code: 'EIO' })
+          }
+          return realFs.stat(target, options)
+        }) as IFileSystemComponent['stat']
+      }
+      statFailStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: statFailingFs, logs: await createLogComponent({}) },
+        statFailRoot
+      )
+      await statFailStorage.storeStream(id, bufferToStream(content))
+      failStats = true
+      retrieveOutcome = await statFailStorage.retrieve(id).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+      fileInfoOutcome = await statFailStorage.fileInfo(id).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await statFailStorage.stop?.()
+      rmSync(statFailRoot, { recursive: true, force: true })
+    })
+
+    it('should reject the read instead of reporting the id absent', () => {
+      expect((retrieveOutcome as { code?: string }).code).toEqual('EIO')
+    })
+
+    it('should reject fileInfo as well', () => {
+      expect((fileInfoOutcome as { code?: string }).code).toEqual('EIO')
+    })
+  })
+
+  describe.each([
+    {
+      what: 'removed',
+      code: 'ENOENT',
+      damage: (shard: string) => rmSync(shard, { recursive: true, force: true })
+    },
+    {
+      what: 'replaced by a file',
+      code: 'ENOTDIR',
+      damage: (shard: string) => {
+        rmSync(shard, { recursive: true, force: true })
+        writeFileSync(shard, 'not a directory')
+      }
+    }
+  ])('when the shard directory is $what between the gzip stat and its open', ({ code, damage }) => {
+    let damagedRoot: string
+    let damagedStorage: IContentStorageComponent
+    let outcome: unknown
+    const compressible = Buffer.from(new Uint8Array(4096).fill(9))
+
+    beforeEach(async () => {
+      // The inflation stats the gzip, then opens it. Damage landing in that window makes the open
+      // fail exactly like a concurrently deleted source — but the shard being gone means every id in
+      // it is unreadable, which is a storage fault and must not be reported as this id being absent.
+      jest.useRealTimers()
+      damagedRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-shard-race-'))
+      const realFs = createFsComponent()
+      let armed = false
+      const damagingFs: IFileSystemComponent = {
+        ...realFs,
+        createReadStream(target: any, options?: any) {
+          if (armed && String(target).endsWith('.gzip')) {
+            armed = false
+            damage(path.join(damagedRoot, '9584'))
+          }
+          return realFs.createReadStream(target, options)
+        }
+      }
+      damagedStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: damagingFs, logs: await createLogComponent({}) },
+        damagedRoot
+      )
+      // Gzip-only, so serving a range must inflate it.
+      await damagedStorage.storeStreamAndCompress(id, bufferToStream(compressible))
+      armed = true
+      outcome = await damagedStorage.retrieve(id, { start: 0, end: 3 }).then(
+        (value) => (value === undefined ? 'reported-absent' : 'served'),
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await damagedStorage.stop?.()
+      rmSync(damagedRoot, { recursive: true, force: true })
+    })
+
+    it('should reject rather than report the id absent', () => {
+      expect((outcome as { code?: string }).code).toEqual(code)
+    })
+  })
+
+  describe('when the decompression staging write fails asynchronously', () => {
+    let asyncFailRoot: string
+    let asyncFailStorage: IContentStorageComponent
+    let outcome: unknown
+    const compressible = Buffer.from(new Uint8Array(4096).fill(7))
+
+    beforeEach(async () => {
+      // The native shape of a vanished staging directory: `createWriteStream` returns a stream that
+      // then emits ENOENT. `pipeline` destroys the upstream gzip stream WITH that error, so the
+      // failure arrives on the source stream as the very same object a deleted source would produce —
+      // it can only be told apart by checking whether the source is actually gone.
+      jest.useRealTimers()
+      asyncFailRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-async-staging-'))
+      const realFs = createFsComponent()
+      let failStaging = false
+      const asyncFailingFs: IFileSystemComponent = {
+        ...realFs,
+        createWriteStream(target: any, options?: any) {
+          if (failStaging && String(target).includes('.tmp-writes')) {
+            // A real write stream over a directory that does not exist: emits ENOENT on open.
+            return realFs.createWriteStream(path.join(asyncFailRoot, 'no-such-dir', 'staged'), options)
+          }
+          return realFs.createWriteStream(target, options)
+        }
+      }
+      asyncFailStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: asyncFailingFs, logs: await createLogComponent({}) },
+        asyncFailRoot
+      )
+      // Gzip-only, so serving a range has to inflate through the staging area.
+      await asyncFailStorage.storeStreamAndCompress(id, bufferToStream(compressible))
+      failStaging = true
+      outcome = await asyncFailStorage.retrieve(id, { start: 0, end: 3 }).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await asyncFailStorage.stop?.()
+      rmSync(asyncFailRoot, { recursive: true, force: true })
+    })
+
+    it('should reject rather than report the id absent', () => {
+      expect((outcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should keep the gzip content intact', async () => {
+      const item = await asyncFailStorage.retrieve(id)
+      expect(await streamToBuffer(await item!.asStream())).toEqual(compressible)
+    })
+  })
+
+  describe('when the decompression staging raises ENOENT', () => {
+    let stagingFailRoot: string
+    let stagingFailStorage: IContentStorageComponent
+    let outcome: unknown
+    let gzipReads: Readable[]
+    // Incompressible and large, so the source is provably still mid-read when the destination fails —
+    // small content finishes and closes itself, which would hide a leaked descriptor.
+    const incompressible = randomBytes(8 << 20)
+
+    beforeEach(async () => {
+      // An ENOENT from the storage's OWN machinery (here the staging directory) is a fault, not a
+      // miss: the content is present and readable, only the cache write failed. Classifying every
+      // ENOENT as absence would hide exactly that.
+      //
+      // The destination is also constructed AFTER the source, so a synchronous failure here is the
+      // case where nothing has taken ownership of the source yet and it must still be torn down.
+      jest.useRealTimers()
+      stagingFailRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-staging-fail-'))
+      const realFs = createFsComponent()
+      let failStaging = false
+      gzipReads = []
+      const stagingFailingFs: IFileSystemComponent = {
+        ...realFs,
+        createReadStream(target: any, options?: any) {
+          const stream = realFs.createReadStream(target, options)
+          // Whole-file reads of the gzip only: the trailer probe is a ranged read.
+          if (String(target).endsWith('.gzip') && options?.start === undefined) {
+            gzipReads.push(stream as Readable)
+          }
+          return stream
+        },
+        createWriteStream(target: any, options?: any) {
+          if (failStaging && String(target).includes('.tmp-writes')) {
+            throw Object.assign(new Error(`ENOENT: no such file or directory, open '${target}'`), {
+              code: 'ENOENT'
+            })
+          }
+          return realFs.createWriteStream(target, options)
+        }
+      }
+      stagingFailStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: stagingFailingFs, logs: await createLogComponent({}) },
+        stagingFailRoot
+      )
+      // Written directly rather than through storeStreamAndCompress: the state needed here is
+      // gzip-only content whose gzip is LARGE, and a store would have discarded a gzip this
+      // incompressible in favour of the raw, leaving nothing to inflate.
+      await nodeFs.mkdir(path.join(stagingFailRoot, '9584'), { recursive: true })
+      await nodeFs.writeFile(path.join(stagingFailRoot, '9584', `${id}.gzip`), gzipSync(incompressible))
+      failStaging = true
+      outcome = await stagingFailStorage.retrieve(id, { start: 0, end: 3 }).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+      // Teardown is asynchronous; give the destroy a turn to land.
+      await new Promise((resolve) => setImmediate(resolve))
+    })
+
+    afterEach(async () => {
+      await stagingFailStorage.stop?.()
+      rmSync(stagingFailRoot, { recursive: true, force: true })
+    })
+
+    it('should reject rather than report the id absent', () => {
+      expect((outcome as { code?: string }).code).toEqual('ENOENT')
+    })
+
+    it('should have opened the gzip source before the destination failed', () => {
+      expect(gzipReads.length).toBeGreaterThan(0)
+    })
+
+    it('should destroy the source rather than leak its descriptor', () => {
+      expect(gzipReads.map((stream) => stream.destroyed)).not.toContain(false)
+    })
+  })
+
+  describe('when a file vanishes between being observed and being read', () => {
+    let vanishRoot: string
+    let vanishStorage: IContentStorageComponent
+    let result: unknown
+    const vanishing = Buffer.from(new Uint8Array(4096).fill(5))
+
+    beforeEach(async () => {
+      // A delete landing mid-read is an expected race, not a fault: the id is genuinely gone, so the
+      // read reports it absent rather than rejecting. The delete is performed at the exact moment the
+      // inflation opens the gzip, so the ENOENT is a real one carrying the real path — racing an
+      // actual concurrent unlink is not deterministic, since POSIX keeps an already-open file
+      // readable.
+      // Earlier tests in this file install fake timers; the inflate pipeline's teardown needs a real
+      // setImmediate to settle.
+      jest.useRealTimers()
+      vanishRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-vanish-'))
+      const realFs = createFsComponent()
+      let armed = false
+      const racingFs: IFileSystemComponent = {
+        ...realFs,
+        createReadStream(target: any, options?: any) {
+          if (armed && String(target).endsWith('.gzip')) {
+            armed = false
+            // The delete lands here: between the existence check that admitted this read and the
+            // open that is about to fail.
+            rmSync(target, { force: true })
+          }
+          return realFs.createReadStream(target, options)
+        }
+      }
+      vanishStorage = await createFolderBasedFileSystemContentStorage(
+        { fs: racingFs, logs: await createLogComponent({}) },
+        vanishRoot
+      )
+      // Gzip-only, so serving a range has to inflate it — the read that observes the vanishing file.
+      await vanishStorage.storeStreamAndCompress(id, bufferToStream(vanishing))
+      armed = true
+      result = await vanishStorage.retrieve(id, { start: 0, end: 3 }).then(
+        (value) => value,
+        (error: unknown) => error
+      )
+    })
+
+    afterEach(async () => {
+      await vanishStorage.stop?.()
+      rmSync(vanishRoot, { recursive: true, force: true })
+    })
+
+    it('should report the id as absent', () => {
+      expect(result).toBeUndefined()
+    })
   })
 
   describe('atomic storeStream', () => {
