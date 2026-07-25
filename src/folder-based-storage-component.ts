@@ -1,14 +1,15 @@
 import { createHash } from 'crypto'
 import path from 'path'
-import { pipeline, Readable, Transform } from 'stream'
+import { pipeline, Readable, Transform, Writable } from 'stream'
 import { promisify } from 'util'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
 import { isAbortError, markAsNonCancellationError, runStoreWithSignal } from './cancellation'
 import { compressContentFile } from './extras/compression'
 import { createFsInvariants } from './folder-based/fs-invariants'
-import { createDecompressCache } from './folder-based/decompress-cache'
+import { createDecompressCache, InvalidationToken } from './folder-based/decompress-cache'
 import { createIntentJournal, TEMP_DIR_NAME, UncommittedIntentSurvivedError } from './folder-based/intent-journal'
+import { DecompressionLimitExceededError, PathNotContainedError } from './folder-based/errors'
 
 const pipe = promisify(pipeline)
 
@@ -58,7 +59,9 @@ function createSizeLimitTransform(maxBytes: number): Transform {
     transform(chunk: Buffer, _encoding, callback) {
       total += chunk.length
       if (total > maxBytes) {
-        callback(new Error(`Decompressed size exceeds the maximum allowed of ${maxBytes} bytes`))
+        callback(
+          new DecompressionLimitExceededError(`Decompressed size exceeds the maximum allowed of ${maxBytes} bytes`)
+        )
         return
       }
       callback(null, chunk)
@@ -82,9 +85,12 @@ function createSizeLimitTransform(maxBytes: number): Transform {
  *   can never leave a partial file at a canonical path. Without `rename` (legacy custom adapters)
  *   writes fall back to non-atomic direct writes; a warning is logged at construction.
  * - **Atomicity covers process crashes, NOT power-loss durability** — staged data is deliberately
- *   not `fsync`'d before the commit rename. A power loss / kernel panic between write and flush may
- *   lose the file entirely (never a partial/mixed state); content is content-addressed and
- *   re-downloadable, so durability past process death is intentionally out of contract.
+ *   not `fsync`'d before the commit rename. Against process death this is airtight (a canonical path
+ *   holds the previous file or the complete new one, never a partial). Against a power loss / kernel
+ *   panic it is not: `rename` orders metadata, so the directory entry can survive while the staged
+ *   data blocks never reached the disk, leaving the file missing, zero-length or partial. Content is
+ *   content-addressed and re-downloadable, so durability past process death is intentionally out of
+ *   contract — but consumers must detect and discard unreadable content rather than trust presence.
  * - **Reserved staging namespace** — one directory name directly under the root (default
  *   `.tmp-writes`, see {@link FolderStorageOptions.tempDirectoryName}) is reserved; ids resolving
  *   into it are rejected. With `disablePrefixHash` the factory REFUSES TO START if that directory
@@ -229,14 +235,47 @@ export async function createFolderBasedFileSystemContentStorage(
 
   /**
    * Read-path existence probe: ONE stat instead of `existPath` followed by `stat`, since a stat
-   * answers both questions. Any failure means "cannot serve", matching what `existPath` reported
-   * (it tests F_OK|R_OK, so an unreadable file was already a miss here). Recovery invariants use
-   * `existsForInvariant` instead, which must distinguish absent from unreadable.
+   * answers both questions.
+   *
+   * Only ENOENT/ENOTDIR count as absent. Every other failure — EACCES, EIO, an adapter fault — means
+   * the file may well be there and we cannot read it, which is not the same answer: returning
+   * `undefined` would report a present-but-unreadable file as missing and put the "broken storage
+   * looks like 404" behaviour right back into the read path this contract exists to fix. Same rule as
+   * `existsForInvariant`; the difference is only that recovery paths need the boolean.
    */
   async function statForRead(filePath: string): Promise<{ size: number } | undefined> {
     try {
       return await components.fs.stat(filePath)
-    } catch {
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw err
+      // A missing-file error here has two very different meanings, and only one of them is a miss.
+      // `getFilePath` created the parent directory (or served it from the cache) immediately before
+      // this probe, so an INTACT DIRECTORY must be sitting there. Anything else means the tree this
+      // instance owns was damaged underneath it — the shard was removed, taking every id inside it,
+      // or something replaced it with a file — which is a storage fault, not this id being absent.
+      // Reporting absence would hand back a 404 for a broken store.
+      //
+      // The parent must be proven to be a DIRECTORY, not merely present: an access check passes for a
+      // regular file left at the shard path, while every stat beneath it fails with ENOTDIR, so
+      // "present" alone would classify a corrupted tree as a miss. A probe that fails for any reason
+      // is likewise not proof, so it does not earn one either.
+      //
+      // Costs one syscall, and only after a stat has already failed — hits, the hot path this cache
+      // exists for, are untouched. Invalidating also lets a write recreate the tree once whatever is
+      // occupying the path is gone (a foreign file is never removed here: destroying something this
+      // storage cannot prove it owns is exactly what the reserved-namespace checks refuse to do).
+      const dirname = path.dirname(filePath)
+      let parentIsIntact = false
+      try {
+        parentIsIntact = (await components.fs.stat(dirname)).isDirectory()
+      } catch {
+        parentIsIntact = false
+      }
+      if (!parentIsIntact) {
+        forgetDirectory(dirname)
+        logger.warn(`Refusing to report ${filePath} as absent: its parent directory is missing or is not a directory`)
+        throw err
+      }
       return undefined
     }
   }
@@ -259,14 +298,14 @@ export async function createFolderBasedFileSystemContentStorage(
     // to "<root>-evil" — cannot pass: "/data/contents-evil".startsWith("/data/contents") is true,
     // but it is outside "/data/contents/".
     if (finalPath !== directoryPath && !finalPath.startsWith(directoryPath + path.sep)) {
-      throw new Error('Cannot manipulate files outside of the root storage folder')
+      throw new PathNotContainedError('Cannot manipulate files outside of the root storage folder')
     }
 
     // The temp-write namespace is reserved: an id resolving into it (reachable when
     // disablePrefixHash makes the root itself the containment dir, e.g. '.tmp-writes/foo') would be
     // hidden from allFileIds and could be deleted by the startup sweep.
     if (ATOMIC_MODE && (finalPath === tempDir || finalPath.startsWith(tempDir + path.sep))) {
-      throw new Error('Cannot manipulate files inside the reserved temp-write folder')
+      throw new PathNotContainedError('Cannot manipulate files inside the reserved temp-write folder')
     }
 
     if (!knownDirectories.has(dirname)) {
@@ -307,6 +346,127 @@ export async function createFolderBasedFileSystemContentStorage(
     }
 
     return undefined
+  }
+
+  async function gzipSourceVanishedForRead(gzipPath: string): Promise<boolean> {
+    // Was a failed inflation the SOURCE disappearing under a concurrent delete — an expected race —
+    // or this storage's own machinery breaking? The error cannot answer that: neither its code nor
+    // its identity is evidence, because `pipeline` destroys upstream streams WITH the downstream
+    // error, so a staging write that fails ENOENT arrives on the gzip stream as the very same object
+    // a vanished source would produce. Attributing by listener would credit every broken staging
+    // directory to a deleted file and retry it into a reported absence.
+    //
+    // The on-disk state does answer it, and only costs a probe on the failure path: if the gzip we
+    // were inflating is gone, the id really is being deleted; if it is still there, the failure
+    // belongs to us.
+    //
+    // Answered by `statForRead`, the same probe the rest of the read path uses, so absence means the
+    // same thing everywhere: the file is gone AND its parent is still proven to be a directory. A
+    // weaker test — plain "the path does not exist" — would call a removed or file-obstructed shard
+    // a vanished source, swallow the inflation and retry it into a reported absence, which is
+    // precisely the misclassification this contract removes. Its rejection (a parent that cannot be
+    // proven intact) is not evidence of a vanish either: it invalidates the stale cache entry on the
+    // way through, and the caller's original inflate error is what surfaces.
+    try {
+      return (await statForRead(gzipPath)) === undefined
+    } catch {
+      return false
+    }
+  }
+
+  async function inflateGzipItemInto(gzipItem: ContentItem, target: string): Promise<void> {
+    // Both streams are created inside the try and torn down if anything fails before `pipe` takes
+    // ownership: arguments evaluate left to right, so the source (and the file descriptor behind it)
+    // already exists by the time the destination is constructed, and a custom adapter may throw
+    // synchronously there where native fs would report asynchronously. Without this the source is
+    // left paused mid-read, holding its descriptor for the life of the process. When `pipe` did run
+    // it has already destroyed both, so the teardown here is a no-op in the common failure case.
+    let source: Readable | undefined
+    let destination: Writable | undefined
+    try {
+      source = await gzipItem.asStream()
+      destination = components.fs.createWriteStream(target)
+      // Cap how much the gzip may inflate to so a decompression bomb cannot write an unbounded file
+      // to disk. The gzip trailer's declared size is attacker-controllable, so the limit is enforced
+      // on the actual inflated bytes.
+      await pipe(source, createSizeLimitTransform(MAX_DECOMPRESSED_SIZE), destination)
+    } catch (err) {
+      for (const stream of [source, destination]) {
+        try {
+          stream?.destroy()
+        } catch {
+          // best-effort teardown; the failure below is what matters
+        }
+      }
+      throw err
+    }
+  }
+
+  async function materializeRangeCacheFromGzip(
+    id: string,
+    uncompressedPath: string,
+    token: InvalidationToken
+  ): Promise<void> {
+    const gzipItem = await retrieveWithEncoding(id, 'gzip')
+    if (!gzipItem) {
+      return
+    }
+
+    const gzipPath = uncompressedPath + '.gzip'
+    const sourceVanished = () => gzipSourceVanishedForRead(gzipPath)
+    const { rename } = components.fs
+    if (rename) {
+      // Stage the inflation in the temp dir so a process killed mid-decompress can never leave a
+      // partial file at the canonical uncompressed path — a later range request would silently serve
+      // its truncated bytes as valid content.
+      const writePath = journal.newTempPath()
+      try {
+        await inflateGzipItemInto(gzipItem, writePath)
+        // Commit under the path lock so this rename can never interleave with a store or delete on
+        // the same canonical path; discard when the source gzip was replaced or the id deleted while
+        // inflating.
+        const committed = await withPathLock(uncompressedPath, async () => {
+          if (token.invalidated) return false
+          await rename(writePath, uncompressedPath)
+          const stat = await components.fs.stat(uncompressedPath)
+          cache.record(uncompressedPath, stat.size)
+          return true
+        })
+        if (!committed) {
+          await noFailUnlink(writePath)
+        }
+      } catch (err) {
+        // Remove the partial staged file; the canonical path was never touched.
+        await noFailUnlink(writePath)
+        // An invalidated token means the id was overwritten/deleted while inflating — the failure
+        // belongs to the replaced gzip, not to the caller's request. Resolving lets the retry loop
+        // observe the new representation instead of the error bubbling into a spurious undefined for
+        // a valid id.
+        if (token.invalidated || (await sourceVanished())) return
+        throw err
+      }
+      return
+    }
+
+    // In-place (no rename) legacy path: there is no staging, so the ENTIRE inflate/register sequence
+    // runs under the path lock and honors the invalidation token — a concurrent store/delete
+    // completing first must not be overwritten by a stale decompression, and the cleanup of a failed
+    // inflation must not race a newer writer.
+    await withPathLock(uncompressedPath, async () => {
+      if (token.invalidated) return
+      try {
+        await inflateGzipItemInto(gzipItem, uncompressedPath)
+      } catch (err) {
+        // Under the lock the partial file is provably ours to remove.
+        await noFailUnlink(uncompressedPath)
+        // Defensive symmetry with the staged branch: writers take this same lock, so the token cannot
+        // flip mid-section today.
+        if (token.invalidated || (await sourceVanished())) return
+        throw err
+      }
+      const stat = await components.fs.stat(uncompressedPath)
+      cache.record(uncompressedPath, stat.size)
+    })
   }
 
   // Shared no-rename (legacy) direct write. MUST be called while holding the path lock. Writes the
@@ -420,6 +580,12 @@ export async function createFolderBasedFileSystemContentStorage(
   // that as a retryable miss, exactly like retrieve() having returned undefined. Ids quarantined by
   // a failed post-rename cleanup are repaired before serving or reported as absent — a read never
   // exposes a known-mixed state (see the intent journal's quarantine).
+  //
+  // Error contract: `undefined` means "there is nothing to serve for this id" — it is absent, it
+  // does not resolve to a servable path, it exceeded the decompression cap, or it vanished mid-read.
+  // A failure of the storage ITSELF (EACCES/EIO/ENOSPC on its own directories, a corrupt gzip, a
+  // failed decompression commit) REJECTS, so callers can distinguish "not here" from "cannot be
+  // read right now" instead of turning an unreadable disk into a 404.
   const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
     if (range) validateRange(range)
     if (journal.isQuarantined(id) && !(await journal.ensureReconciled(id))) {
@@ -448,76 +614,9 @@ export async function createFolderBasedFileSystemContentStorage(
 
         // Deduplicated across concurrent callers of the same path, and handed the invalidation token
         // that says whether the gzip this inflation started from is still the current version.
-        await cache.deduplicateInflation(uncompressedPath, async (token) => {
-          const gzipItem = await retrieveWithEncoding(id, 'gzip')
-          if (!gzipItem) {
-            return
-          }
-          const { rename } = components.fs
-          if (rename) {
-            // Stage the inflation in the temp dir so a process killed mid-decompress can never
-            // leave a partial file at the canonical uncompressed path — a later range request
-            // would silently serve its truncated bytes as valid content.
-            const writePath = journal.newTempPath()
-            try {
-              // Cap how much the gzip may inflate to so a decompression bomb cannot write an
-              // unbounded file to disk. The gzip trailer's declared size is attacker-
-              // controllable, so the limit is enforced on the actual inflated bytes.
-              await pipe(
-                await gzipItem.asStream(),
-                createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
-                components.fs.createWriteStream(writePath)
-              )
-              // Commit under the path lock so this rename can never interleave with a store or
-              // delete on the same canonical path; discard when the source gzip was replaced or
-              // the id deleted while inflating.
-              const committed = await withPathLock(uncompressedPath, async () => {
-                if (token.invalidated) return false
-                await rename(writePath, uncompressedPath)
-                const stat = await components.fs.stat(uncompressedPath)
-                cache.record(uncompressedPath, stat.size)
-                return true
-              })
-              if (!committed) {
-                await noFailUnlink(writePath)
-              }
-            } catch (err) {
-              // Remove the partial staged file; the canonical path was never touched.
-              await noFailUnlink(writePath)
-              // An invalidated token means the id was overwritten/deleted while inflating —
-              // the failure belongs to the replaced gzip, not to the caller's request.
-              // Resolving lets the retry loop observe the new representation instead of the
-              // error bubbling into a spurious undefined for a valid id.
-              if (token.invalidated) return
-              throw err
-            }
-            return
-          }
-
-          // In-place (no rename) legacy path: there is no staging, so the ENTIRE inflate/
-          // register sequence runs under the path lock and honors the invalidation token — a
-          // concurrent store/delete completing first must not be overwritten by a stale
-          // decompression, and the cleanup of a failed inflation must not race a newer writer.
-          await withPathLock(uncompressedPath, async () => {
-            if (token.invalidated) return
-            try {
-              await pipe(
-                await gzipItem.asStream(),
-                createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
-                components.fs.createWriteStream(uncompressedPath)
-              )
-            } catch (err) {
-              // Under the lock the partial file is provably ours to remove.
-              await noFailUnlink(uncompressedPath)
-              // Defensive symmetry with the staged branch: writers take this same lock, so the
-              // token cannot flip mid-section today.
-              if (token.invalidated) return
-              throw err
-            }
-            const stat = await components.fs.stat(uncompressedPath)
-            cache.record(uncompressedPath, stat.size)
-          })
-        })
+        await cache.deduplicateInflation(uncompressedPath, (token) =>
+          materializeRangeCacheFromGzip(id, uncompressedPath, token)
+        )
 
         // Serve range from the cached uncompressed file (undefined when the gzip didn't exist or
         // the decompression was discarded; the loop then retries once)
@@ -527,9 +626,27 @@ export async function createFolderBasedFileSystemContentStorage(
       return contentItem
     } catch (error: any) {
       if (error instanceof RangeError) throw error
+      // Expected misses, reported as "absent" exactly like an unknown id: an id that does not
+      // resolve to a servable path (the pinned containment contract — note that `exist` and
+      // `fileInfo` reject those loudly instead), and content that refuses to inflate within the
+      // decompression cap. Nothing is servable and nothing about the request is retryable.
+      //
+      // A file vanishing under a concurrent delete is deliberately NOT classified here. An ENOENT is
+      // only a miss when the content itself is provably gone, which is decided at the inflation by
+      // re-probing the source (see `sourceVanished`) and resolves into a retry. Treating every ENOENT
+      // as a miss here would also absorb one raised by the staging directory, a rename or a missing
+      // shard — storage faults wearing the same shape, which is exactly what this contract removes.
+      if (error instanceof PathNotContainedError || error instanceof DecompressionLimitExceededError) {
+        logger.warn(`Cannot serve ${id}`, { reason: error?.message ?? String(error) })
+        return undefined
+      }
+      // Everything else is the STORAGE failing, not the id missing: EACCES/EIO/ENOSPC on our own
+      // directories, a corrupt gzip, a failed decompression commit. Answering "not found" would
+      // tell the caller the content is permanently absent while `exist()` still reports it present,
+      // so a broken disk would read as an empty node and stop being retried. Surface it instead.
       logger.error(error)
+      throw error
     }
-    return undefined
   }
 
   async function exist(id: string): Promise<boolean> {
@@ -557,7 +674,12 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  async function readGzipOriginalSize(filePath: string, gzipSize: number): Promise<number | null> {
+  /**
+   * The gzip trailer's declared original size: a `number` when the format supplies one, `null` when it
+   * cannot, or `undefined` when the file disappeared while being read (the caller then falls through
+   * to the id's other representation). A storage failure rejects rather than answering any of these.
+   */
+  async function readGzipOriginalSize(filePath: string, gzipSize: number): Promise<number | null | undefined> {
     // The gzip format (RFC 1952) stores the original uncompressed size in its
     // trailer — the last 4 bytes (ISIZE field, uint32 little-endian).
     // This works for files < 4GB (ISIZE is mod 2^32).
@@ -572,8 +694,17 @@ export async function createFolderBasedFileSystemContentStorage(
       })
       const buffer = await streamToBuffer(stream)
       return buffer.readUInt32LE(0)
-    } catch {
-      return null
+    } catch (err) {
+      // `null` is a legitimate answer — content whose size the format cannot express (a >4GB original,
+      // where ISIZE wraps) genuinely has no declared size — so it must not double as "we could not
+      // read it". Callers cannot tell those apart, and at least one uses `contentSize ?? size` to bound
+      // range requests, where a masked failure silently substitutes the COMPRESSED size.
+      //
+      // Same rule as every other read, via the same probe: a file provably gone with its parent intact
+      // is the documented mid-read race, and everything else — EIO, EACCES, a damaged shard (which
+      // `statForRead` rejects on) — is a fault that surfaces.
+      if ((await statForRead(filePath)) === undefined) return undefined
+      throw err
     }
   }
 
@@ -589,6 +720,10 @@ export async function createFolderBasedFileSystemContentStorage(
       if (stat) {
         if (encoding === 'gzip') {
           const contentSize = await readGzipOriginalSize(filePath, stat.size)
+          // The gzip vanished between the stat and the trailer read: try the raw representation
+          // instead of reporting a file that is no longer there (a store transitioning gzip -> raw
+          // lands exactly here), and report the id absent only if that is gone too.
+          if (contentSize === undefined) continue
           return {
             size: stat.size,
             encoding,
