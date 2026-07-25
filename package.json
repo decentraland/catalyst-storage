@@ -9,8 +9,8 @@
     "build:watch": "tsc -p tsconfig.json --watch",
     "lint:check": "eslint '**/*.{js,ts}'",
     "lint:fix": "eslint '**/*.{js,ts}' --fix",
-    "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --forceExit --detectOpenHandles --verbose",
-    "test:coverage": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --forceExit --detectOpenHandles --coverage --verbose"
+    "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --verbose",
+    "test:coverage": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --coverage --verbose"
   },
   "repository": {
     "type": "git",
@@ -36,7 +36,6 @@
     "@types/node": "^18.11.18",
     "@well-known-components/env-config-provider": "^1.2.0",
     "@well-known-components/logger": "^3.1.2",
-    "@well-known-components/test-helpers": "^1.5.2",
     "cross-env": "^10.1.0",
     "typescript": "^4.9.5"
   },

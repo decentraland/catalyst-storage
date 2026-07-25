@@ -18,6 +18,55 @@ describe('SimpleContentItem', () => {
     rmSync(root, { recursive: true, force: true })
   })
 
+  describe('when a stream emits something other than bytes', () => {
+    let outcome: unknown
+
+    beforeEach(async () => {
+      // An object-mode stream reaching this helper would otherwise have its values concatenated into
+      // a Buffer, producing silently wrong content rather than a clear failure.
+      const objectStream = Readable.from([{ not: 'bytes' }], { objectMode: true })
+      outcome = await streamToBuffer(objectStream).then(
+        () => 'resolved' as const,
+        (error: unknown) => error
+      )
+    })
+
+    it('should reject naming what it expected', () => {
+      expect(outcome).toMatchObject({ message: 'Stream did not emit Uint8Array' })
+    })
+  })
+
+  describe('when an encoded item is built without an explicit content size', () => {
+    let item: SimpleContentItem
+
+    beforeEach(() => {
+      // `size` is the STORED (compressed) length, so defaulting contentSize to it reported the
+      // compressed byte count under the field documented as the logical size — which callers use as
+      // `contentSize ?? size` to bound reads. Unknown is the only honest default here.
+      item = new SimpleContentItem(async () => Readable.from(Buffer.alloc(0)), 133, 'gzip')
+    })
+
+    it('should report the content size as unknown rather than as the stored size', () => {
+      expect(item.contentSize).toBeNull()
+    })
+
+    it('should keep reporting the stored size', () => {
+      expect(item.size).toBe(133)
+    })
+  })
+
+  describe('when an unencoded item is built without an explicit content size', () => {
+    let item: SimpleContentItem
+
+    beforeEach(() => {
+      item = new SimpleContentItem(async () => Readable.from(Buffer.alloc(0)), 133, null)
+    })
+
+    it('should default the content size to the stored size, which is the same thing', () => {
+      expect(item.contentSize).toBe(133)
+    })
+  })
+
   describe('when a gzip item is read', () => {
     let bytes: Buffer
 

@@ -2682,16 +2682,24 @@ describe('fileSystemContentStorage', () => {
         expect((storeOutcome as Error).message).toContain('quarantined')
       })
 
-      it('should not expose the new bytes through range reads while quarantined', async () => {
-        expect(await failingStorage.retrieve(id, { start: 0, end: 2 })).toBeUndefined()
+      // The id is PRESENT — both representations are on disk and `allFileIds` still enumerates it —
+      // so an unrepairable mixed state is a "cannot be read", not a "not here". Reporting absence
+      // handed back a 404 for content sitting on the disk, and contradicted the store that had
+      // already failed announcing the quarantine.
+      it('should reject range reads rather than exposing the new bytes while quarantined', async () => {
+        await expect(failingStorage.retrieve(id, { start: 0, end: 2 })).rejects.toThrow(/mixed state/)
       })
 
-      it('should not expose the old version through full reads while quarantined', async () => {
-        expect(await failingStorage.retrieve(id)).toBeUndefined()
+      it('should reject full reads rather than exposing the old version while quarantined', async () => {
+        await expect(failingStorage.retrieve(id)).rejects.toThrow(/mixed state/)
       })
 
-      it('should report the id as unavailable while quarantined', async () => {
-        expect(await failingStorage.exist(id)).toBe(false)
+      it('should reject exist rather than reporting the present id as absent while quarantined', async () => {
+        await expect(failingStorage.exist(id)).rejects.toThrow(/mixed state/)
+      })
+
+      it('should reject fileInfo while quarantined', async () => {
+        await expect(failingStorage.fileInfo(id)).rejects.toThrow(/mixed state/)
       })
 
       it('should repair through a read once the cleanup can complete', async () => {

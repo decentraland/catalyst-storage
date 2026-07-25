@@ -38,6 +38,7 @@ describe('runStoreWithSignal', () => {
 
   describe('when destroying the source throws', () => {
     let reason: Error
+    let transportError: Error
     let hookCalled: jest.Mock
     let outcome: 'resolved' | unknown
 
@@ -53,11 +54,15 @@ describe('runStoreWithSignal', () => {
       const operation = new Promise<never>((_, reject) => {
         rejectOperation = reject
       })
-      // A real hook reports that it tore the transport down, which is what credits the resulting
-      // transport-shaped rejection to this cancellation.
+      // The hook tears its transport down and that transport rejects with its own shape. This layer
+      // does NOT credit transport shapes — a transport can raise one for reasons of its own — so the
+      // rejection surfaces as itself; a backend that knows it caused the abort converts it to the
+      // caller's reason at its own call site, as the S3 upload does.
+      // The shape the AWS SDK v3 actually rejects an aborted request with. It is deliberately NOT
+      // credited here — a transport can raise one for its own reasons — so it must surface as itself.
+      transportError = Object.assign(new Error('transport torn down'), { name: 'AbortError', code: 'ABORT_ERR' })
       hookCalled = jest.fn(() => {
-        rejectOperation(Object.assign(new Error('transport torn down'), { code: 'RequestAbortedError' }))
-        return true
+        rejectOperation(transportError)
       })
       const pending = runStoreWithSignal(source, controller.signal, () => operation, hookCalled)
       controller.abort(reason)
@@ -71,8 +76,8 @@ describe('runStoreWithSignal', () => {
       expect(hookCalled).toHaveBeenCalled()
     })
 
-    it('should reject with the abort reason', () => {
-      expect(outcome).toBe(reason)
+    it('should surface the transport error it cannot attribute to the cancellation', () => {
+      expect(outcome).toBe(transportError)
     })
   })
 

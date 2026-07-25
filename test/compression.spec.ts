@@ -60,6 +60,67 @@ describe('compressContentFile', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
+  describe('when the output path is the same as the input path', () => {
+    let source: string
+
+    beforeEach(() => {
+      // Compressing a file onto itself would open it for reading and truncate it for writing at the
+      // same time, destroying the content it is meant to preserve.
+      source = path.join(dir, 'same.txt')
+      writeFileSync(source, 'content worth keeping')
+    })
+
+    it('should refuse rather than destroy the source', async () => {
+      await expect(compressContentFile(source, undefined, source)).rejects.toThrow(/src==dst/)
+    })
+
+    it('should leave the source intact', async () => {
+      await compressContentFile(source, undefined, source).catch(() => undefined)
+
+      expect(await nodeFs.readFile(source, 'utf8')).toBe('content worth keeping')
+    })
+  })
+
+  describe('when the partial output cannot be removed after a failure', () => {
+    let warnings: Array<{ message: string; context: any }>
+    let source: string
+
+    beforeEach(async () => {
+      // A surviving partial `.gzip` would be preferred by reads over the real content, so the failure
+      // to remove it has to be visible rather than swallowed with the compression error.
+      warnings = []
+      source = path.join(dir, 'input.txt')
+      writeFileSync(source, 'x'.repeat(5000))
+      const logger: any = {
+        log: () => undefined,
+        debug: () => undefined,
+        info: () => undefined,
+        error: () => undefined
+      }
+      logger.warn = (message: string, context: any) => warnings.push({ message, context })
+      const failing: CompressionFileSystem = {
+        createReadStream,
+        createWriteStream: (() => {
+          throw Object.assign(new Error('EIO: cannot open output'), { code: 'EIO' })
+        }) as any,
+        unlink: async () => {
+          throw Object.assign(new Error('EPERM: cannot remove'), { code: 'EPERM' })
+        },
+        stat: nodeFs.stat,
+        lstat: nodeFs.lstat
+      }
+      await compressContentFile(source, logger, path.join(dir, 'out.gzip'), undefined, failing).catch(() => undefined)
+    })
+
+    it('should warn that the compressed output was left behind', () => {
+      expect(warnings.map((each) => each.message)).toContainEqual(expect.stringContaining('Failed to remove'))
+    })
+
+    it('should name the unlink failure rather than the compression one', () => {
+      expect(warnings[0].context.error).toContain('EPERM')
+    })
+  })
+
   describe('when the filesystem adapter methods depend on `this`', () => {
     let adapter: ThisDependentFileSystem
     let outcome: unknown

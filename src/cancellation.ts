@@ -41,34 +41,27 @@ export function isAbortError(error: unknown): boolean {
 type TeardownProvenance = {
   /** The listener destroyed a source that was still live (a destroy on a dead stream is a no-op). */
   destroyedSource: boolean
-  /** The `onAbort` hook reported tearing down in-flight transport (e.g. an S3 managed upload). */
-  abortedTransport: boolean
 }
 
 /**
  * True only for rejections provably produced by this module's abort teardown. Every shape a store
  * can reject with is public — a source can close prematurely, an SDK can report an aborted request,
  * a custom stream or transport can raise an `AbortError` of its own — so no shape is credited on
- * appearance alone. The signal's own reason needs no provenance (only our checkpoints throw it, and
- * the one place that hands a signal to an abortable pipeline converts that pipeline's abort into the
- * reason at its call site, where the attribution is known); the remaining shapes are credited only
- * when this run's teardown actually performed the corresponding action. Anything else — fs, zlib,
- * transport or logic errors — is NOT teardown-caused and surfaces as itself.
+ * appearance alone. The signal's own reason needs no provenance (only our checkpoints throw it); the
+ * premature close is credited only when this run's teardown actually destroyed a live source.
+ * Anything else — fs, zlib, transport or logic errors — is NOT teardown-caused and surfaces as
+ * itself.
+ *
+ * Transport-shaped rejections are deliberately NOT matched here. The AWS SDK v3 rejects an aborted
+ * request with an `AbortError` from @smithy, a shape a custom transport can raise for its own
+ * reasons, so it cannot be credited on appearance. Both places that hand a signal to abortable
+ * machinery — the S3 managed upload and the compression pipeline — instead attribute the abort at
+ * their own call site, where they know they caused it, and convert it to the caller's reason there.
  */
 function isAbortTeardownError(error: unknown, signal: AbortSignal, teardown: TeardownProvenance): boolean {
   if (error === signal.reason) return true
   const err = error as { name?: unknown; code?: unknown } | null
-  if (teardown.destroyedSource && err?.code === 'ERR_STREAM_PREMATURE_CLOSE') return true
-  // aws-sdk v2 ManagedUpload.abort(). NOTE for a future v3 migration (v3 was tried in #66 and
-  // rolled back in #74): v3 rejects aborted requests with an `AbortError` from @smithy, a shape this
-  // function deliberately does NOT credit — a custom transport can raise one coincidentally. A v3
-  // port must therefore attribute the abort where it is known, as the compression pipeline does at
-  // its call site (or rely on v3's native `abortSignal` request option), or cancelled uploads will
-  // surface as raw abort errors instead of the caller's reason.
-  if (teardown.abortedTransport && (err?.code === 'RequestAbortedError' || err?.name === 'RequestAbortedError')) {
-    return true
-  }
-  return false
+  return teardown.destroyedSource && err?.code === 'ERR_STREAM_PREMATURE_CLOSE'
 }
 
 function abortReasonOf(signal: AbortSignal): unknown {
@@ -82,14 +75,14 @@ function abortReasonOf(signal: AbortSignal): unknown {
  *
  * On abort the source stream is destroyed — settling any consumer awaiting its data — and the
  * optional `onAbort` hook runs so callers can tear down transport that no longer depends on the
- * source (e.g. an S3 managed upload whose remaining parts are already buffered); the hook returns
- * `true` when it actually tore something down, which is what lets a transport-shaped rejection be
- * credited to this cancellation rather than to a coincident fault. A rejection that
- * is provably caused by that teardown is surfaced as the signal's reason, so callers observe their
- * own cancellation cause rather than a transport-specific error; a rejection that merely RACED the
- * abort (fs, zlib, transport or logic failures) surfaces as itself — cancellation must never mask
- * a real storage error. A store that completes before consuming the abort is allowed to succeed:
- * content is addressed by its id, so a committed write is never harmful.
+ * source (e.g. an S3 managed upload whose remaining parts are already buffered). A rejection that is
+ * provably caused by that teardown is surfaced as the signal's reason, so callers observe their own
+ * cancellation cause rather than a transport-specific error; a rejection that merely RACED the abort
+ * (fs, zlib, transport or logic failures) surfaces as itself — cancellation must never mask a real
+ * storage error. A backend whose transport rejects with its own abort shape attributes that at its
+ * call site, where it knows it caused it, rather than relying on shape matching here. A store that
+ * completes before consuming the abort is allowed to succeed: content is addressed by its id, so a
+ * committed write is never harmful.
  *
  * The source is destroyed without an error: consumers observe a premature close, and an
  * already-ended (fully consumed) source is left untouched instead of emitting an 'error' that
@@ -99,7 +92,7 @@ export async function runStoreWithSignal<T>(
   stream: Readable,
   signal: AbortSignal | undefined,
   operation: () => Promise<T>,
-  onAbort?: () => boolean | void
+  onAbort?: () => void
 ): Promise<T> {
   if (!signal) {
     return operation()
@@ -112,11 +105,11 @@ export async function runStoreWithSignal<T>(
     }
     throw abortReasonOf(signal)
   }
-  // What this run's teardown actually did. A premature-close or aborted-transport rejection is only
-  // provably ours when the corresponding action happened: if the source was already dead (ended, or
-  // destroyed by a real upstream fault), or the hook never tore any transport down, a rejection with
-  // that shape belongs to the underlying fault, not to the cancellation.
-  const teardown: TeardownProvenance = { destroyedSource: false, abortedTransport: false }
+  // What this run's teardown actually did. A premature-close rejection is only provably ours when
+  // the corresponding action happened: if the source was already dead (ended, or destroyed by a real
+  // upstream fault), a rejection with that shape belongs to the underlying fault, not to the
+  // cancellation.
+  const teardown: TeardownProvenance = { destroyedSource: false }
   const abort = (): void => {
     // Exception-safe: this runs inside the signal's event dispatch, where a throw would escape as
     // an uncaught exception — and a failing stream teardown must not prevent the backend hook from
@@ -134,7 +127,7 @@ export async function runStoreWithSignal<T>(
       // best-effort
     }
     try {
-      teardown.abortedTransport = onAbort?.() === true
+      onAbort?.()
     } catch {
       // best-effort
     }

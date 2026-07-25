@@ -35,7 +35,7 @@ function createCommonSuite(components: { storage?: IContentStorageComponent }) {
     expect(await components.storage!.exist('f/b/c/4')).toBeTruthy()
   })
 
-  it.skip('Finds all elements using allFileIds', async () => {
+  it('Finds all elements using allFileIds', async () => {
     const files: any = {}
 
     for await (const id of components.storage!.allFileIds('f/')) {

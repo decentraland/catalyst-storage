@@ -5,6 +5,7 @@ import { promisify } from 'util'
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
 import { isAbortError, markAsNonCancellationError, runStoreWithSignal } from './cancellation'
+import { mapWithConcurrency } from './concurrency'
 import { compressContentFile } from './extras/compression'
 import { createFsInvariants } from './folder-based/fs-invariants'
 import { createDecompressCache, InvalidationToken } from './folder-based/decompress-cache'
@@ -46,6 +47,17 @@ export type FolderStorageOptions = {
    * enforced.
    */
   tempDirectoryName?: string
+  /**
+   * Whether `start()` walks the content tree once, in the background, adopting decompressed
+   * range-cache copies left behind by a run that never reached `stop()` so eviction can reclaim
+   * them. Default: true.
+   *
+   * The cost is one directory walk plus one `existPath` per stored file, per process start — the
+   * same traversal `allFileIds()` performs. It is detached (startup is never delayed) and awaited by
+   * `stop()`. Set it to false on a very large store that shuts down cleanly, accepting that
+   * decompressed copies orphaned by a hard kill are then never reclaimed.
+   */
+  adoptOrphanedDecompressedFiles?: boolean
 }
 
 /**
@@ -156,6 +168,7 @@ export async function createFolderBasedFileSystemContentStorage(
 
   const { existsForInvariant, noFailUnlink } = createFsInvariants(components.fs)
 
+  const ADOPT_ORPHANED_DECOMPRESSED_FILES = options?.adoptOrphanedDecompressedFiles ?? true
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
   const MAX_DECOMPRESSED_SIZE = options?.decompressMaxFileSize ?? TWO_HUNDRED_FIFTY_SIX_MB_IN_BYTES
 
@@ -243,11 +256,21 @@ export async function createFolderBasedFileSystemContentStorage(
    * looks like 404" behaviour right back into the read path this contract exists to fix. Same rule as
    * `existsForInvariant`; the difference is only that recovery paths need the boolean.
    */
-  async function statForRead(filePath: string): Promise<{ size: number } | undefined> {
+  async function statForRead(
+    filePath: string,
+    parentAlreadyProvenIntact = false
+  ): Promise<{ size: number } | undefined> {
     try {
       return await components.fs.stat(filePath)
     } catch (err: any) {
       if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw err
+      // An id's two representations live in the SAME directory, so a caller probing both only needs
+      // that directory proven once: `parentAlreadyProvenIntact` says an earlier probe in this
+      // operation already resolved (rather than threw), which is exactly that proof. Without it,
+      // `exist()` on a missing id paid four stats where three suffice, on a batch API. The window it
+      // gives up — the directory being destroyed between two adjacent probes of the same operation,
+      // downgrading a fault to a miss — is narrower than the races the read path already tolerates.
+      if (parentAlreadyProvenIntact) return undefined
       // A missing-file error here has two very different meanings, and only one of them is a miss.
       // `getFilePath` created the parent directory (or served it from the cache) immediately before
       // this probe, so an INTACT DIRECTORY must be sitting there. Anything else means the tree this
@@ -293,11 +316,19 @@ export async function createFolderBasedFileSystemContentStorage(
     // recursively creates the directory structure if needed
     const dirname = path.dirname(finalPath)
 
+    // An id that resolves to the containment directory ITSELF names a directory, not a file — `''`
+    // and `'.'` are the only ids that do it. Allowing them meant `exist()` stat'd the directory and
+    // answered `true`, and `retrieve()` handed back a ContentItem whose stream fails with EISDIR; in
+    // flat mode the directory in question is the storage root, so every such id aliased onto it.
+    if (finalPath === directoryPath) {
+      throw new PathNotContainedError('The id does not name a file inside the storage folder')
+    }
+
     // Containment check. We compare against `directoryPath + path.sep` (not a bare `startsWith`)
     // so a sibling directory that merely shares the prefix — e.g. id "../<root>-evil/x" resolving
     // to "<root>-evil" — cannot pass: "/data/contents-evil".startsWith("/data/contents") is true,
     // but it is outside "/data/contents/".
-    if (finalPath !== directoryPath && !finalPath.startsWith(directoryPath + path.sep)) {
+    if (!finalPath.startsWith(directoryPath + path.sep)) {
       throw new PathNotContainedError('Cannot manipulate files outside of the root storage folder')
     }
 
@@ -323,29 +354,49 @@ export async function createFolderBasedFileSystemContentStorage(
     return finalPath
   }
 
+  /**
+   * Builds the `ContentItem` for ONE representation of an id, or `undefined` when that
+   * representation is not there.
+   *
+   * `resolveContentSize` controls the gzip trailer read that makes the item report its LOGICAL
+   * (uncompressed) size. Callers that only want the gzip stream — the range-cache inflation, which
+   * discards the item's metadata immediately — pass `false` to skip that read.
+   */
   const retrieveWithEncoding = async (
     id: string,
     encoding: string | null,
-    range?: { start: number; end: number }
+    range?: { start: number; end: number },
+    resolveContentSize = true
   ): Promise<ContentItem | undefined> => {
     const extension = encoding ? '.' + encoding : ''
     const filePath = (await getFilePath(id)) + extension
 
     const stat = await statForRead(filePath)
-    if (stat) {
-      if (range) {
-        const clampedEnd = clampRange(range, stat.size)
-        return new SimpleContentItem(
-          async () => components.fs.createReadStream(filePath, { start: range.start, end: clampedEnd }),
-          clampedEnd - range.start + 1,
-          encoding
-        )
-      }
+    if (!stat) return undefined
 
-      return new SimpleContentItem(async () => components.fs.createReadStream(filePath), stat.size, encoding)
+    if (range) {
+      const clampedEnd = clampRange(range, stat.size)
+      return new SimpleContentItem(
+        async () => components.fs.createReadStream(filePath, { start: range.start, end: clampedEnd }),
+        clampedEnd - range.start + 1,
+        encoding
+      )
     }
 
-    return undefined
+    // A gzip item's `asStream()` yields DECOMPRESSED bytes, so its `contentSize` — documented as the
+    // logical, uncompressed size — must come from the trailer, exactly as `fileInfo` reads it.
+    // Leaving it to SimpleContentItem's `contentSize = size` fallback would hand callers the
+    // COMPRESSED byte count under that field, and at least one bounds range requests with
+    // `contentSize ?? size`. An `undefined` trailer means the gzip vanished mid-read: report this
+    // representation as absent so the caller falls through to the raw one, just as `fileInfo` does.
+    let contentSize: number | null = stat.size
+    if (encoding === 'gzip' && resolveContentSize) {
+      const originalSize = await readGzipOriginalSize(filePath, stat.size)
+      if (originalSize === undefined) return undefined
+      contentSize = originalSize
+    }
+
+    return new SimpleContentItem(async () => components.fs.createReadStream(filePath), stat.size, encoding, contentSize)
   }
 
   async function gzipSourceVanishedForRead(gzipPath: string): Promise<boolean> {
@@ -407,7 +458,9 @@ export async function createFolderBasedFileSystemContentStorage(
     uncompressedPath: string,
     token: InvalidationToken
   ): Promise<void> {
-    const gzipItem = await retrieveWithEncoding(id, 'gzip')
+    // `false`: only the stream is used here, so the trailer read that resolves the logical size
+    // would be pure overhead on the decompression path.
+    const gzipItem = await retrieveWithEncoding(id, 'gzip', undefined, false)
     if (!gzipItem) {
       return
     }
@@ -570,29 +623,45 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   // Concurrent-read contract: reads are deliberately NOT serialized against writes (locking the hot
-  // read path would be far too costly). Every read observes some COMPLETE committed version of the
-  // id — commits are atomic renames and a version's raw/gzip transition happens under the path
-  // lock — but a read that overlaps a commit may still serve the previous version (e.g. its gzip,
-  // which retrieve prefers, in the instant before the committing section unlinks it). Reads started
-  // after a store/delete promise resolves observe that operation's outcome. The returned
-  // ContentItem opens its stream LAZILY: a store/delete landing between retrieve() and asStream()
+  // read path would be far too costly). IN ATOMIC MODE every read observes some COMPLETE committed
+  // version of the id — commits are atomic renames and a version's raw/gzip transition happens under
+  // the path lock — but a read that overlaps a commit may still serve the previous version (e.g. its
+  // gzip, which retrieve prefers, in the instant before the committing section unlinks it). Reads
+  // started after a store/delete promise resolves observe that operation's outcome.
+  //
+  // WITHOUT `rename` (legacy no-rename adapters) that completeness guarantee DOES NOT HOLD, and not
+  // only after a crash: the in-place write streams straight onto the canonical path, so a concurrent
+  // reader can observe a partially written file during normal operation — a truncated raw, or a gzip
+  // that fails to inflate. There is no way to make an in-place write atomic for readers; the mode
+  // exists for backward compatibility, and a deployment that serves reads concurrently with writes
+  // needs `rename`.
+  //
+  // METADATA AND BYTES CAN COME FROM DIFFERENT VERSIONS. The returned ContentItem opens its stream
+  // LAZILY, while `size`/`contentSize` were measured at retrieve() time. A store landing in between
   // can unlink the observed file, making asStream() fail (typically ENOENT) — callers should treat
-  // that as a retryable miss, exactly like retrieve() having returned undefined. Ids quarantined by
-  // a failed post-rename cleanup are repaired before serving or reported as absent — a read never
-  // exposes a known-mixed state (see the intent journal's quarantine).
+  // that as a retryable miss, exactly like retrieve() having returned undefined — but it can also
+  // REPLACE the file, in which case the stream yields the new version's bytes under the previous
+  // version's advertised size (and, for a gzip item, a `contentSize` read from what is no longer the
+  // file's trailer, so it may be an arbitrary number). This only arises when an id is overwritten
+  // with DIFFERENT content, which the content-addressed model this storage is built for does not do;
+  // callers that both allow it and forward `size` as an HTTP Content-Length must re-check after
+  // streaming rather than trust the advertised value. Closing the window entirely needs the stream
+  // opened eagerly at retrieve() and read through that descriptor, which the filesystem component
+  // has no capability for today.
+  //
+  // Ids quarantined by
+  // a failed post-rename cleanup are repaired before serving, and REJECT when they cannot be — a
+  // read never exposes a known-mixed state (see the intent journal's quarantine).
   //
   // Error contract: `undefined` means "there is nothing to serve for this id" — it is absent, it
   // does not resolve to a servable path, it exceeded the decompression cap, or it vanished mid-read.
   // A failure of the storage ITSELF (EACCES/EIO/ENOSPC on its own directories, a corrupt gzip, a
-  // failed decompression commit) REJECTS, so callers can distinguish "not here" from "cannot be
-  // read right now" instead of turning an unreadable disk into a 404.
+  // failed decompression commit, an unrepairable mixed state) REJECTS, so callers can distinguish
+  // "not here" from "cannot be read right now" instead of turning an unreadable disk into a 404.
   const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
     if (range) validateRange(range)
-    if (journal.isQuarantined(id) && !(await journal.ensureReconciled(id))) {
-      logger.warn(`Refusing to serve a quarantined mixed-state id`, { id })
-      return undefined
-    }
     try {
+      await assertNotQuarantined(id)
       let contentItem: ContentItem | undefined = undefined
       if (!range) contentItem = await retrieveWithEncoding(id, 'gzip')
       if (!contentItem) {
@@ -649,28 +718,69 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  async function exist(id: string): Promise<boolean> {
-    if (journal.isQuarantined(id) && !(await journal.ensureReconciled(id))) return false
-    const filePath = await getFilePath(id)
-    return (await components.fs.existPath(filePath + '.gzip')) || (await components.fs.existPath(filePath))
+  /**
+   * Refuses a read of an id whose on-disk state is known-mixed and could not be repaired.
+   *
+   * The id is PRESENT — both of its representations are on disk — and this storage simply cannot
+   * decide which one is current, so this is a "cannot be read", not a "not here". Reporting absence
+   * handed back a 404 for content whose bytes are sitting on the disk and which `allFileIds()` still
+   * enumerates, and contradicted the store that had already failed loudly announcing the quarantine.
+   * Repairing first (under the path lock) means a recoverable id is served normally and only a
+   * genuinely stuck one reaches the throw.
+   */
+  async function assertNotQuarantined(id: string): Promise<void> {
+    if (!journal.isQuarantined(id)) return
+    if (await journal.ensureReconciled(id)) return
+    throw new Error(
+      `Cannot serve ${id}: its raw and gzip representations are in a mixed state that could not be repaired. ` +
+        `Reads are refused for this id until a retried store, a later repair or a restart completes the cleanup.`
+    )
   }
 
-  const allFileIdsRec = async function* (folder: string, prefix?: string): AsyncIterable<string> {
+  async function exist(id: string): Promise<boolean> {
+    await assertNotQuarantined(id)
+    const filePath = await getFilePath(id)
+    // Probed with `statForRead`, the same rule the rest of the read path uses: only a file PROVABLY
+    // gone is absent. `existPath` tests F_OK|R_OK, so a present-but-unreadable file (mode/ACL damage,
+    // EIO) read as `false` — the "a broken store looks like an empty one" answer this storage's read
+    // contract exists to remove, and one `fileInfo()` already refuses to give for the very same id.
+    if ((await statForRead(filePath + '.gzip')) !== undefined) return true
+    // The gzip probe resolving already proved the shared parent directory intact.
+    return (await statForRead(filePath, true)) !== undefined
+  }
+
+  const GZIP_EXTENSION = '.gzip'
+
+  /**
+   * Walks the content tree yielding stored ids.
+   *
+   * An id is the path of its file RELATIVE TO the directory `getFilePath` resolves ids against — the
+   * shard directory when hash prefixes are on, the storage root in flat mode. Yielding the bare
+   * basename instead would collapse an id containing path separators (which nests it into
+   * subdirectories) onto its last segment, so `allFileIds()` reported ids that do not resolve back to
+   * the file they came from. `prefix` filters those ids, not the on-disk filenames — matching it
+   * against the filename let it match the `.gzip` extension of a compressed representation.
+   */
+  const allFileIdsRec = async function* (folder: string, idBase: string, prefix?: string): AsyncIterable<string> {
     const dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
     for await (const entry of dirEntries) {
+      const entryPath = path.resolve(folder, entry.name)
       if (entry.isDirectory()) {
         // The reserved temp-write dir only exists directly under the storage root; skip it there and
         // only there, so a deeper same-named directory (reachable via a slash-containing id) is not
         // silently hidden from enumeration.
         if (ATOMIC_MODE && folder === root && entry.name === tempDirName) continue
-        yield* allFileIdsRec(path.resolve(folder, entry.name), prefix)
-      } else if (!prefix || entry.name.startsWith(prefix)) {
-        const baseName = entry.name.replace(/\.gzip$/, '')
-        // Skip cached uncompressed files when the .gzip version also exists
-        if (baseName !== entry.name || !(await components.fs.existPath(path.resolve(folder, baseName + '.gzip')))) {
-          yield baseName
-        }
+        // With hash prefixes the SHARD is the id namespace root, so ids nested inside it are relative
+        // to the shard rather than to the storage root.
+        yield* allFileIdsRec(entryPath, USE_HASH_PREFIX && folder === root ? entryPath : idBase, prefix)
+        continue
       }
+      const isGzip = entry.name.endsWith(GZIP_EXTENSION)
+      const id = path.relative(idBase, isGzip ? entryPath.slice(0, -GZIP_EXTENSION.length) : entryPath)
+      if (prefix && !id.startsWith(prefix)) continue
+      // Skip cached uncompressed files when the .gzip version also exists: both are one id.
+      if (!isGzip && (await components.fs.existPath(entryPath + GZIP_EXTENSION))) continue
+      yield id
     }
   }
 
@@ -693,6 +803,13 @@ export async function createFolderBasedFileSystemContentStorage(
         end: gzipSize - 1
       })
       const buffer = await streamToBuffer(stream)
+      // Fewer than 4 bytes means the file SHRANK between the stat that produced `gzipSize` and this
+      // read of its last four bytes — a concurrent overwrite with smaller content, which is the same
+      // benign race as the file vanishing outright and is answered the same way. Reading on would
+      // throw ERR_BUFFER_OUT_OF_BOUNDS, and because the path still EXISTS (it was replaced, not
+      // removed) the probe below cannot recognize the race either — so a healthy storage rejected an
+      // ordinary read with a raw buffer error.
+      if (buffer.length < 4) return undefined
       return buffer.readUInt32LE(0)
     } catch (err) {
       // `null` is a legitimate answer — content whose size the format cannot express (a >4GB original,
@@ -709,14 +826,17 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   async function fileInfo(id: string): Promise<FileInfo | undefined> {
-    if (journal.isQuarantined(id) && !(await journal.ensureReconciled(id))) return undefined
+    await assertNotQuarantined(id)
     const possibleEncondings = ['gzip', null]
     const baseFilePath = await getFilePath(id)
 
+    // Both representations share a parent directory, so it only has to be proven intact once.
+    let parentProven = false
     for (const encoding of possibleEncondings) {
       const extension = encoding ? '.' + encoding : ''
       const filePath = baseFilePath + extension
-      const stat = await statForRead(filePath)
+      const stat = await statForRead(filePath, parentProven)
+      parentProven = true
       if (stat) {
         if (encoding === 'gzip') {
           const contentSize = await readGzipOriginalSize(filePath, stat.size)
@@ -880,7 +1000,65 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  /**
+   * Adopts decompressed range-cache files left behind by a previous run into this instance's cache
+   * tracker, so TTL/LRU eviction can reclaim them.
+   *
+   * Cache tracking is in-memory. A process that dies without reaching `stop()` — SIGKILL, OOM,
+   * eviction — leaves every decompressed copy it wrote on disk, and the next boot has no record of
+   * them: they are invisible to eviction, and invisible to `allFileIds` too (which deliberately skips
+   * a raw whose `.gzip` exists), so without this they accumulate across restarts with nothing that
+   * ever reclaims the space.
+   *
+   * A raw file sitting next to its own `.gzip` can only be such a cache copy: every commit path makes
+   * exactly one representation primary and removes the counterpart, and commits interrupted midway
+   * are resolved by `journal.reconcile()` before this runs. Nothing is deleted here — the files are
+   * handed to the normal eviction policy, so a warm cache survives a restart rather than being thrown
+   * away wholesale.
+   */
+  async function adoptOrphanedCacheFiles(folder: string): Promise<number> {
+    let adopted = 0
+    const dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
+    for await (const entry of dirEntries) {
+      const entryPath = path.resolve(folder, entry.name)
+      // Per entry, so one unreadable file or damaged shard costs only its own adoption instead of
+      // aborting the sweep and leaving every later orphan untracked. Reclaiming disk is best-effort
+      // by nature; the operations that must be exact do their own verification.
+      try {
+        if (entry.isDirectory()) {
+          if (ATOMIC_MODE && folder === root && entry.name === tempDirName) continue
+          adopted += await adoptOrphanedCacheFiles(entryPath)
+          continue
+        }
+        if (entry.name.endsWith(GZIP_EXTENSION)) continue
+        if (!(await components.fs.existPath(entryPath + GZIP_EXTENSION))) continue
+        // Re-confirm the `.gzip` counterpart INSIDE the lock. Outside it, a store could commit a raw
+        // at this path (removing the gzip and forgetting the entry) between the scan and the
+        // adoption — and adopting that raw would hand the only copy of freshly stored primary content
+        // to the evictor. Under the lock a commit is either fully before this check (no gzip left, so
+        // it is skipped) or fully after it (its `cache.forget` drops what was adopted here).
+        const wasAdopted = await withPathLock(entryPath, async () => {
+          if (!(await components.fs.existPath(entryPath + GZIP_EXTENSION))) return false
+          const stat = await statForRead(entryPath)
+          if (!stat) return false
+          return cache.adopt(entryPath, stat.size)
+        })
+        if (wasAdopted) adopted++
+      } catch (error) {
+        logger.warn(`Could not adopt a possible orphaned decompressed cache file`, {
+          path: entryPath,
+          error: error instanceof Error ? error.message : String(error)
+        })
+      }
+    }
+    return adopted
+  }
+
   await journal.reconcile()
+
+  // Batch surfaces take an unbounded id list; see `mapWithConcurrency`. Sized so the two `stat`s each
+  // `exist()` performs stay far below any conventional per-process file-descriptor limit.
+  const BATCH_CONCURRENCY = 64
 
   return {
     async start(_startOptions: any) {
@@ -904,6 +1082,13 @@ export async function createFolderBasedFileSystemContentStorage(
           if (removed > 0) logger.info(`Removed ${removed} orphaned temp file(s) at startup`)
         })
         .catch((error) => logger.warn(`Orphaned temp-file sweep failed: ${error}`))
+        // Chained onto the same promise (rather than started in parallel) so the two startup sweeps
+        // never contend for the disk with each other, and `stop()` still has one thing to await.
+        .then(() => (ADOPT_ORPHANED_DECOMPRESSED_FILES ? adoptOrphanedCacheFiles(root) : 0))
+        .then((adopted) => {
+          if (adopted > 0) logger.info(`Adopted ${adopted} orphaned decompressed cache file(s) at startup`)
+        })
+        .catch((error) => logger.warn(`Orphaned decompress-cache adoption failed: ${error}`))
     },
     async stop() {
       if (evictionTimer) {
@@ -956,14 +1141,23 @@ export async function createFolderBasedFileSystemContentStorage(
       }
     },
     async existMultiple(cids: string[]): Promise<Map<string, boolean>> {
-      const entries = await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]))
-      return new Map(entries)
+      return new Map(
+        await mapWithConcurrency(
+          cids,
+          BATCH_CONCURRENCY,
+          async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]
+        )
+      )
     },
-    allFileIds: (prefix?: string) => allFileIdsRec(root, prefix),
+    allFileIds: (prefix?: string) => allFileIdsRec(root, root, prefix),
     fileInfo,
     async fileInfoMultiple(cids: string[]): Promise<Map<string, FileInfo | undefined>> {
       return new Map(
-        await Promise.all(cids.map(async (cid): Promise<[string, FileInfo | undefined]> => [cid, await fileInfo(cid)]))
+        await mapWithConcurrency(
+          cids,
+          BATCH_CONCURRENCY,
+          async (cid): Promise<[string, FileInfo | undefined]> => [cid, await fileInfo(cid)]
+        )
       )
     }
   }

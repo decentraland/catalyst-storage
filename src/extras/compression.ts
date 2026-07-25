@@ -29,9 +29,10 @@ const NATIVE_FS: CompressionFileSystem = {
 }
 
 /**
- * @public
+ * What a successful compression measured. Internal: `compressContentFile` reports only whether the
+ * compression was kept, so this shape has never been reachable from any exported signature.
  */
-export type CompressionResult = {
+type CompressionResult = {
   originalSize: number
   compressedSize: number
 }

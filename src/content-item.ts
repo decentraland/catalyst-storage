@@ -10,7 +10,12 @@ export class SimpleContentItem implements ContentItem {
     private streamCreator: () => Promise<Readable>,
     public size: number | null,
     public encoding: string | null,
-    public contentSize: number | null = size
+    // Defaults to `size` only for UNENCODED content, where the two are the same by definition. For
+    // encoded content `size` is the stored (compressed) length while `contentSize` is documented as
+    // the logical one, so defaulting to it silently reported the compressed byte count under the
+    // field callers use — some as `contentSize ?? size` — to bound reads. `null` is the documented
+    // "unknown"; a caller that knows the real logical size passes it explicitly, as both backends do.
+    public contentSize: number | null = encoding ? null : size
   ) {}
 
   static fromBuffer(buffer: Uint8Array): SimpleContentItem {
