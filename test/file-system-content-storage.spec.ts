@@ -2194,6 +2194,13 @@ describe('fileSystemContentStorage', () => {
         reason = new Error('cancelled while queued on the lock')
         const controller = new AbortController()
         const queuedStore = lockedStorage.storeStream(id, bufferToStream(content), controller.signal)
+        // Capture the outcome NOW rather than after `await firstStore`. The queued store can reject
+        // while that await is still pending, and with no handler attached yet that surfaces as an
+        // unhandled rejection instead of the value this test wants to inspect.
+        const queuedSettled = queuedStore.then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
         // Let the queued store consume its source and reach the lock queue.
         const tempDirPath = path.join(lockRoot, '.tmp-writes')
         for (let i = 0; i < 1000; i++) {
@@ -2206,10 +2213,7 @@ describe('fileSystemContentStorage', () => {
         controller.abort(reason)
         releaseRename()
         await firstStore
-        queuedOutcome = await queuedStore.then(
-          () => 'resolved' as const,
-          (error: unknown) => error
-        )
+        queuedOutcome = await queuedSettled
       })
 
       afterEach(async () => {

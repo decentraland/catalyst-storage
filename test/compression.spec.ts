@@ -7,6 +7,7 @@ import {
   rmSync,
   writeFileSync
 } from 'fs'
+import { Readable } from 'stream'
 import os from 'os'
 import path from 'path'
 import { CompressionFileSystem, compressContentFile } from '../src/extras/compression'
@@ -99,7 +100,10 @@ describe('compressContentFile', () => {
       }
       logger.warn = (message: string, context: any) => warnings.push({ message, context })
       const failing: CompressionFileSystem = {
-        createReadStream,
+        // An in-memory source rather than a real file: only the failed cleanup is under test here,
+        // and a real read stream's open can still land after this suite removes its temp directory,
+        // emitting an unhandled ENOENT into whichever test runs next.
+        createReadStream: (() => Readable.from([Buffer.alloc(64)])) as any,
         createWriteStream: (() => {
           throw Object.assign(new Error('EIO: cannot open output'), { code: 'EIO' })
         }) as any,
