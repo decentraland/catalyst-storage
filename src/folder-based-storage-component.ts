@@ -7,7 +7,7 @@ import { SimpleContentItem, streamToBuffer } from './content-item'
 import { isAbortError, markAsNonCancellationError, runStoreWithSignal } from './cancellation'
 import { compressContentFile } from './extras/compression'
 import { createFsInvariants } from './folder-based/fs-invariants'
-import { createDecompressCache } from './folder-based/decompress-cache'
+import { createDecompressCache, InvalidationToken } from './folder-based/decompress-cache'
 import { createIntentJournal, TEMP_DIR_NAME, UncommittedIntentSurvivedError } from './folder-based/intent-journal'
 import { DecompressionLimitExceededError, PathNotContainedError } from './folder-based/errors'
 
@@ -348,6 +348,127 @@ export async function createFolderBasedFileSystemContentStorage(
     return undefined
   }
 
+  async function gzipSourceVanishedForRead(gzipPath: string): Promise<boolean> {
+    // Was a failed inflation the SOURCE disappearing under a concurrent delete — an expected race —
+    // or this storage's own machinery breaking? The error cannot answer that: neither its code nor
+    // its identity is evidence, because `pipeline` destroys upstream streams WITH the downstream
+    // error, so a staging write that fails ENOENT arrives on the gzip stream as the very same object
+    // a vanished source would produce. Attributing by listener would credit every broken staging
+    // directory to a deleted file and retry it into a reported absence.
+    //
+    // The on-disk state does answer it, and only costs a probe on the failure path: if the gzip we
+    // were inflating is gone, the id really is being deleted; if it is still there, the failure
+    // belongs to us.
+    //
+    // Answered by `statForRead`, the same probe the rest of the read path uses, so absence means the
+    // same thing everywhere: the file is gone AND its parent is still proven to be a directory. A
+    // weaker test — plain "the path does not exist" — would call a removed or file-obstructed shard
+    // a vanished source, swallow the inflation and retry it into a reported absence, which is
+    // precisely the misclassification this contract removes. Its rejection (a parent that cannot be
+    // proven intact) is not evidence of a vanish either: it invalidates the stale cache entry on the
+    // way through, and the caller's original inflate error is what surfaces.
+    try {
+      return (await statForRead(gzipPath)) === undefined
+    } catch {
+      return false
+    }
+  }
+
+  async function inflateGzipItemInto(gzipItem: ContentItem, target: string): Promise<void> {
+    // Both streams are created inside the try and torn down if anything fails before `pipe` takes
+    // ownership: arguments evaluate left to right, so the source (and the file descriptor behind it)
+    // already exists by the time the destination is constructed, and a custom adapter may throw
+    // synchronously there where native fs would report asynchronously. Without this the source is
+    // left paused mid-read, holding its descriptor for the life of the process. When `pipe` did run
+    // it has already destroyed both, so the teardown here is a no-op in the common failure case.
+    let source: Readable | undefined
+    let destination: Writable | undefined
+    try {
+      source = await gzipItem.asStream()
+      destination = components.fs.createWriteStream(target)
+      // Cap how much the gzip may inflate to so a decompression bomb cannot write an unbounded file
+      // to disk. The gzip trailer's declared size is attacker-controllable, so the limit is enforced
+      // on the actual inflated bytes.
+      await pipe(source, createSizeLimitTransform(MAX_DECOMPRESSED_SIZE), destination)
+    } catch (err) {
+      for (const stream of [source, destination]) {
+        try {
+          stream?.destroy()
+        } catch {
+          // best-effort teardown; the failure below is what matters
+        }
+      }
+      throw err
+    }
+  }
+
+  async function materializeRangeCacheFromGzip(
+    id: string,
+    uncompressedPath: string,
+    token: InvalidationToken
+  ): Promise<void> {
+    const gzipItem = await retrieveWithEncoding(id, 'gzip')
+    if (!gzipItem) {
+      return
+    }
+
+    const gzipPath = uncompressedPath + '.gzip'
+    const sourceVanished = () => gzipSourceVanishedForRead(gzipPath)
+    const { rename } = components.fs
+    if (rename) {
+      // Stage the inflation in the temp dir so a process killed mid-decompress can never leave a
+      // partial file at the canonical uncompressed path — a later range request would silently serve
+      // its truncated bytes as valid content.
+      const writePath = journal.newTempPath()
+      try {
+        await inflateGzipItemInto(gzipItem, writePath)
+        // Commit under the path lock so this rename can never interleave with a store or delete on
+        // the same canonical path; discard when the source gzip was replaced or the id deleted while
+        // inflating.
+        const committed = await withPathLock(uncompressedPath, async () => {
+          if (token.invalidated) return false
+          await rename(writePath, uncompressedPath)
+          const stat = await components.fs.stat(uncompressedPath)
+          cache.record(uncompressedPath, stat.size)
+          return true
+        })
+        if (!committed) {
+          await noFailUnlink(writePath)
+        }
+      } catch (err) {
+        // Remove the partial staged file; the canonical path was never touched.
+        await noFailUnlink(writePath)
+        // An invalidated token means the id was overwritten/deleted while inflating — the failure
+        // belongs to the replaced gzip, not to the caller's request. Resolving lets the retry loop
+        // observe the new representation instead of the error bubbling into a spurious undefined for
+        // a valid id.
+        if (token.invalidated || (await sourceVanished())) return
+        throw err
+      }
+      return
+    }
+
+    // In-place (no rename) legacy path: there is no staging, so the ENTIRE inflate/register sequence
+    // runs under the path lock and honors the invalidation token — a concurrent store/delete
+    // completing first must not be overwritten by a stale decompression, and the cleanup of a failed
+    // inflation must not race a newer writer.
+    await withPathLock(uncompressedPath, async () => {
+      if (token.invalidated) return
+      try {
+        await inflateGzipItemInto(gzipItem, uncompressedPath)
+      } catch (err) {
+        // Under the lock the partial file is provably ours to remove.
+        await noFailUnlink(uncompressedPath)
+        // Defensive symmetry with the staged branch: writers take this same lock, so the token cannot
+        // flip mid-section today.
+        if (token.invalidated || (await sourceVanished())) return
+        throw err
+      }
+      const stat = await components.fs.stat(uncompressedPath)
+      cache.record(uncompressedPath, stat.size)
+    })
+  }
+
   // Shared no-rename (legacy) direct write. MUST be called while holding the path lock. Writes the
   // raw in place and enforces the same successful-write invariant as the atomic path: never resolve
   // while the preferred gzip counterpart survives. There is no journal in this mode, so a surviving
@@ -493,120 +614,9 @@ export async function createFolderBasedFileSystemContentStorage(
 
         // Deduplicated across concurrent callers of the same path, and handed the invalidation token
         // that says whether the gzip this inflation started from is still the current version.
-        await cache.deduplicateInflation(uncompressedPath, async (token) => {
-          const gzipItem = await retrieveWithEncoding(id, 'gzip')
-          if (!gzipItem) {
-            return
-          }
-          // Was a failed inflation the SOURCE disappearing under a concurrent delete — an expected
-          // race — or this storage's own machinery breaking? The error cannot answer that: neither its
-          // code nor its identity is evidence, because `pipeline` destroys upstream streams WITH the
-          // downstream error, so a staging write that fails ENOENT arrives on the gzip stream as the
-          // very same object a vanished source would produce. Attributing by listener would credit
-          // every broken staging directory to a deleted file and retry it into a reported absence.
-          //
-          // The on-disk state does answer it, and only costs a probe on the failure path: if the gzip
-          // we were inflating is gone, the id really is being deleted; if it is still there, the
-          // failure belongs to us.
-          //
-          // Answered by `statForRead`, the same probe the rest of the read path uses, so absence means
-          // the same thing everywhere: the file is gone AND its parent is still proven to be a
-          // directory. A weaker test — plain "the path does not exist" — would call a removed or
-          // file-obstructed shard a vanished source, swallow the inflation and retry it into a
-          // reported absence, which is precisely the misclassification this contract removes. Its
-          // rejection (a parent that cannot be proven intact) is not evidence of a vanish either: it
-          // invalidates the stale cache entry on the way through, and the caller's original inflate
-          // error is what surfaces.
-          const gzipPath = uncompressedPath + '.gzip'
-          const sourceVanished = async (): Promise<boolean> => {
-            try {
-              return (await statForRead(gzipPath)) === undefined
-            } catch {
-              return false
-            }
-          }
-          // Inflates the gzip into `target`. Both streams are created inside the try and torn down if
-          // anything fails before `pipe` takes ownership: arguments evaluate left to right, so the
-          // source (and the file descriptor behind it) already exists by the time the destination is
-          // constructed, and a custom adapter may throw synchronously there where native fs would
-          // report asynchronously. Without this the source is left paused mid-read, holding its
-          // descriptor for the life of the process. When `pipe` did run it has already destroyed both,
-          // so the teardown here is a no-op in the common failure case.
-          const inflateInto = async (target: string): Promise<void> => {
-            let source: Readable | undefined
-            let destination: Writable | undefined
-            try {
-              source = await gzipItem.asStream()
-              destination = components.fs.createWriteStream(target)
-              // Cap how much the gzip may inflate to so a decompression bomb cannot write an
-              // unbounded file to disk. The gzip trailer's declared size is attacker-controllable, so
-              // the limit is enforced on the actual inflated bytes.
-              await pipe(source, createSizeLimitTransform(MAX_DECOMPRESSED_SIZE), destination)
-            } catch (err) {
-              for (const stream of [source, destination]) {
-                try {
-                  stream?.destroy()
-                } catch {
-                  // best-effort teardown; the failure below is what matters
-                }
-              }
-              throw err
-            }
-          }
-          const { rename } = components.fs
-          if (rename) {
-            // Stage the inflation in the temp dir so a process killed mid-decompress can never
-            // leave a partial file at the canonical uncompressed path — a later range request
-            // would silently serve its truncated bytes as valid content.
-            const writePath = journal.newTempPath()
-            try {
-              await inflateInto(writePath)
-              // Commit under the path lock so this rename can never interleave with a store or
-              // delete on the same canonical path; discard when the source gzip was replaced or
-              // the id deleted while inflating.
-              const committed = await withPathLock(uncompressedPath, async () => {
-                if (token.invalidated) return false
-                await rename(writePath, uncompressedPath)
-                const stat = await components.fs.stat(uncompressedPath)
-                cache.record(uncompressedPath, stat.size)
-                return true
-              })
-              if (!committed) {
-                await noFailUnlink(writePath)
-              }
-            } catch (err) {
-              // Remove the partial staged file; the canonical path was never touched.
-              await noFailUnlink(writePath)
-              // An invalidated token means the id was overwritten/deleted while inflating —
-              // the failure belongs to the replaced gzip, not to the caller's request.
-              // Resolving lets the retry loop observe the new representation instead of the
-              // error bubbling into a spurious undefined for a valid id.
-              if (token.invalidated || (await sourceVanished())) return
-              throw err
-            }
-            return
-          }
-
-          // In-place (no rename) legacy path: there is no staging, so the ENTIRE inflate/
-          // register sequence runs under the path lock and honors the invalidation token — a
-          // concurrent store/delete completing first must not be overwritten by a stale
-          // decompression, and the cleanup of a failed inflation must not race a newer writer.
-          await withPathLock(uncompressedPath, async () => {
-            if (token.invalidated) return
-            try {
-              await inflateInto(uncompressedPath)
-            } catch (err) {
-              // Under the lock the partial file is provably ours to remove.
-              await noFailUnlink(uncompressedPath)
-              // Defensive symmetry with the staged branch: writers take this same lock, so the
-              // token cannot flip mid-section today.
-              if (token.invalidated || (await sourceVanished())) return
-              throw err
-            }
-            const stat = await components.fs.stat(uncompressedPath)
-            cache.record(uncompressedPath, stat.size)
-          })
-        })
+        await cache.deduplicateInflation(uncompressedPath, (token) =>
+          materializeRangeCacheFromGzip(id, uncompressedPath, token)
+        )
 
         // Serve range from the cached uncompressed file (undefined when the gzip didn't exist or
         // the decompression was discarded; the loop then retries once)
