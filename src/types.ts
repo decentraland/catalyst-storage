@@ -62,6 +62,24 @@ export type FileInfo = {
 }
 
 /**
+ * Thrown when a backend cannot serve a RANGE of an object it can otherwise serve whole.
+ *
+ * Distinct from `RangeError`, which means the requested bounds are invalid: here the request is
+ * well-formed and the content is present, but this backend has no way to apply logical bounds to it
+ * (S3 ranges address the stored bytes, and S3 keeps no uncompressed-size metadata for encoded
+ * objects). Typed so callers can answer 416 rather than the 5xx the read contract prescribes for
+ * every other `retrieve()` rejection.
+ *
+ * @public
+ */
+export class RangeNotSupportedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RangeNotSupportedError'
+  }
+}
+
+/**
  * Validates that a range is well-formed (start >= 0 and start <= end).
  *
  * @public

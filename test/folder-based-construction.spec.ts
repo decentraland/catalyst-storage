@@ -1,4 +1,6 @@
 import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
+import { gzipSync } from 'zlib'
+import { intentNameFor } from './file-system-utils'
 import os from 'os'
 import path from 'path'
 import {
@@ -92,7 +94,7 @@ describe('folder-based storage construction', () => {
       root = mkdtempSync(path.join(os.tmpdir(), 'unprovable-intent-'))
       await nodeFs.mkdir(path.join(root, '.tmp-writes'), { recursive: true })
       await nodeFs.writeFile(
-        path.join(root, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
+        path.join(root, '.tmp-writes', intentNameFor('some-id')),
         JSON.stringify({ op: 'raw', id: 'some-id', staged: 'deadbeefdeadbeef-00000000000000000000000000000000' })
       )
     })
@@ -118,7 +120,7 @@ describe('folder-based storage construction', () => {
       // started: it is discarded rather than applied to whatever the id looks like now.
       root = mkdtempSync(path.join(os.tmpdir(), 'corrupt-intent-'))
       await nodeFs.mkdir(path.join(root, '.tmp-writes'), { recursive: true })
-      intentPath = path.join(root, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+      intentPath = path.join(root, '.tmp-writes', intentNameFor('some-id'))
       await nodeFs.writeFile(intentPath, '{"op":"raw","id":"some-i')
       storage = await createFolderBasedFileSystemContentStorage(
         { fs: createFsComponent(), logs: await createLogComponent({}) },
@@ -147,16 +149,19 @@ describe('folder-based storage construction', () => {
 
     beforeEach(async () => {
       // A committed gzip whose stale raw counterpart survived: reconciliation must remove the raw.
-      // sha1('some-id') = 9584b661c135a43f2fbbe43cc5104f7bd693d048
+      // The intent journal is named sha256(id).intent; see intentNameFor.
       root = mkdtempSync(path.join(os.tmpdir(), 'pending-intent-'))
       const shard = path.join(root, '9584')
       await nodeFs.mkdir(shard, { recursive: true })
       staleRawPath = path.join(shard, 'some-id')
       await nodeFs.writeFile(staleRawPath, 'stale raw')
-      await nodeFs.writeFile(path.join(shard, 'some-id.gzip'), 'committed gzip')
+      // A REAL gzip: reconciliation refuses to treat a gzip too short to be valid as a landed commit
+      // (a power loss can leave the directory entry without the data), so a placeholder string would
+      // be discarded instead of being reconciled.
+      await nodeFs.writeFile(path.join(shard, 'some-id.gzip'), gzipSync(Buffer.from('committed gzip')))
       await nodeFs.mkdir(path.join(root, '.tmp-writes'), { recursive: true })
       await nodeFs.writeFile(
-        path.join(root, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
+        path.join(root, '.tmp-writes', intentNameFor('some-id')),
         JSON.stringify({ op: 'gzip', id: 'some-id', staged: 'deadbeefdeadbeef-00000000000000000000000000000000' })
       )
       storage = await createFolderBasedFileSystemContentStorage(

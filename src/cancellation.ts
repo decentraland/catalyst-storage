@@ -64,6 +64,25 @@ function isAbortTeardownError(error: unknown, signal: AbortSignal, teardown: Tea
   return teardown.destroyedSource && err?.code === 'ERR_STREAM_PREMATURE_CLOSE'
 }
 
+/**
+ * Destroys a stream that nothing else is listening to yet.
+ *
+ * The listener is attached BEFORE destroying, and is not optional. A stream whose `open(2)` is still
+ * in flight goes on to emit 'error' even after `destroy()` — an `fs.ReadStream` over a missing or
+ * unreadable path is the ordinary case — and on the pre-aborted path below `operation()` never runs,
+ * so NOTHING else ever attaches a listener: the emit becomes an uncaught exception, which terminates
+ * the process by default. The same window exists for the abort listener, which can fire before the
+ * backend's `pipeline` has taken ownership of the source.
+ *
+ * Whatever arrives here is post-mortem noise — the caller is about to observe the cancellation
+ * reason, or the operation's own rejection. Mirrors the teardown in `compressContentFile` and
+ * `inflateGzipItemInto`, which guard the identical hazard.
+ */
+function destroyQuietly(stream: Readable): void {
+  stream.on('error', () => undefined)
+  stream.destroy()
+}
+
 function abortReasonOf(signal: AbortSignal): unknown {
   // `??` would also replace an explicit `null` abort reason; the caller must observe their own
   // cancellation cause, so only default when no reason was provided at all.
@@ -99,7 +118,7 @@ export async function runStoreWithSignal<T>(
   }
   if (signal.aborted) {
     try {
-      stream.destroy()
+      destroyQuietly(stream)
     } catch {
       // teardown is best-effort; the abort reason below must win
     }
@@ -121,7 +140,7 @@ export async function runStoreWithSignal<T>(
         // or in the tick before an auto-destroy lands) is just resource cleanup and earns no
         // provenance — otherwise a premature-close rejection from elsewhere would be credited to us.
         teardown.destroyedSource = !stream.readableEnded
-        stream.destroy()
+        destroyQuietly(stream)
       }
     } catch {
       // best-effort
