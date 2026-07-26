@@ -98,6 +98,10 @@ describe('folder-based storage read contract', () => {
 
   describe('when a stored id becomes unreadable', () => {
     let shardPath: string
+    // `chmod 000` denies nothing to root, which is the default user in most CI containers, so the
+    // premise of these two cases simply does not hold there.
+    const canDenyAccess = typeof process.getuid === 'function' && process.getuid() !== 0
+    const itUnlessRoot = canDenyAccess ? it : it.skip
 
     beforeEach(async () => {
       await storage.storeStream('locked-id', bufferToStream(Buffer.from('secret')))
@@ -109,13 +113,13 @@ describe('folder-based storage read contract', () => {
       await nodeFs.chmod(shardPath, 0o755)
     })
 
-    it('should reject exist rather than reporting the present-but-unreadable id as absent', async () => {
+    itUnlessRoot('should reject exist rather than reporting the present-but-unreadable id as absent', async () => {
       // `existPath` tests F_OK|R_OK, so this used to answer `false` — the "a broken store looks like
       // an empty one" answer the read contract exists to remove, and one `fileInfo` already refuses.
       await expect(storage.exist('locked-id')).rejects.toMatchObject({ code: 'EACCES' })
     })
 
-    it('should reject fileInfo for the same id, as it already did', async () => {
+    itUnlessRoot('should reject fileInfo for the same id, as it already did', async () => {
       await expect(storage.fileInfo('locked-id')).rejects.toMatchObject({ code: 'EACCES' })
     })
   })
@@ -229,6 +233,26 @@ describe('folder-based storage ids that normalize onto another id', () => {
         await expect(storage.delete([aliasing])).rejects.toBeInstanceOf(PathNotContainedError)
         expect(await storage.exist('victim')).toBe(true)
       })
+    })
+
+    describe.each([
+      ['ends in .gzip', 'victim.gzip'],
+      ['contains a NUL byte', 'vic\0tim']
+    ])('and the id %s', (_name, unaddressable) => {
+      it('should reject a store', async () => {
+        await expect(storage.storeStream(unaddressable, bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should reject exist', async () => {
+        await expect(storage.exist(unaddressable)).rejects.toBeInstanceOf(PathNotContainedError)
+      })
+    })
+
+    it('should report an over-long name as absent rather than as a storage fault', async () => {
+      // No file of that name can exist, so it is a miss. Throwing failed whole existMultiple batches.
+      await expect(storage.exist('x'.repeat(300))).resolves.toBe(false)
     })
 
     it('should still accept a legitimately nested id', async () => {

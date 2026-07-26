@@ -47,17 +47,6 @@ export type FolderStorageOptions = {
    * enforced.
    */
   tempDirectoryName?: string
-  /**
-   * Whether `start()` walks the content tree once, in the background, adopting decompressed
-   * range-cache copies left behind by a run that never reached `stop()` so eviction can reclaim
-   * them. Default: true.
-   *
-   * The cost is one directory walk plus one `existPath` per stored file, per process start — the
-   * same traversal `allFileIds()` performs. It is detached (startup is never delayed) and awaited by
-   * `stop()`. Set it to false on a very large store that shuts down cleanly, accepting that
-   * decompressed copies orphaned by a hard kill are then never reclaimed.
-   */
-  adoptOrphanedDecompressedFiles?: boolean
 }
 
 /**
@@ -168,7 +157,6 @@ export async function createFolderBasedFileSystemContentStorage(
 
   const { existsForInvariant, noFailUnlink } = createFsInvariants(components.fs)
 
-  const ADOPT_ORPHANED_DECOMPRESSED_FILES = options?.adoptOrphanedDecompressedFiles ?? true
   const CACHE_EVICTION_INTERVAL = options?.decompressCacheEvictionInterval ?? FIVE_MINUTES_IN_MS
   const MAX_DECOMPRESSED_SIZE = options?.decompressMaxFileSize ?? TWO_HUNDRED_FIFTY_SIX_MB_IN_BYTES
 
@@ -188,6 +176,9 @@ export async function createFolderBasedFileSystemContentStorage(
   // operation that needs it fails loudly and `forgetDirectory` lets the retry recreate it.
   // Bounded by construction with hash prefixes (16^4 = 65,536 shards) and capped for flat mode,
   // where slash-containing ids can nest arbitrarily.
+  /** This storage's own suffix for an id's compressed representation. Reserved: ids may not end in it. */
+  const GZIP_EXTENSION = '.gzip'
+
   const MAX_KNOWN_DIRECTORIES = 100_000
   const knownDirectories = new Set<string>()
 
@@ -263,7 +254,10 @@ export async function createFolderBasedFileSystemContentStorage(
     try {
       return await components.fs.stat(filePath)
     } catch (err: any) {
-      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw err
+      // ENAMETOOLONG joins ENOENT/ENOTDIR as PROVABLY absent: no file of that name can exist, so it
+      // is a miss rather than a storage fault. `exist()` answered `false` for it before switching to
+      // this probe, and turning that into a throw failed whole `existMultiple` batches.
+      if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR' && err?.code !== 'ENAMETOOLONG') throw err
       // An id's two representations live in the SAME directory, so a caller probing both only needs
       // that directory proven once: `parentAlreadyProvenIntact` says an earlier probe in this
       // operation already resolved (rather than threw), which is exactly that proof. Without it,
@@ -309,6 +303,24 @@ export async function createFolderBasedFileSystemContentStorage(
     // an empty id and an empty relative path are equal.
     if (id.length === 0) {
       throw new PathNotContainedError('The id is empty, so it does not name a file inside the storage folder')
+    }
+
+    // `<id>.gzip` is this storage's own name for the compressed representation of `<id>`, so an id
+    // ending in it is not addressable: it occupies another id's second path. The damage is not
+    // hypothetical — storing `foo` and `foo.gzip` made `retrieve('foo')` serve `foo.gzip`'s bytes
+    // (inflating them, with a contentSize read out of the wrong file's last four bytes),
+    // `exist('foo.gzip')` answer false, and `allFileIds()` report a phantom `foo` twice while never
+    // listing `foo.gzip` — so a consumer syncing or GC-ing from it would delete real content.
+    if (id.endsWith(GZIP_EXTENSION)) {
+      throw new PathNotContainedError(
+        `The id ends in ${GZIP_EXTENSION}, which names the compressed representation of another id: ${JSON.stringify(id)}`
+      )
+    }
+
+    // A NUL byte cannot be part of a filename; `fs` rejects it with ERR_INVALID_ARG_VALUE, which is
+    // not one of the "provably absent" codes, so it would surface from `exist()` as a storage fault.
+    if (id.includes('\0')) {
+      throw new PathNotContainedError(`The id contains a NUL byte, which no filename can hold`)
     }
 
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
@@ -408,7 +420,10 @@ export async function createFolderBasedFileSystemContentStorage(
     // COMPRESSED byte count under that field, and at least one bounds range requests with
     // `contentSize ?? size`. An `undefined` trailer means the gzip vanished mid-read: report this
     // representation as absent so the caller falls through to the raw one, just as `fileInfo` does.
-    let contentSize: number | null = stat.size
+    // For a gzip item the logical size is the trailer's, or `null` when the caller opted out of
+    // reading it — never `stat.size`, which is the COMPRESSED count and is exactly the confusion
+    // SimpleContentItem's own `encoding ? null : size` default exists to prevent.
+    let contentSize: number | null = encoding === 'gzip' ? null : stat.size
     if (encoding === 'gzip' && resolveContentSize) {
       const originalSize = await readGzipOriginalSize(filePath, stat.size)
       if (originalSize === undefined) return undefined
@@ -768,8 +783,6 @@ export async function createFolderBasedFileSystemContentStorage(
     return (await statForRead(filePath, true)) !== undefined
   }
 
-  const GZIP_EXTENSION = '.gzip'
-
   /**
    * Walks the content tree yielding stored ids.
    *
@@ -823,12 +836,16 @@ export async function createFolderBasedFileSystemContentStorage(
       })
       const buffer = await streamToBuffer(stream)
       // Fewer than 4 bytes means the file SHRANK between the stat that produced `gzipSize` and this
-      // read of its last four bytes — a concurrent overwrite with smaller content, which is the same
-      // benign race as the file vanishing outright and is answered the same way. Reading on would
-      // throw ERR_BUFFER_OUT_OF_BOUNDS, and because the path still EXISTS (it was replaced, not
-      // removed) the probe below cannot recognize the race either — so a healthy storage rejected an
-      // ordinary read with a raw buffer error.
-      if (buffer.length < 4) return undefined
+      // read of its last four bytes — a concurrent overwrite with smaller content. Reading on would
+      // throw ERR_BUFFER_OUT_OF_BOUNDS, and the probe below cannot recognise the race either because
+      // the path still EXISTS (it was replaced, not removed).
+      //
+      // The answer is `null` (size unknown), NOT `undefined`. `undefined` means "this representation
+      // is gone, try the other one" — and when the newer version is gzip-primary there IS no other
+      // one, so a present id was reported ABSENT. Measured at ~1.3% of reads under concurrent
+      // compressing writes. The gzip is there and perfectly servable; only its declared logical size
+      // is unknowable from a stat that no longer describes the file.
+      if (buffer.length < 4) return null
       return buffer.readUInt32LE(0)
     } catch (err) {
       // `null` is a legitimate answer — content whose size the format cannot express (a >4GB original,
@@ -1019,60 +1036,6 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  /**
-   * Adopts decompressed range-cache files left behind by a previous run into this instance's cache
-   * tracker, so TTL/LRU eviction can reclaim them.
-   *
-   * Cache tracking is in-memory. A process that dies without reaching `stop()` — SIGKILL, OOM,
-   * eviction — leaves every decompressed copy it wrote on disk, and the next boot has no record of
-   * them: they are invisible to eviction, and invisible to `allFileIds` too (which deliberately skips
-   * a raw whose `.gzip` exists), so without this they accumulate across restarts with nothing that
-   * ever reclaims the space.
-   *
-   * A raw file sitting next to its own `.gzip` can only be such a cache copy: every commit path makes
-   * exactly one representation primary and removes the counterpart, and commits interrupted midway
-   * are resolved by `journal.reconcile()` before this runs. Nothing is deleted here — the files are
-   * handed to the normal eviction policy, so a warm cache survives a restart rather than being thrown
-   * away wholesale.
-   */
-  async function adoptOrphanedCacheFiles(folder: string): Promise<number> {
-    let adopted = 0
-    const dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
-    for await (const entry of dirEntries) {
-      const entryPath = path.resolve(folder, entry.name)
-      // Per entry, so one unreadable file or damaged shard costs only its own adoption instead of
-      // aborting the sweep and leaving every later orphan untracked. Reclaiming disk is best-effort
-      // by nature; the operations that must be exact do their own verification.
-      try {
-        if (entry.isDirectory()) {
-          if (ATOMIC_MODE && folder === root && entry.name === tempDirName) continue
-          adopted += await adoptOrphanedCacheFiles(entryPath)
-          continue
-        }
-        if (entry.name.endsWith(GZIP_EXTENSION)) continue
-        if (!(await components.fs.existPath(entryPath + GZIP_EXTENSION))) continue
-        // Re-confirm the `.gzip` counterpart INSIDE the lock. Outside it, a store could commit a raw
-        // at this path (removing the gzip and forgetting the entry) between the scan and the
-        // adoption — and adopting that raw would hand the only copy of freshly stored primary content
-        // to the evictor. Under the lock a commit is either fully before this check (no gzip left, so
-        // it is skipped) or fully after it (its `cache.forget` drops what was adopted here).
-        const wasAdopted = await withPathLock(entryPath, async () => {
-          if (!(await components.fs.existPath(entryPath + GZIP_EXTENSION))) return false
-          const stat = await statForRead(entryPath)
-          if (!stat) return false
-          return cache.adopt(entryPath, stat.size)
-        })
-        if (wasAdopted) adopted++
-      } catch (error) {
-        logger.warn(`Could not adopt a possible orphaned decompressed cache file`, {
-          path: entryPath,
-          error: error instanceof Error ? error.message : String(error)
-        })
-      }
-    }
-    return adopted
-  }
-
   await journal.reconcile()
 
   // Batch surfaces take an unbounded id list; see `mapWithConcurrency`. Sized so the two `stat`s each
@@ -1101,13 +1064,6 @@ export async function createFolderBasedFileSystemContentStorage(
           if (removed > 0) logger.info(`Removed ${removed} orphaned temp file(s) at startup`)
         })
         .catch((error) => logger.warn(`Orphaned temp-file sweep failed: ${error}`))
-        // Chained onto the same promise (rather than started in parallel) so the two startup sweeps
-        // never contend for the disk with each other, and `stop()` still has one thing to await.
-        .then(() => (ADOPT_ORPHANED_DECOMPRESSED_FILES ? adoptOrphanedCacheFiles(root) : 0))
-        .then((adopted) => {
-          if (adopted > 0) logger.info(`Adopted ${adopted} orphaned decompressed cache file(s) at startup`)
-        })
-        .catch((error) => logger.warn(`Orphaned decompress-cache adoption failed: ${error}`))
     },
     async stop() {
       if (evictionTimer) {

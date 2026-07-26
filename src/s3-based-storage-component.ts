@@ -273,10 +273,6 @@ export async function createS3BasedFileSystemContentStorage(
         // upload no longer needs that source, so it would run to completion and commit content for
         // an already-cancelled store. This is the checkpoint that stops it.
         //
-        // Nothing below re-checks `signal.aborted` before `done()` because nothing can change it:
-        // the constructor is synchronous, so no job — including the signal's own event dispatch —
-        // runs between here and there. Anyone introducing an `await` in that gap has to add a
-        // checkpoint back.
         signal?.throwIfAborted()
 
         upload = new Upload({
@@ -289,6 +285,17 @@ export async function createS3BasedFileSystemContentStorage(
             ContentType: mimeType
           }
         })
+        // Re-checked because `getKey` above is CALLER-supplied code evaluated inside the params
+        // literal, i.e. after the checkpoint and before `upload` is assigned. A `getKey` that aborts
+        // the signal lands while the abort listener still sees `upload === undefined` and so tears
+        // nothing down, leaving an already-cancelled store to run to completion and commit. Nothing
+        // else in this gap can move the signal — the constructor and `done()`'s prologue are
+        // synchronous — but the caller's own callback can, so the upload is torn down here, where it
+        // provably exists.
+        if (signal?.aborted) {
+          abortUpload()
+          signal.throwIfAborted()
+        }
         try {
           await upload.done()
         } catch (error) {
@@ -404,8 +411,14 @@ export async function createS3BasedFileSystemContentStorage(
           .slice(0, 5)
           .map((each) => `${each.Key} (${each.Code ?? 'unknown'})`)
           .join(', ')
+        // Names the CALLER's scope, not this chunk's. The request may span many chunks: earlier ones
+        // are already deleted and later ones are never attempted, so a message counting only this
+        // batch left callers unable to tell what remains. `delete` is idempotent, so retrying the
+        // whole list is safe and is the intended recovery.
         throw new Error(
-          `Failed to delete ${errors.length} of ${batch.length} object(s) from S3: ${shown}` +
+          `Failed to delete ${errors.length} object(s) from S3 while deleting ${ids.length} requested ` +
+            `(failing in the chunk starting at index ${from}; objects before it are already deleted and ` +
+            `objects after it were not attempted): ${shown}` +
             (errors.length > 5 ? ', …' : '')
         )
       }

@@ -107,10 +107,9 @@ export const loadFileType: FileTypeLoader = () => {
  * Detects the MIME type of content from its leading bytes, falling back to
  * `application/octet-stream` when nothing recognizable is found or the detector is unavailable.
  *
- * `loadModule` is injectable because the real loader cannot run under a Jest sandbox: the dynamic
- * `import()` is issued from a `Function`-compiled helper, which the runtime cannot attribute to a
- * referencing module, so it rejects with "trying to `import` a file outside of the scope of the test
- * code". Production always uses the default.
+ * `loadModule` is injectable so the fallback and logging paths can be driven directly — a real
+ * `file-type` load never fails, so those branches are otherwise unreachable from a test. Production
+ * always uses the default loader.
  */
 export async function detectMimeTypeFromBuffer(
   buffer: Buffer | Uint8Array,

@@ -34,11 +34,17 @@ const versionOf = (bytes: Buffer): number | undefined => {
   return match ? Number(match[1]) : undefined
 }
 
-/** Outcomes a read racing a write is allowed to produce. */
+/**
+ * Outcomes a read racing a write is allowed to produce with NO faults injected. Deliberately narrow:
+ * a shared allowlist covering the fault-injected run too would let a regression that started
+ * quarantining ids, or failing deletes, pass silently on a healthy filesystem.
+ */
 const isTolerableFailure = (error: any): boolean =>
-  error?.code === 'ENOENT' ||
-  error instanceof RangeError ||
-  error?.code === 'ERR_STREAM_PREMATURE_CLOSE' ||
+  error?.code === 'ENOENT' || error instanceof RangeError || error?.code === 'ERR_STREAM_PREMATURE_CLOSE'
+
+/** Additionally tolerated once `unlink` is being made to fail: these are the designed responses. */
+const isTolerableUnderInjectedFaults = (error: any): boolean =>
+  isTolerableFailure(error) ||
   /mixed state that could not be repaired/.test(error?.message ?? '') ||
   /injected/.test(error?.message ?? '') ||
   /quarantined/.test(error?.message ?? '') ||
@@ -57,6 +63,18 @@ type StormResult = {
 }
 
 async function runStorm(options: { seed: number; injectFaults?: boolean }): Promise<StormResult> {
+  let cleanup: () => void = () => undefined
+  try {
+    return await runStormIn(options, (dir) => (cleanup = () => rmSync(dir, { recursive: true, force: true })))
+  } finally {
+    cleanup()
+  }
+}
+
+async function runStormIn(
+  options: { seed: number; injectFaults?: boolean },
+  onRoot: (dir: string) => void
+): Promise<StormResult> {
   let seed = options.seed
   const rnd = (): number => {
     seed = (seed * 1103515245 + 12345) & 0x7fffffff
@@ -75,6 +93,7 @@ async function runStorm(options: { seed: number; injectFaults?: boolean }): Prom
   }
 
   const root = mkdtempSync(path.join(os.tmpdir(), 'stress-'))
+  onRoot(root)
   const base = createFsComponent()
   const component: IFileSystemComponent = { ...base }
   if (options.injectFaults) {
@@ -141,7 +160,8 @@ async function runStorm(options: { seed: number; injectFaults?: boolean }): Prom
           }
         }
       } catch (error: any) {
-        if (!isTolerableFailure(error)) {
+        const tolerated = options.injectFaults ? isTolerableUnderInjectedFaults : isTolerableFailure
+        if (!tolerated(error)) {
           result.unexpectedFailures.push(`${error?.code ?? ''} ${error?.message}`)
         }
       }
@@ -176,7 +196,6 @@ async function runStorm(options: { seed: number; injectFaults?: boolean }): Prom
   for await (const each of storage.allFileIds()) listed.push(each)
   result.duplicateIds = listed.filter((value, index) => listed.indexOf(value) !== index)
 
-  rmSync(root, { recursive: true, force: true })
   return result
 }
 

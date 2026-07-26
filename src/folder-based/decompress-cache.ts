@@ -44,13 +44,6 @@ export type DecompressCache = {
   /** Starts tracking a freshly committed decompressed file. Must be called under the path lock. */
   record(filePath: string, size: number): void
   /**
-   * Starts tracking a decompressed file this instance did NOT write — one left on disk by a previous
-   * run that never reached `stop()`. Returns whether it was adopted; an already-tracked path is
-   * ignored, so adoption can never double-count against the size budget. Must be called under the
-   * path lock, with the caller having just confirmed the path is still a derived cache copy.
-   */
-  adopt(filePath: string, size: number): boolean
-  /**
    * Drops the tracking entry WITHOUT unlinking the file. Used when the canonical path stops being a
    * derived cache and becomes primary content (a store landed there): a stale entry would let
    * TTL/size eviction delete the only copy of the new content.
@@ -205,12 +198,6 @@ export function createDecompressCache(
       forget(filePath)
       entries.set(filePath, { size, lastAccess: Date.now() })
       totalCacheSize += size
-    },
-    adopt(filePath: string, size: number): boolean {
-      if (entries.has(filePath)) return false
-      entries.set(filePath, { size, lastAccess: Date.now() })
-      totalCacheSize += size
-      return true
     },
     async remove(filePath: string): Promise<boolean> {
       const entry = entries.get(filePath)

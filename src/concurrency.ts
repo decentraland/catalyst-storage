@@ -40,9 +40,11 @@ export async function mapWithConcurrency<T, R>(
     }
   }
 
-  // At least one worker whenever there is work: a limit of 0 or below would otherwise spawn none and
-  // return a fully-holed array as if every item had been mapped.
-  const workers = items.length === 0 ? 0 : Math.max(1, Math.min(limit, items.length))
+  // At least one worker whenever there is work. A limit of 0 or below — or a non-finite one, where
+  // `Math.max(1, Math.min(NaN, n))` is still NaN and `Array.from({length: NaN})` is empty — would
+  // otherwise spawn none and resolve with a fully-holed array as if every item had been mapped.
+  const bounded = Number.isFinite(limit) ? Math.max(1, Math.min(limit, items.length)) : items.length
+  const workers = items.length === 0 ? 0 : bounded
   await Promise.all(Array.from({ length: workers }, () => worker()))
   if (failed) throw failure
   return results

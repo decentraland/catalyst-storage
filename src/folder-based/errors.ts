@@ -4,6 +4,8 @@
  * empty, `.` or `..` segment, or an absolute path). Typed so a read can report it as "nothing to
  * serve" without having to recognize an error message, while writes and existence checks reject
  * loudly.
+ *
+ * @public
  */
 export class PathNotContainedError extends Error {}
 
@@ -11,5 +13,7 @@ export class PathNotContainedError extends Error {}
  * A gzip item refused to inflate within the configured cap (a decompression bomb, or content that
  * genuinely exceeds `decompressMaxFileSize`). Typed so a read reports it as a miss: there is nothing
  * servable and nothing an operator can repair on this request.
+ *
+ * @public
  */
 export class DecompressionLimitExceededError extends Error {}

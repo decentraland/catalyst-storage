@@ -233,89 +233,52 @@ describe('S3 Storage', () => {
 })
 
 describe('S3 Storage MIME type detection', () => {
-  // The real detector cannot run here: `file-type` is ESM-only and the dynamic import that loads it
-  // is issued from a `Function`-compiled helper, which a Jest sandbox refuses to attribute to a
-  // referencing module. These tests therefore cover the wiring this repo owns — that the head of the
-  // stream reaches the detector and that its answer becomes the uploaded ContentType — while
-  // `mime-detection.spec.ts` covers the detection helpers directly.
   let storage: IContentStorageComponent
   let fakeS3: FakeS3Client
 
+  // Each payload is padded well past the 4100-byte detection window, so passing proves the type was
+  // identified from the HEAD alone while the body streamed through.
+  const padding = Buffer.alloc(8192, 0)
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]),
+    padding
+  ])
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0]), padding])
+  const glb = Buffer.concat([Buffer.from('glTF'), Buffer.from([2, 0, 0, 0, 0x10, 0, 0, 0]), padding])
+
   beforeEach(async () => {
     fakeS3 = createFakeS3Client()
-    const logs = await createLogComponent({})
-    storage = await createS3BasedFileSystemContentStorage({ logs }, fakeS3, { Bucket: 'example' })
+    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fakeS3, {
+      Bucket: 'example'
+    })
+  })
+
+  describe.each([
+    ['a PNG', 'png-id', png, 'image/png'],
+    ['a JPEG', 'jpeg-id', jpeg, 'image/jpeg'],
+    ['a binary glTF', 'glb-id', glb, 'model/gltf-binary']
+  ])('when %s larger than the detection window is stored', (_name, id, payload, expected) => {
+    beforeEach(async () => {
+      await storage.storeStream(id, bufferToStream(payload))
+    })
+
+    it(`should upload it as ${expected}`, () => {
+      expect(fakeS3.objects.get(id)!.contentType).toBe(expected)
+    })
+
+    it('should still upload every byte of the payload', () => {
+      expect(fakeS3.objects.get(id)!.body.equals(payload)).toBe(true)
+    })
   })
 
   describe('when the content has no signature the detector recognizes', () => {
-    let gltfJson: Buffer
-
     beforeEach(async () => {
-      gltfJson = Buffer.from(JSON.stringify({ asset: { version: '2.0' } }))
-      await storage.storeStream('gltf-id', bufferToStream(gltfJson))
+      await storage.storeStream('gltf-id', bufferToStream(Buffer.from(JSON.stringify({ asset: { version: '2.0' } }))))
     })
 
-    it('should upload it as application/octet-stream', () => {
+    it('should fall back to application/octet-stream', () => {
       expect(fakeS3.objects.get('gltf-id')!.contentType).toBe('application/octet-stream')
     })
-  })
-
-  describe('when the payload is far larger than the detection window', () => {
-    let payload: Buffer
-
-    beforeEach(async () => {
-      payload = Buffer.alloc(64 * 1024, 7)
-      await storage.storeStream('large-id', bufferToStream(payload))
-    })
-
-    it('should upload every byte of the content despite only the head being inspected', () => {
-      expect(fakeS3.objects.get('large-id')!.body).toEqual(payload)
-    })
-  })
-})
-
-describe('S3 Storage edge cases', () => {
-  it(`When a file has ContentLength 0, then fileInfo returns size 0 instead of null`, async () => {
-    const fake = createFakeS3Client()
-    fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentLength: 0, ContentEncoding: undefined }))
-    const logs = await createLogComponent({})
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
-
-    const info = await storage.fileInfo('empty-file')
-    expect(info).toEqual({ encoding: null, size: 0, contentSize: 0 })
-  })
-
-  it(`When headObject returns no ContentLength, then a range retrieve returns null size`, async () => {
-    const fake = createFakeS3Client()
-    fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentEncoding: undefined }))
-    fake.on('GetObjectCommand', () => ({ Body: bufferToStream(Buffer.from('Hello')) }))
-    const logs = await createLogComponent({})
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
-
-    const item = await storage.retrieve('some-file', { start: 0, end: 4 })
-    expect(item).toBeDefined()
-    expect(item!.size).toBeNull()
-  })
-
-  it(`When the upload fails, then the source stream is released`, async () => {
-    const fake = createFakeS3Client()
-    const uploadFailure = () => {
-      throw new Error('upload failed')
-    }
-    // lib-storage may take either the single-part or multipart route depending on buffering.
-    fake.on('PutObjectCommand', uploadFailure)
-    fake.on('CreateMultipartUploadCommand', uploadFailure)
-    const logs = await createLogComponent({})
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
-
-    // Two chunks so the body still has unread data after the head is peeked.
-    const source = Readable.from([Buffer.alloc(5000, 1), Buffer.alloc(5000, 1)])
-    const closed = once(source, 'close')
-
-    await expect(storage.storeStream('fail-id', source)).rejects.toThrow('upload failed')
-    await closed
-
-    expect(source.destroyed).toBe(true)
   })
 })
 

@@ -1,4 +1,15 @@
+import { mkdtempSync, rmSync } from 'fs'
+import os from 'os'
+import path from 'path'
 import { mapWithConcurrency } from '../src/concurrency'
+import {
+  createFolderBasedFileSystemContentStorage,
+  createFsComponent,
+  IContentStorageComponent,
+  IFileSystemComponent
+} from '../src'
+import { bufferToStream } from '../src'
+import { createLogComponent } from '@well-known-components/logger'
 
 describe('mapWithConcurrency', () => {
   describe('when more items than the limit are mapped', () => {
@@ -94,6 +105,55 @@ describe('mapWithConcurrency', () => {
 
     it('should map every item exactly once', () => {
       expect(results).toEqual([2, 3, 4])
+    })
+  })
+})
+
+describe('batch surfaces', () => {
+  describe('when existMultiple is given far more ids than the concurrency limit', () => {
+    let root: string
+    let storage: IContentStorageComponent
+    let peakInFlight: number
+
+    beforeEach(async () => {
+      // Unbounded `Promise.all` issued one stat per id AT ONCE, which exhausts the process
+      // file-descriptor limit and fails the whole batch with EMFILE. Nothing asserted the bound, so
+      // reverting the backends to Promise.all left the suite green.
+      root = mkdtempSync(path.join(os.tmpdir(), 'batch-bound-'))
+      const base = createFsComponent()
+      let inFlight = 0
+      peakInFlight = 0
+      const counting: IFileSystemComponent = {
+        ...base,
+        stat: (async (target: any, ...rest: any[]) => {
+          inFlight++
+          peakInFlight = Math.max(peakInFlight, inFlight)
+          try {
+            return await (base.stat as any)(target, ...rest)
+          } finally {
+            inFlight--
+          }
+        }) as typeof base.stat
+      }
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: counting, logs: await createLogComponent({}) },
+        root
+      )
+      await storage.storeStream('present-id', bufferToStream(Buffer.from('x')))
+      await storage.existMultiple(Array.from({ length: 800 }, (_, index) => `id-${index}`))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('should never have more probes in flight than the configured bound', () => {
+      expect(peakInFlight).toBeLessThanOrEqual(64)
+    })
+
+    it('should still have issued enough concurrency to be worth batching', () => {
+      expect(peakInFlight).toBeGreaterThan(1)
     })
   })
 })

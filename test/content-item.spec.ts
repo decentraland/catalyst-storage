@@ -78,7 +78,8 @@ describe('SimpleContentItem', () => {
     })
 
     it('should inflate the stored bytes', () => {
-      expect(bytes).toEqual(content)
+      // `.equals()` not `toEqual`: Jest's deep-equality walks a 1MB Buffer element-by-element (~4.8s).
+      expect(bytes.equals(content)).toBe(true)
     })
   })
 
@@ -139,7 +140,8 @@ describe('SimpleContentItem', () => {
     })
 
     it('should return the stored bytes unchanged', () => {
-      expect(bytes).toEqual(content)
+      // `.equals()` not `toEqual`: Jest's deep-equality walks a 1MB Buffer element-by-element (~4.8s).
+      expect(bytes.equals(content)).toBe(true)
     })
   })
 })
