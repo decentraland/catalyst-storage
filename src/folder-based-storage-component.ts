@@ -303,40 +303,13 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  /**
-   * Rejects ids that would resolve onto ANOTHER id's file.
-   *
-   * An id is used verbatim as a path under the containment directory, and `path.join` normalizes what
-   * it builds — so `a/../victim`, `./victim`, `victim/` and `a//victim` all collapse onto the path of
-   * a different logical id. Containment does not catch this: the result is still inside the root, it
-   * is just somebody else's file. A caller that accepts untrusted ids could therefore overwrite, read
-   * or delete another id's content — in flat mode directly, and with hash prefixes by varying a
-   * prefix until the first four SHA-1 hex digits match the victim's shard, which is ~2^16 work.
-   *
-   * Ids containing separators stay supported (they nest into subdirectories and round-trip through
-   * `allFileIds`); only the forms that can alias are refused. Backslash counts as a separator too, so
-   * an id behaves the same way on a platform where it is one.
-   */
-  function assertAddressableId(id: string): void {
+  async function getFilePath(id: string): Promise<string> {
+    // An empty id resolves to the containment directory itself, which is a directory and not anyone's
+    // content. It is also the one input the round-trip check below cannot reject on its own, because
+    // an empty id and an empty relative path are equal.
     if (id.length === 0) {
       throw new PathNotContainedError('The id is empty, so it does not name a file inside the storage folder')
     }
-    if (path.isAbsolute(id)) {
-      throw new PathNotContainedError(`Cannot use an absolute path as an id: ${JSON.stringify(id)}`)
-    }
-    for (const segment of id.split(/[/\\]/)) {
-      if (segment === '' || segment === '.' || segment === '..') {
-        throw new PathNotContainedError(
-          `The id resolves onto a different id: it must be a relative path with no empty, "." or ".." ` +
-            `segments, got ${JSON.stringify(id)}`
-        )
-      }
-    }
-  }
-
-  async function getFilePath(id: string): Promise<string> {
-    // Before anything else: an id that normalizes onto another id's path is not addressable here.
-    assertAddressableId(id)
 
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
     // for the file system to handle millions of files in the same directory.
@@ -350,10 +323,30 @@ export async function createFolderBasedFileSystemContentStorage(
     // recursively creates the directory structure if needed
     const dirname = path.dirname(finalPath)
 
-    // Containment check. We compare against `directoryPath + path.sep` (not a bare `startsWith`)
-    // so a sibling directory that merely shares the prefix — e.g. id "../<root>-evil/x" resolving
-    // to "<root>-evil" — cannot pass: "/data/contents-evil".startsWith("/data/contents") is true,
-    // but it is outside "/data/contents/".
+    // ALIASING check: the id must resolve to EXACTLY its own path. `path.join` normalizes what it
+    // builds, so several distinct id strings can land on one file — `a/../victim`, `./victim`,
+    // `/victim` and `a//../victim` all reach the path of `victim`, and `a//victim` reaches that of
+    // `a/victim`. A caller accepting untrusted ids could then overwrite, read or delete another id's
+    // content: directly in flat mode, and with hash prefixes after finding a prefix whose first four
+    // SHA-1 hex digits match the victim's shard, which is only ~2^16 work.
+    //
+    // Stated as the invariant rather than as a list of the bad forms, which would only be as good as
+    // the enumeration: every aliasing form fails this equality by construction, because normalizing
+    // is exactly what makes the resolved path differ from the id that produced it. It is also the
+    // precise inverse of how `allFileIds` recovers an id from a path, so storing and enumerating are
+    // provably round-trip.
+    if (path.relative(directoryPath, finalPath) !== id) {
+      throw new PathNotContainedError(
+        `The id does not name a path of its own: ${JSON.stringify(id)} resolves onto ` +
+          `${JSON.stringify(path.relative(directoryPath, finalPath))}`
+      )
+    }
+
+    // CONTAINMENT check, orthogonal to the one above: an id like `../evil` resolves to exactly its own
+    // path and so round-trips cleanly, it is simply outside the root. We compare against
+    // `directoryPath + path.sep` (not a bare `startsWith`) so a sibling directory that merely shares
+    // the prefix — e.g. id "../<root>-evil/x" resolving to "<root>-evil" — cannot pass:
+    // "/data/contents-evil".startsWith("/data/contents") is true, but it is outside "/data/contents/".
     if (!finalPath.startsWith(directoryPath + path.sep)) {
       throw new PathNotContainedError('Cannot manipulate files outside of the root storage folder')
     }

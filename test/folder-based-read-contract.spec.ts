@@ -210,7 +210,7 @@ describe('folder-based storage ids that normalize onto another id', () => {
       ['an empty segment', 'a//../victim'],
       ['a trailing separator', 'victim/'],
       ['an absolute path', '/victim'],
-      ['a backslash separator', 'a\\..\\victim']
+      ['a current-directory segment mid-path', 'a/./victim']
     ])('and the id uses %s', (_name, aliasing) => {
       it('should reject a store rather than overwrite the id it normalizes onto', async () => {
         await expect(storage.storeStream(aliasing, bufferToStream(Buffer.from('ATTACKER')))).rejects.toBeInstanceOf(
@@ -235,6 +235,28 @@ describe('folder-based storage ids that normalize onto another id', () => {
       await storage.storeStream('nested/legit/id', bufferToStream(Buffer.from('fine')))
 
       expect(await storage.exist('nested/legit/id')).toBe(true)
+    })
+
+    describe('and the id contains a backslash', () => {
+      // The check is platform-aware because `path.join`/`path.relative` are: on POSIX a backslash is
+      // an ordinary filename character, so `a\..\victim` names its own file and aliases nothing, and
+      // rejecting it would refuse a valid id. On Windows the very same equality rejects it, because
+      // there it IS a separator and the id normalizes away.
+      beforeEach(async () => {
+        await storage.storeStream('a\\..\\victim', bufferToStream(Buffer.from('OWN FILE')))
+      })
+
+      it('should store it under its own literal name', async () => {
+        const item = await storage.retrieve('a\\..\\victim')
+
+        expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('OWN FILE'))
+      })
+
+      it('should leave the id it would alias on a separator platform untouched', async () => {
+        const item = await storage.retrieve('victim')
+
+        expect(await streamToBuffer(await item!.asStream())).toEqual(victimBytes)
+      })
     })
   })
 })
