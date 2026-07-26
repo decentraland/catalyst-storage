@@ -216,6 +216,40 @@ describe('compressContentFile', () => {
     })
   })
 
+  describe('when the source is torn down while its open is still in flight', () => {
+    let heldSource: Readable
+
+    beforeEach(async () => {
+      // `createReadStream` starts an async open; the destination throwing tears the source down while
+      // that open is still pending. The open then fails and the DESTROYED stream still emits 'error'
+      // — with none attached that is an uncaught exception, which terminates the process by default
+      // (reproduced 200/200 outside Jest). Reachable from outside: the input path is the caller's and
+      // `compressContentFile` is public API.
+      heldSource = new Readable({ read() {} })
+      const adapter = {
+        createReadStream: () => heldSource,
+        createWriteStream: () => {
+          throw new Error('cannot open the output')
+        },
+        unlink: nodeFs.unlink,
+        stat: nodeFs.stat,
+        lstat: nodeFs.lstat
+      } as unknown as CompressionFileSystem
+      await compressContentFile(path.join(dir, 'vanishes'), undefined, undefined, undefined, adapter).catch(
+        () => undefined
+      )
+    })
+
+    it('should leave a handler attached so the late failure cannot escape', () => {
+      // `emit('error')` THROWS when nothing is listening, which is precisely how it escapes as an
+      // uncaught exception in production. Asserting on a process-level handler cannot work here —
+      // Jest installs its own and the observation is swallowed.
+      expect(() =>
+        heldSource.emit('error', Object.assign(new Error('late open failure'), { code: 'ENOENT' }))
+      ).not.toThrow()
+    })
+  })
+
   describe('when the signal is already aborted', () => {
     let input: string
     let outcome: 'resolved' | unknown

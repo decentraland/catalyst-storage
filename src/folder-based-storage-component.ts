@@ -478,6 +478,10 @@ export async function createFolderBasedFileSystemContentStorage(
     } catch (err) {
       for (const stream of [source, destination]) {
         try {
+          // Listener first: a stream destroyed while its `open(2)` is still in flight still emits
+          // 'error' afterwards, and with none attached that becomes an uncaught exception rather
+          // than the failure being rethrown below.
+          stream?.on('error', () => undefined)
           stream?.destroy()
         } catch {
           // best-effort teardown; the failure below is what matters
