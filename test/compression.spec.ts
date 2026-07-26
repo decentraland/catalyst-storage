@@ -7,6 +7,7 @@ import {
   rmSync,
   writeFileSync
 } from 'fs'
+import { Readable } from 'stream'
 import os from 'os'
 import path from 'path'
 import { CompressionFileSystem, compressContentFile } from '../src/extras/compression'
@@ -58,6 +59,70 @@ describe('compressContentFile', () => {
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true })
+  })
+
+  describe('when the output path is the same as the input path', () => {
+    let source: string
+
+    beforeEach(() => {
+      // Compressing a file onto itself would open it for reading and truncate it for writing at the
+      // same time, destroying the content it is meant to preserve.
+      source = path.join(dir, 'same.txt')
+      writeFileSync(source, 'content worth keeping')
+    })
+
+    it('should refuse rather than destroy the source', async () => {
+      await expect(compressContentFile(source, undefined, source)).rejects.toThrow(/src==dst/)
+    })
+
+    it('should leave the source intact', async () => {
+      await compressContentFile(source, undefined, source).catch(() => undefined)
+
+      expect(await nodeFs.readFile(source, 'utf8')).toBe('content worth keeping')
+    })
+  })
+
+  describe('when the partial output cannot be removed after a failure', () => {
+    let warnings: Array<{ message: string; context: any }>
+    let source: string
+
+    beforeEach(async () => {
+      // A surviving partial `.gzip` would be preferred by reads over the real content, so the failure
+      // to remove it has to be visible rather than swallowed with the compression error.
+      warnings = []
+      source = path.join(dir, 'input.txt')
+      writeFileSync(source, 'x'.repeat(5000))
+      const logger: any = {
+        log: () => undefined,
+        debug: () => undefined,
+        info: () => undefined,
+        error: () => undefined
+      }
+      logger.warn = (message: string, context: any) => warnings.push({ message, context })
+      const failing: CompressionFileSystem = {
+        // An in-memory source rather than a real file: only the failed cleanup is under test here,
+        // and a real read stream's open can still land after this suite removes its temp directory,
+        // emitting an unhandled ENOENT into whichever test runs next.
+        createReadStream: (() => Readable.from([Buffer.alloc(64)])) as any,
+        createWriteStream: (() => {
+          throw Object.assign(new Error('EIO: cannot open output'), { code: 'EIO' })
+        }) as any,
+        unlink: async () => {
+          throw Object.assign(new Error('EPERM: cannot remove'), { code: 'EPERM' })
+        },
+        stat: nodeFs.stat,
+        lstat: nodeFs.lstat
+      }
+      await compressContentFile(source, logger, path.join(dir, 'out.gzip'), undefined, failing).catch(() => undefined)
+    })
+
+    it('should warn that the compressed output was left behind', () => {
+      expect(warnings.map((each) => each.message)).toContainEqual(expect.stringContaining('Failed to remove'))
+    })
+
+    it('should name the unlink failure rather than the compression one', () => {
+      expect(warnings[0].context.error).toContain('EPERM')
+    })
   })
 
   describe('when the filesystem adapter methods depend on `this`', () => {
@@ -148,6 +213,40 @@ describe('compressContentFile', () => {
 
     it('should remove the partial output', () => {
       expect(existsSync(output)).toEqual(false)
+    })
+  })
+
+  describe('when the source is torn down while its open is still in flight', () => {
+    let heldSource: Readable
+
+    beforeEach(async () => {
+      // `createReadStream` starts an async open; the destination throwing tears the source down while
+      // that open is still pending. The open then fails and the DESTROYED stream still emits 'error'
+      // — with none attached that is an uncaught exception, which terminates the process by default
+      // (reproduced 200/200 outside Jest). Reachable from outside: the input path is the caller's and
+      // `compressContentFile` is public API.
+      heldSource = new Readable({ read() {} })
+      const adapter = {
+        createReadStream: () => heldSource,
+        createWriteStream: () => {
+          throw new Error('cannot open the output')
+        },
+        unlink: nodeFs.unlink,
+        stat: nodeFs.stat,
+        lstat: nodeFs.lstat
+      } as unknown as CompressionFileSystem
+      await compressContentFile(path.join(dir, 'vanishes'), undefined, undefined, undefined, adapter).catch(
+        () => undefined
+      )
+    })
+
+    it('should leave a handler attached so the late failure cannot escape', () => {
+      // `emit('error')` THROWS when nothing is listening, which is precisely how it escapes as an
+      // uncaught exception in production. Asserting on a process-level handler cannot work here —
+      // Jest installs its own and the observation is swallowed.
+      expect(() =>
+        heldSource.emit('error', Object.assign(new Error('late open failure'), { code: 'ENOENT' }))
+      ).not.toThrow()
     })
   })
 

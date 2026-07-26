@@ -62,10 +62,9 @@ export type FileInfo = {
 }
 
 /**
- * @public
- */
-/**
  * Validates that a range is well-formed (start >= 0 and start <= end).
+ *
+ * @public
  */
 export function validateRange(range: { start: number; end: number }): void {
   // Safe integers only: NaN/Infinity/fractional bounds would otherwise surface as low-level stream
@@ -81,6 +80,8 @@ export function validateRange(range: { start: number; end: number }): void {
 /**
  * Clamps range.end to the file size and validates that start is within bounds.
  * Returns the clamped end value.
+ *
+ * @public
  */
 export function clampRange(range: { start: number; end: number }, size: number): number {
   validateRange(range)
@@ -91,6 +92,9 @@ export function clampRange(range: { start: number; end: number }, size: number):
   return clampedEnd
 }
 
+/**
+ * @public
+ */
 export type ContentItem = FileInfo & {
   /**
    * Gets the readable stream, uncompressed if necessary.

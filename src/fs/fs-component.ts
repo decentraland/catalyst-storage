@@ -18,7 +18,6 @@ export function createFsComponent(): IFileSystemComponent {
   return {
     createReadStream: fs.createReadStream,
     createWriteStream: fs.createWriteStream,
-    access: fsPromises.access,
     opendir: fsPromises.opendir,
     stat: fsPromises.stat,
     unlink: fsPromises.unlink,
@@ -27,10 +26,6 @@ export function createFsComponent(): IFileSystemComponent {
     mkdir: fsPromises.mkdir,
     readdir: fsPromises.readdir,
     readFile: fsPromises.readFile,
-    constants: {
-      F_OK: fs.constants.F_OK,
-      R_OK: fs.constants.R_OK
-    },
     existPath
   }
 }

@@ -89,8 +89,17 @@ export function createFakeS3Client(): FakeS3Client {
       return {}
     },
     DeleteObjectsCommand: ({ Delete }) => {
-      for (const { Key } of Delete?.Objects ?? []) objects.delete(Key)
-      return { Deleted: (Delete?.Objects ?? []).map(({ Key }: { Key: string }) => ({ Key })) }
+      // S3 rejects an empty list and anything past 1000 keys with MalformedXML, and the SDK does not
+      // split the batch — modelled here so a caller that exceeds either limit fails in tests too.
+      const requested = Delete?.Objects ?? []
+      if (requested.length === 0 || requested.length > 1000) {
+        throw Object.assign(new Error('The XML you provided was not well-formed'), {
+          name: 'MalformedXML',
+          $metadata: { httpStatusCode: 400 }
+        })
+      }
+      for (const { Key } of requested) objects.delete(Key)
+      return { Deleted: requested.map(({ Key }: { Key: string }) => ({ Key })) }
     },
     ListObjectsV2Command: ({ Prefix, ContinuationToken }) => {
       const keys = [...objects.keys()].filter((key) => !Prefix || key.startsWith(Prefix)).sort()

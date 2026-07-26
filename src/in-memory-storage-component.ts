@@ -11,7 +11,7 @@ export function createInMemoryStorage(): IContentStorageComponent {
 
   async function fileInfo(id: string): Promise<FileInfo | undefined> {
     const buffer = storage.get(id)
-    return buffer ? { encoding: null, size: buffer!.length, contentSize: buffer!.length } : undefined
+    return buffer ? { encoding: null, size: buffer.length, contentSize: buffer.length } : undefined
   }
 
   // Shared by both store methods (this backend does not compress). The checkpoint before the commit

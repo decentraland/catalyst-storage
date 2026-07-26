@@ -192,6 +192,10 @@ export function createDecompressCache(
       })
     },
     record(filePath: string, size: number): void {
+      // Drop any existing entry first: `totalCacheSize` is a running sum, so overwriting an entry
+      // without subtracting its old size would inflate the total permanently and make the size
+      // budget evict content that is not actually over it.
+      forget(filePath)
       entries.set(filePath, { size, lastAccess: Date.now() })
       totalCacheSize += size
     },

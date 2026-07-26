@@ -236,8 +236,8 @@ describe('S3 Storage MIME type detection', () => {
   let storage: IContentStorageComponent
   let fakeS3: FakeS3Client
 
-  // Each payload is padded well beyond the detection window so the test proves the type is
-  // detected from the head alone, without buffering the whole file.
+  // Each payload is padded well past the 4100-byte detection window, so passing proves the type was
+  // identified from the HEAD alone while the body streamed through.
   const padding = Buffer.alloc(8192, 0)
   const png = Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]),
@@ -245,7 +245,117 @@ describe('S3 Storage MIME type detection', () => {
   ])
   const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0]), padding])
   const glb = Buffer.concat([Buffer.from('glTF'), Buffer.from([2, 0, 0, 0, 0x10, 0, 0, 0]), padding])
-  const gltfJson = Buffer.from(JSON.stringify({ asset: { version: '2.0' } }))
+
+  beforeEach(async () => {
+    fakeS3 = createFakeS3Client()
+    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fakeS3, {
+      Bucket: 'example'
+    })
+  })
+
+  describe.each([
+    ['a PNG', 'png-id', png, 'image/png'],
+    ['a JPEG', 'jpeg-id', jpeg, 'image/jpeg'],
+    ['a binary glTF', 'glb-id', glb, 'model/gltf-binary']
+  ])('when %s larger than the detection window is stored', (_name, id, payload, expected) => {
+    beforeEach(async () => {
+      await storage.storeStream(id, bufferToStream(payload))
+    })
+
+    it(`should upload it as ${expected}`, () => {
+      expect(fakeS3.objects.get(id)!.contentType).toBe(expected)
+    })
+
+    it('should still upload every byte of the payload', () => {
+      expect(fakeS3.objects.get(id)!.body.equals(payload)).toBe(true)
+    })
+  })
+
+  describe('when the content has no signature the detector recognizes', () => {
+    beforeEach(async () => {
+      await storage.storeStream('gltf-id', bufferToStream(Buffer.from(JSON.stringify({ asset: { version: '2.0' } }))))
+    })
+
+    it('should fall back to application/octet-stream', () => {
+      expect(fakeS3.objects.get('gltf-id')!.contentType).toBe('application/octet-stream')
+    })
+  })
+})
+
+describe('S3 Storage enumeration', () => {
+  describe('when a page reports itself truncated but carries no continuation token', () => {
+    let listed: string[]
+    let requests: number
+
+    beforeEach(async () => {
+      // Re-requesting with an undefined token returns the FIRST page again, so without the guard this
+      // yields the same keys forever and hangs whatever is consuming the iterator.
+      requests = 0
+      const fake = createFakeS3Client()
+      fake.on('ListObjectsV2Command', () => {
+        requests++
+        return { Contents: [{ Key: 'only-key' }], IsTruncated: true, NextContinuationToken: undefined }
+      })
+      const storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+        Bucket: 'example'
+      })
+      listed = []
+      for await (const each of storage.allFileIds()) listed.push(each)
+    })
+
+    it('should stop after the page it could not continue from', () => {
+      expect(requests).toBe(1)
+    })
+
+    it('should still yield the keys that page contained', () => {
+      expect(listed).toEqual(['only-key'])
+    })
+  })
+})
+
+describe('S3 Storage client lifecycle', () => {
+  describe('when the factory constructed the client itself', () => {
+    let storage: IContentStorageComponent
+
+    beforeEach(async () => {
+      storage = await createAwsS3BasedFileSystemContentStorage(
+        {
+          config: createConfigComponent({ AWS_REGION: 'eu-west-1' }),
+          logs: await createLogComponent({})
+        },
+        'some-bucket'
+      )
+    })
+
+    it('should expose a stop that releases the client it owns', async () => {
+      // The SDK's guidance is to destroy a client explicitly in Node, or its sockets stay open long
+      // after the last request. Nothing offered a way to do that, so the agent outlived the component.
+      await expect(storage.stop?.()).resolves.toBeUndefined()
+    })
+  })
+
+  describe('when the client is injected by the caller', () => {
+    let storage: IContentStorageComponent
+
+    beforeEach(async () => {
+      storage = await createS3BasedFileSystemContentStorage(
+        { logs: await createLogComponent({}) },
+        createFakeS3Client(),
+        {
+          Bucket: 'example'
+        }
+      )
+    })
+
+    it('should not take ownership of a client it did not create', () => {
+      expect(storage.stop).toBeUndefined()
+    })
+  })
+})
+
+describe('S3 Storage delete', () => {
+  let fakeS3: FakeS3Client
+  let storage: IContentStorageComponent
 
   beforeEach(async () => {
     fakeS3 = createFakeS3Client()
@@ -253,75 +363,76 @@ describe('S3 Storage MIME type detection', () => {
     storage = await createS3BasedFileSystemContentStorage({ logs }, fakeS3, { Bucket: 'example' })
   })
 
-  const uploadedContentType = (key: string): string => fakeS3.objects.get(key)!.contentType!
+  describe('when more ids than one DeleteObjects request accepts are deleted', () => {
+    let ids: string[]
 
-  it(`When a PNG larger than the detection window is stored, then it is uploaded as image/png`, async () => {
-    await storage.storeStream('png-id', bufferToStream(png))
+    beforeEach(async () => {
+      // S3 caps the request at 1000 keys and the SDK does not split the list, so the whole delete
+      // used to be rejected as MalformedXML.
+      ids = Array.from({ length: 2500 }, (_, index) => `id-${index}`)
+      for (const id of ids) await storage.storeStream(id, bufferToStream(Buffer.from(id)))
+      await storage.delete(ids)
+    })
 
-    expect(uploadedContentType('png-id')).toBe('image/png')
+    it('should remove every object across the chunked requests', () => {
+      expect(fakeS3.objects.size).toBe(0)
+    })
   })
 
-  it(`When a JPEG larger than the detection window is stored, then it is uploaded as image/jpeg`, async () => {
-    await storage.storeStream('jpeg-id', bufferToStream(jpeg))
-
-    expect(uploadedContentType('jpeg-id')).toBe('image/jpeg')
+  describe('when no ids are given', () => {
+    it('should resolve without issuing a request S3 would reject', async () => {
+      await expect(storage.delete([])).resolves.toBeUndefined()
+    })
   })
 
-  it(`When a binary glTF (GLB) larger than the detection window is stored, then it is uploaded as model/gltf-binary`, async () => {
-    await storage.storeStream('glb-id', bufferToStream(glb))
+  describe('when S3 reports per-key failures inside a successful response', () => {
+    beforeEach(async () => {
+      await storage.storeStream('kept-id', bufferToStream(Buffer.from('x')))
+      // DeleteObjects answers 200 with the failures listed in `Errors`, so a resolved send is not a
+      // completed delete: ignoring it reported success while the object was still readable.
+      fakeS3.on('DeleteObjectsCommand', () => ({
+        Deleted: [],
+        Errors: [{ Key: 'kept-id', Code: 'AccessDenied' }]
+      }))
+    })
 
-    expect(uploadedContentType('glb-id')).toBe('model/gltf-binary')
-  })
-
-  it(`When a text-based glTF (JSON) is stored, then it falls back to application/octet-stream`, async () => {
-    await storage.storeStream('gltf-id', bufferToStream(gltfJson))
-
-    expect(uploadedContentType('gltf-id')).toBe('application/octet-stream')
+    it('should reject naming the key that survived', async () => {
+      await expect(storage.delete(['kept-id'])).rejects.toThrow(/kept-id \(AccessDenied\)/)
+    })
   })
 })
 
-describe('S3 Storage edge cases', () => {
-  it(`When a file has ContentLength 0, then fileInfo returns size 0 instead of null`, async () => {
-    const fake = createFakeS3Client()
-    fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentLength: 0, ContentEncoding: undefined }))
-    const logs = await createLogComponent({})
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
+describe('S3 Storage content size', () => {
+  describe('when the stored object is content-encoded', () => {
+    let item: NonNullable<Awaited<ReturnType<IContentStorageComponent['retrieve']>>>
 
-    const info = await storage.fileInfo('empty-file')
-    expect(info).toEqual({ encoding: null, size: 0, contentSize: 0 })
-  })
+    beforeEach(async () => {
+      const fake = createFakeS3Client()
+      const logs = await createLogComponent({})
+      // `size` is the COMPRESSED length for an encoded object, so defaulting contentSize to it hands
+      // callers doing `contentSize ?? size` the wrong number under a field documented as the
+      // uncompressed one. S3 stores no uncompressed size, so `null` ("unknown") is the honest answer.
+      fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentLength: 133, ContentEncoding: 'gzip' }))
+      const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
+      item = (await storage.retrieve('encoded-id'))!
+    })
 
-  it(`When headObject returns no ContentLength, then a range retrieve returns null size`, async () => {
-    const fake = createFakeS3Client()
-    fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentEncoding: undefined }))
-    fake.on('GetObjectCommand', () => ({ Body: bufferToStream(Buffer.from('Hello')) }))
-    const logs = await createLogComponent({})
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
+    it('should report the stored size', () => {
+      expect(item.size).toBe(133)
+    })
 
-    const item = await storage.retrieve('some-file', { start: 0, end: 4 })
-    expect(item).toBeDefined()
-    expect(item!.size).toBeNull()
-  })
+    it('should report the content size as unknown rather than as the compressed size', () => {
+      expect(item.contentSize).toBeNull()
+    })
 
-  it(`When the upload fails, then the source stream is released`, async () => {
-    const fake = createFakeS3Client()
-    const uploadFailure = () => {
-      throw new Error('upload failed')
-    }
-    // lib-storage may take either the single-part or multipart route depending on buffering.
-    fake.on('PutObjectCommand', uploadFailure)
-    fake.on('CreateMultipartUploadCommand', uploadFailure)
-    const logs = await createLogComponent({})
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
+    it('should agree with fileInfo, which reports the same unknown content size', async () => {
+      const fake = createFakeS3Client()
+      const logs = await createLogComponent({})
+      fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentLength: 133, ContentEncoding: 'gzip' }))
+      const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
 
-    // Two chunks so the body still has unread data after the head is peeked.
-    const source = Readable.from([Buffer.alloc(5000, 1), Buffer.alloc(5000, 1)])
-    const closed = once(source, 'close')
-
-    await expect(storage.storeStream('fail-id', source)).rejects.toThrow('upload failed')
-    await closed
-
-    expect(source.destroyed).toBe(true)
+      expect((await storage.fileInfo('encoded-id'))!.contentSize).toBe(item.contentSize)
+    })
   })
 })
 
@@ -331,16 +442,27 @@ describe('S3 Storage retrieve error logging', () => {
     return { logs: { getLogger: () => logger }, logger }
   }
 
-  async function retrieveWithHeadError(headError: any) {
+  async function storageWithHeadError(headError: any) {
     const { logs, logger } = createSpyLogs()
     const fake = createFakeS3Client()
     fake.on('HeadObjectCommand', () => {
       throw headError
     })
     const storage = await createS3BasedFileSystemContentStorage({ logs } as any, fake, { Bucket: 'test' })
+    return { storage, logger }
+  }
+
+  async function retrieveWithHeadError(headError: any) {
+    const { storage, logger } = await storageWithHeadError(headError)
     const result = await storage.retrieve('some-key')
     return { result, logger }
   }
+
+  // Scoped to warnings ABOUT THE KEY: construction also warms the MIME detector, which warns on its
+  // own when the ESM loader is unavailable (as it is under Jest). Counting every warning would
+  // couple these assertions to an unrelated log line.
+  const retrievalWarnings = (logger: { warn: jest.Mock }) =>
+    logger.warn.mock.calls.filter((call) => (call[1] as { key?: string })?.key === 'some-key')
 
   it(`When headObject returns 403 Forbidden, then it warns with the key and does not error`, async () => {
     const { result, logger } = await retrieveWithHeadError(
@@ -349,29 +471,68 @@ describe('S3 Storage retrieve error logging', () => {
 
     expect(result).toBeUndefined()
     expect(logger.error).not.toHaveBeenCalled()
-    expect(logger.warn).toHaveBeenCalledTimes(1)
-    expect(logger.warn.mock.calls[0][1]).toMatchObject({ key: 'some-key', statusCode: 403 })
+    expect(retrievalWarnings(logger)).toHaveLength(1)
+    expect(retrievalWarnings(logger)[0][1]).toMatchObject({ key: 'some-key', statusCode: 403 })
   })
 
-  it(`When headObject returns NotFound, then it logs nothing and returns undefined`, async () => {
+  it(`When headObject returns NotFound, then it logs nothing about the key and returns undefined`, async () => {
     const { result, logger } = await retrieveWithHeadError(
       Object.assign(new Error(), { name: 'NotFound', $metadata: { httpStatusCode: 404 } })
     )
 
     expect(result).toBeUndefined()
-    expect(logger.warn).not.toHaveBeenCalled()
+    expect(retrievalWarnings(logger)).toHaveLength(0)
     expect(logger.error).not.toHaveBeenCalled()
   })
 
-  it(`When headObject fails with a non-403 error, then it logs an error with the key`, async () => {
-    const { result, logger } = await retrieveWithHeadError(
-      Object.assign(new Error('boom'), { name: 'InternalError', $metadata: { httpStatusCode: 500 } })
-    )
+  describe('when headObject fails with something other than a not-found', () => {
+    // Reporting a 500, a 503 SlowDown or an unreachable bucket as `undefined` told the caller the
+    // content was permanently absent, so a broken node read as an empty one and stopped being
+    // retried. The folder-based backend already refuses to do this.
+    let storage: IContentStorageComponent
+    let logger: ReturnType<typeof createSpyLogs>['logger']
+    let headError: Error
 
-    expect(result).toBeUndefined()
-    expect(logger.warn).not.toHaveBeenCalled()
-    expect(logger.error).toHaveBeenCalledTimes(1)
-    expect(logger.error.mock.calls[0][1]).toMatchObject({ key: 'some-key', code: 'InternalError' })
+    beforeEach(async () => {
+      headError = Object.assign(new Error('boom'), { name: 'InternalError', $metadata: { httpStatusCode: 500 } })
+      ;({ storage, logger } = await storageWithHeadError(headError))
+    })
+
+    it('should reject the retrieve instead of reporting the content as absent', async () => {
+      await expect(storage.retrieve('some-key')).rejects.toBe(headError)
+    })
+
+    it('should reject exist instead of reporting the content as absent', async () => {
+      await expect(storage.exist('some-key')).rejects.toBe(headError)
+    })
+
+    it('should reject fileInfo instead of reporting the content as absent', async () => {
+      await expect(storage.fileInfo('some-key')).rejects.toBe(headError)
+    })
+
+    it('should log the failure with the key and the error code', async () => {
+      await storage.retrieve('some-key').catch(() => undefined)
+
+      expect(logger.error.mock.calls[0][1]).toMatchObject({ key: 'some-key', code: 'InternalError' })
+    })
+  })
+
+  describe('when headObject reports the object as missing', () => {
+    let storage: IContentStorageComponent
+
+    beforeEach(async () => {
+      ;({ storage } = await storageWithHeadError(
+        Object.assign(new Error(), { name: 'NotFound', $metadata: { httpStatusCode: 404 } })
+      ))
+    })
+
+    it('should report exist as false', async () => {
+      await expect(storage.exist('some-key')).resolves.toBe(false)
+    })
+
+    it('should report fileInfo as undefined', async () => {
+      await expect(storage.fileInfo('some-key')).resolves.toBeUndefined()
+    })
   })
 })
 

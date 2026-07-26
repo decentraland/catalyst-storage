@@ -14,6 +14,7 @@ import {
 import { bufferToStream, streamToBuffer } from '../src'
 import * as compressionModule from '../src/extras/compression'
 import { createLogComponent } from '@well-known-components/logger'
+import { PathNotContainedError } from '../src/folder-based/errors'
 
 describe('fileSystemContentStorage', () => {
   const fs = createFsComponent()
@@ -2194,6 +2195,13 @@ describe('fileSystemContentStorage', () => {
         reason = new Error('cancelled while queued on the lock')
         const controller = new AbortController()
         const queuedStore = lockedStorage.storeStream(id, bufferToStream(content), controller.signal)
+        // Capture the outcome NOW rather than after `await firstStore`. The queued store can reject
+        // while that await is still pending, and with no handler attached yet that surfaces as an
+        // unhandled rejection instead of the value this test wants to inspect.
+        const queuedSettled = queuedStore.then(
+          () => 'resolved' as const,
+          (error: unknown) => error
+        )
         // Let the queued store consume its source and reach the lock queue.
         const tempDirPath = path.join(lockRoot, '.tmp-writes')
         for (let i = 0; i < 1000; i++) {
@@ -2206,10 +2214,7 @@ describe('fileSystemContentStorage', () => {
         controller.abort(reason)
         releaseRename()
         await firstStore
-        queuedOutcome = await queuedStore.then(
-          () => 'resolved' as const,
-          (error: unknown) => error
-        )
+        queuedOutcome = await queuedSettled
       })
 
       afterEach(async () => {
@@ -2682,16 +2687,24 @@ describe('fileSystemContentStorage', () => {
         expect((storeOutcome as Error).message).toContain('quarantined')
       })
 
-      it('should not expose the new bytes through range reads while quarantined', async () => {
-        expect(await failingStorage.retrieve(id, { start: 0, end: 2 })).toBeUndefined()
+      // The id is PRESENT — both representations are on disk and `allFileIds` still enumerates it —
+      // so an unrepairable mixed state is a "cannot be read", not a "not here". Reporting absence
+      // handed back a 404 for content sitting on the disk, and contradicted the store that had
+      // already failed announcing the quarantine.
+      it('should reject range reads rather than exposing the new bytes while quarantined', async () => {
+        await expect(failingStorage.retrieve(id, { start: 0, end: 2 })).rejects.toThrow(/mixed state/)
       })
 
-      it('should not expose the old version through full reads while quarantined', async () => {
-        expect(await failingStorage.retrieve(id)).toBeUndefined()
+      it('should reject full reads rather than exposing the old version while quarantined', async () => {
+        await expect(failingStorage.retrieve(id)).rejects.toThrow(/mixed state/)
       })
 
-      it('should report the id as unavailable while quarantined', async () => {
-        expect(await failingStorage.exist(id)).toBe(false)
+      it('should reject exist rather than reporting the present id as absent while quarantined', async () => {
+        await expect(failingStorage.exist(id)).rejects.toThrow(/mixed state/)
+      })
+
+      it('should reject fileInfo while quarantined', async () => {
+        await expect(failingStorage.fileInfo(id)).rejects.toThrow(/mixed state/)
       })
 
       it('should repair through a read once the cleanup can complete', async () => {
@@ -4721,10 +4734,13 @@ describe('fileSystemContentStorage', () => {
       const escapingId = path.join('..', path.basename(root) + 'X', 'escaped')
 
       try {
-        await expect(storage.storeStream(escapingId, bufferToStream(Buffer.from('x')))).rejects.toThrow(
-          /outside of the root/
+        // Asserted by TYPE, not message: such an id is now refused by the addressability check (it
+        // carries `..` segments, which alias other ids) before the containment check it used to
+        // reach. What matters — the rejection and that nothing lands outside the root — is unchanged.
+        await expect(storage.storeStream(escapingId, bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+          PathNotContainedError
         )
-        await expect(storage.exist(escapingId)).rejects.toThrow(/outside of the root/)
+        await expect(storage.exist(escapingId)).rejects.toBeInstanceOf(PathNotContainedError)
         expect(await fs.existPath(siblingDir)).toBeFalsy()
       } finally {
         await storage.stop?.()
@@ -4742,9 +4758,9 @@ describe('fileSystemContentStorage', () => {
       )
 
       try {
-        await expect(storage.storeStream('../../../tmp/escaped', bufferToStream(Buffer.from('x')))).rejects.toThrow(
-          /outside of the root/
-        )
+        await expect(
+          storage.storeStream('../../../tmp/escaped', bufferToStream(Buffer.from('x')))
+        ).rejects.toBeInstanceOf(PathNotContainedError)
       } finally {
         await storage.stop?.()
         rmSync(root, { recursive: true, force: true })

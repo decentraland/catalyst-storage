@@ -71,7 +71,11 @@ export type IntentJournal = {
   newTempPath(): string
   /**
    * Commits a staged file onto its canonical primary path and removes the other representation.
-   * Must be called while holding the path lock for `primaryPath`.
+   *
+   * Must be called while holding the id's path lock. That lock is always taken on the RAW path
+   * (`<id>`), for a gzip commit as much as a raw one — every operation that can touch either
+   * representation (stores, deletes, decompressions, cache eviction) locks that one path, which is
+   * what makes them mutually exclusive across BOTH of an id's paths.
    */
   commitRepresentation(
     op: Representation,
@@ -519,8 +523,18 @@ export async function createIntentJournal(
       let entries: string[]
       try {
         entries = await fs.readdir(tempDir)
-      } catch {
-        return
+      } catch (err: any) {
+        // ENOENT is the only tolerable answer — nothing was ever staged here, so there are no intents
+        // to apply. Swallowing anything else (EACCES, EIO) meant construction could not know whether
+        // a pending repair existed and started regardless, which is exactly the "usable instance over
+        // an unreconciled mixed state" the loop below refuses to allow: reads never consult intents,
+        // so the stale representation would be served for the whole process lifetime.
+        if (err?.code === 'ENOENT') return
+        throw new Error(
+          `Refusing to start: the reserved temp directory '${tempDirName}' could not be read, so pending intent ` +
+            `journals cannot be reconciled. Fix the underlying filesystem issue (permissions, mount) and restart. ` +
+            `Original error: ${err instanceof Error ? err.message : String(err)}`
+        )
       }
       // Intent paths are a deterministic function of the id, so there is at most one per id and no
       // ordering to resolve. A repair that cannot be completed FAILS CONSTRUCTION: live reads do not

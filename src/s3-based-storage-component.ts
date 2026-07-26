@@ -9,83 +9,27 @@ import {
 } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
 import { Readable } from 'stream'
+
 import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem } from './content-item'
 import { isAbortError, runStoreWithSignal } from './cancellation'
+import { mapWithConcurrency } from './concurrency'
+import {
+  DEFAULT_MIME_TYPE,
+  detectMimeTypeFromBuffer,
+  loadFileType,
+  MIME_DETECTION_BYTES,
+  peekHead
+} from './mime-detection'
 
-// Workaround: TS "commonjs" transforms import() to require().
-// This indirection preserves the native import() needed for ESM-only packages.
-const _importDynamic = Function('modulePath', 'return import(modulePath)') as (modulePath: string) => Promise<any>
-
-const MIME_DETECTION_BYTES = 4100
-
-/**
- * Reads at least the first `byteCount` bytes from the stream for inspection (chunk-granular, so it
- * may read a bit more — up to a whole chunk past the target), then returns those bytes together
- * with a Readable that re-emits them followed by the remainder of the original stream. This lets us
- * detect the MIME type from the head while streaming the body straight to S3, so large files are
- * never buffered in memory in full.
- */
-async function peekHead(stream: Readable, byteCount: number): Promise<{ head: Buffer; body: Readable }> {
-  const iterator = stream[Symbol.asyncIterator]()
-  const headChunks: Buffer[] = []
-  let headLength = 0
-  let finished = false
-
-  while (headLength < byteCount) {
-    const next = await iterator.next()
-    if (next.done) {
-      finished = true
-      break
-    }
-    const chunk = Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value)
-    headChunks.push(chunk)
-    headLength += chunk.length
-  }
-
-  const head = Buffer.concat(headChunks)
-
-  const body = Readable.from(
-    (async function* () {
-      try {
-        yield head
-        if (!finished) {
-          let next = await iterator.next()
-          while (!next.done) {
-            yield Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value)
-            next = await iterator.next()
-          }
-        }
-      } finally {
-        // Release the source stream whenever consumption stops — normal end, or early
-        // termination such as the body being destroyed after a failed upload — so its
-        // underlying resources (e.g. file descriptors) are not leaked.
-        await iterator.return?.()
-      }
-    })()
-  )
-
-  return { head, body }
-}
+/** S3's hard per-request limit for `DeleteObjects`; the SDK does not split a larger list. */
+const DELETE_OBJECTS_MAX_KEYS = 1000
 
 /**
- * Detects the MIME type from a buffer.
- * Uses only the first bytes of the buffer for detection.
- * file-type v21 only needs the first ~4100 bytes to detect any file type.
+ * How many ids a batch surface (`existMultiple`, `fileInfoMultiple`) may have in flight at once. Well
+ * under the SDK's default connection pool, so a large batch queues instead of drawing 503 SlowDown.
  */
-async function detectMimeTypeFromBuffer(buffer: Buffer | Uint8Array): Promise<string> {
-  const maxBytesForDetection = 4100
-  const bytesToUse = Math.min(maxBytesForDetection, buffer.length)
-  const detectionBuffer = buffer.slice(0, bytesToUse)
-
-  try {
-    const { fileTypeFromBuffer } = await _importDynamic('file-type')
-    const mime = await fileTypeFromBuffer(detectionBuffer)
-    return mime?.mime || 'application/octet-stream'
-  } catch (error: any) {
-    return 'application/octet-stream'
-  }
-}
+const BATCH_CONCURRENCY = 32
 
 /**
  * @public
@@ -102,7 +46,22 @@ export async function createAwsS3BasedFileSystemContentStorage(
 
   const getKey = (hash: string) => hash
 
-  return createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: bucket, getKey })
+  const storage = await createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: bucket, getKey })
+
+  return {
+    ...storage,
+    // This factory CONSTRUCTED the client, so releasing its socket pool is part of shutting the
+    // component down — the SDK's own guidance is to destroy a client explicitly in Node, or sockets
+    // stay open long after the last request. Nothing offered a way to do that, so the agent outlived
+    // every consumer of this factory.
+    //
+    // `createS3BasedFileSystemContentStorage` deliberately does NOT do this: there the client is
+    // injected, the caller owns it and may share it with other components.
+    async stop() {
+      await storage.stop?.()
+      s3.destroy()
+    }
+  }
 }
 
 /** Whether an S3 response body is a Node-style readable stream this storage can serve. */
@@ -190,12 +149,73 @@ export async function createS3BasedFileSystemContentStorage(
   const getKey = options.getKey || ((hash: string) => hash)
   const Bucket = options.Bucket
 
+  // Warm the ESM loader now rather than on the first store, so a resolution problem shows up in the
+  // logs before traffic arrives instead of silently degrading every object's content type.
+  void loadFileType().catch((error: any) =>
+    logger.warn(
+      `Could not preload the MIME detection module; stores will retry and fall back to ${DEFAULT_MIME_TYPE}`,
+      { error: error?.message ?? String(error) }
+    )
+  )
+
+  /**
+   * Whether an S3 failure means "there is no object to serve" rather than "this storage could not
+   * answer the question".
+   *
+   * Only a definitive not-found qualifies: `NotFound`/`NoSuchKey`, or a 404. 403 is included because
+   * a principal without `s3:ListBucket` gets 403 instead of 404 for a MISSING key, and the response
+   * carries nothing that separates that from a genuine denial — so "not here" is the only answer the
+   * bucket policy leaves available. It is logged as actionable (see `warnIfForbidden`).
+   *
+   * Everything else — 500, 503 SlowDown, a network fault, expired credentials — is the STORAGE
+   * failing. Reporting those as absent is what made a broken or throttled bucket look like an empty
+   * one to callers, so they are surfaced; this is the same contract the folder-based backend gives.
+   */
+  function isNotFound(error: any): boolean {
+    const statusCode = error?.$metadata?.httpStatusCode
+    const code = error?.name
+    return code === 'NotFound' || code === 'NoSuchKey' || statusCode === 404 || statusCode === 403
+  }
+
+  function logContextFor(id: string, error: any): Record<string, string | number> {
+    const context: Record<string, string | number> = { key: getKey(id) }
+    if (error?.name) context.code = error.name
+    if (error?.$metadata?.httpStatusCode) context.statusCode = error.$metadata.httpStatusCode
+    return context
+  }
+
+  /** A 403 read as not-found is worth an operator's attention: it may be a real permission problem. */
+  function warnIfForbidden(operation: string, id: string, error: any): void {
+    if (error?.$metadata?.httpStatusCode !== 403) return
+    logger.warn(
+      `S3 returned 403 Forbidden while ${operation}; reporting the content as not found. If the object is simply ` +
+        `missing, grant the principal s3:ListBucket so missing keys return 404; otherwise check the object/bucket ` +
+        `permissions.`,
+      logContextFor(id, error)
+    )
+  }
+
+  function logStorageFailure(operation: string, id: string, error: any): void {
+    logger.error(
+      `Failed while ${operation} in S3: ${error?.message || error?.name || 'unknown error'}`,
+      logContextFor(id, error)
+    )
+  }
+
   async function exist(id: string): Promise<boolean> {
     try {
-      const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
-      return !!obj.ETag
-    } catch {
-      return false
+      await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
+      // A HeadObject that succeeds IS the existence answer. Requiring an ETag on top of it is
+      // stricter than the contract and reports a present object as absent on any S3-compatible
+      // implementation that omits the header.
+      return true
+    } catch (error: any) {
+      if (isNotFound(error)) {
+        warnIfForbidden('checking whether content exists', id, error)
+        return false
+      }
+      logStorageFailure('checking whether content exists', id, error)
+      throw error
     }
   }
 
@@ -216,8 +236,8 @@ export async function createS3BasedFileSystemContentStorage(
     // its own reasons). Tracking our own teardown here is the provenance that lets this call site
     // attribute the rejection, the same way the compression pipeline attributes its own.
     let abortedUpload = false
-    const abortUpload = (): boolean => {
-      if (!upload) return false
+    const abortUpload = (): void => {
+      if (!upload) return
       try {
         // `abort()` is declared async, so awaiting it here would stall the signal's event dispatch:
         // it is deliberately fire-and-forget. A rejected promise must still be absorbed — an
@@ -234,7 +254,6 @@ export async function createS3BasedFileSystemContentStorage(
       // signal — not `Upload.abort()` — that tears the in-flight request down.
       uploadAbort.abort()
       abortedUpload = true
-      return true
     }
     // Requests issued by the managed upload carry this signal, so cancelling tears the in-flight
     // request down instead of merely losing the race inside `done()`. See createAbortableClient.
@@ -247,7 +266,13 @@ export async function createS3BasedFileSystemContentStorage(
         // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
         // upload, buffering only part-sized chunks rather than the whole file.
         const { head, body } = await peekHead(stream, MIME_DETECTION_BYTES)
-        const mimeType = await detectMimeTypeFromBuffer(head)
+        const mimeType = await detectMimeTypeFromBuffer(head, logger)
+        // LOAD-BEARING, and it must stay immediately before the upload is constructed. An abort
+        // landing during the two awaits above found `upload` still undefined, so the listener's
+        // teardown did nothing — and with a small source already fully buffered into the head the
+        // upload no longer needs that source, so it would run to completion and commit content for
+        // an already-cancelled store. This is the checkpoint that stops it.
+        //
         signal?.throwIfAborted()
 
         upload = new Upload({
@@ -260,11 +285,13 @@ export async function createS3BasedFileSystemContentStorage(
             ContentType: mimeType
           }
         })
-        // The abort listener can only tear the upload down once `upload` is assigned: an abort
-        // landing before this point found it undefined and did nothing, and — with a small source
-        // already fully buffered into the head — the upload no longer needs the source, so it would
-        // complete and commit content for an already-cancelled store. Re-check here, where the
-        // upload provably exists, and tear it down ourselves.
+        // Re-checked because `getKey` above is CALLER-supplied code evaluated inside the params
+        // literal, i.e. after the checkpoint and before `upload` is assigned. A `getKey` that aborts
+        // the signal lands while the abort listener still sees `upload === undefined` and so tears
+        // nothing down, leaving an already-cancelled store to run to completion and commit. Nothing
+        // else in this gap can move the signal — the constructor and `done()`'s prologue are
+        // synchronous — but the caller's own callback can, so the upload is torn down here, where it
+        // provably exists.
         if (signal?.aborted) {
           abortUpload()
           signal.throwIfAborted()
@@ -304,6 +331,8 @@ export async function createS3BasedFileSystemContentStorage(
 
       const size = obj.ContentLength ?? null
       const clampedEnd = range && size !== null ? clampRange(range, size) : undefined
+      const encoding = obj.ContentEncoding || null
+      const itemSize = range ? (clampedEnd !== undefined ? clampedEnd - range.start + 1 : null) : size
 
       return new SimpleContentItem(
         async () => {
@@ -329,32 +358,27 @@ export async function createS3BasedFileSystemContentStorage(
           }
           return body
         },
-        range ? (clampedEnd !== undefined ? clampedEnd - range.start + 1 : null) : size,
-        obj.ContentEncoding || null
+        itemSize,
+        encoding,
+        // Same rule `fileInfo` applies: S3 keeps no uncompressed-size metadata, so for encoded
+        // content the logical size is genuinely unknown. Letting SimpleContentItem default it to
+        // `itemSize` passed the COMPRESSED byte count off as the content size to callers doing
+        // `contentSize ?? size`. `null` is the documented "unknown".
+        encoding ? null : itemSize
       )
     } catch (error: any) {
       if (error instanceof RangeError) throw error
-      // A missing object returns NotFound (404) when the principal has s3:ListBucket; there is
-      // nothing to serve, so fall through and return undefined.
       // v3 reports the error code as `name` and the HTTP status under `$metadata`.
-      const statusCode = error.$metadata?.httpStatusCode
-      const code = error.name
-      if (code !== 'NotFound' && statusCode !== 404) {
-        const logContext = { key: getKey(id), code, statusCode }
-        if (statusCode === 403) {
-          // S3 returns 403 (with an empty body, hence a null message on HEAD) instead of 404 for a
-          // missing key when the principal lacks s3:ListBucket. It can also be a genuine access
-          // denial. Surface it as an actionable warning rather than a bare, message-less error.
-          logger.warn(
-            'S3 returned 403 Forbidden retrieving content; returning not-found. If the object is simply missing, grant the principal s3:ListBucket so missing keys return 404; otherwise check the object/bucket permissions.',
-            logContext
-          )
-        } else {
-          logger.error(`Failed to retrieve content from S3: ${error.message || code || 'unknown error'}`, logContext)
-        }
+      if (isNotFound(error)) {
+        warnIfForbidden('retrieving content', id, error)
+        return undefined
       }
+      // The STORAGE failed, not the object missing. Answering `undefined` would tell the caller the
+      // content is permanently absent while it may well be there, so a throttled or unreachable
+      // bucket would read as an empty node and stop being retried.
+      logStorageFailure('retrieving content', id, error)
+      throw error
     }
-    return undefined
   }
 
   async function storeStreamAndCompress(id: string, stream: Readable, signal?: AbortSignal): Promise<void> {
@@ -363,18 +387,52 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   async function deleteFn(ids: string[]): Promise<void> {
-    await s3.send(
-      new DeleteObjectsCommand({
-        Bucket,
-        Delete: {
-          Objects: ids.map(($) => ({ Key: getKey($) }))
-        }
-      })
-    )
+    // S3 caps DeleteObjects at DELETE_OBJECTS_MAX_KEYS keys per request and the SDK does not split
+    // the list, so a larger batch was rejected outright as MalformedXML. An EMPTY list is rejected
+    // the same way, and simply never enters the loop — matching the other backends, where deleting
+    // nothing is a no-op rather than an error.
+    for (let from = 0; from < ids.length; from += DELETE_OBJECTS_MAX_KEYS) {
+      const batch = ids.slice(from, from + DELETE_OBJECTS_MAX_KEYS)
+      const output = await s3.send(
+        new DeleteObjectsCommand({
+          Bucket,
+          Delete: {
+            Objects: batch.map(($) => ({ Key: getKey($) }))
+          }
+        })
+      )
+      // DeleteObjects reports PER-KEY failures inside a 200 response, so a resolved send is not a
+      // completed delete. Ignoring them let `delete()` report success while the objects were still
+      // readable; this backend now gives the same guarantee as the folder-based one, where a delete
+      // that resolves means nothing readable survived it.
+      const errors = output.Errors ?? []
+      if (errors.length > 0) {
+        const shown = errors
+          .slice(0, 5)
+          .map((each) => `${each.Key} (${each.Code ?? 'unknown'})`)
+          .join(', ')
+        // Names the CALLER's scope, not this chunk's. The request may span many chunks: earlier ones
+        // are already deleted and later ones are never attempted, so a message counting only this
+        // batch left callers unable to tell what remains. `delete` is idempotent, so retrying the
+        // whole list is safe and is the intended recovery.
+        throw new Error(
+          `Failed to delete ${errors.length} object(s) from S3 while deleting ${ids.length} requested ` +
+            `(failing in the chunk starting at index ${from}; objects before it are already deleted and ` +
+            `objects after it were not attempted): ${shown}` +
+            (errors.length > 5 ? ', …' : '')
+        )
+      }
+    }
   }
 
   async function existMultiple(cids: string[]): Promise<Map<string, boolean>> {
-    return new Map(await Promise.all(cids.map(async (cid): Promise<[string, boolean]> => [cid, await exist(cid)])))
+    return new Map(
+      await mapWithConcurrency(
+        cids,
+        BATCH_CONCURRENCY,
+        async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]
+      )
+    )
   }
 
   async function* allFileIds(prefix?: string): AsyncIterable<string> {
@@ -396,7 +454,9 @@ export async function createS3BasedFileSystemContentStorage(
         }
       }
       params.ContinuationToken = output.NextContinuationToken
-    } while (output.IsTruncated)
+      // A truncated page with no continuation token would otherwise re-request the FIRST page
+      // forever, yielding the same keys on every pass.
+    } while (output.IsTruncated && params.ContinuationToken)
   }
 
   async function fileInfo(id: string): Promise<FileInfo | undefined> {
@@ -408,14 +468,23 @@ export async function createS3BasedFileSystemContentStorage(
         size,
         contentSize: obj.ContentEncoding ? null : size
       }
-    } catch {
-      return undefined
+    } catch (error: any) {
+      if (isNotFound(error)) {
+        warnIfForbidden('reading content metadata', id, error)
+        return undefined
+      }
+      logStorageFailure('reading content metadata', id, error)
+      throw error
     }
   }
 
   async function fileInfoMultiple(cids: string[]): Promise<Map<string, FileInfo | undefined>> {
     return new Map(
-      await Promise.all(cids.map(async (cid): Promise<[string, FileInfo | undefined]> => [cid, await fileInfo(cid)]))
+      await mapWithConcurrency(
+        cids,
+        BATCH_CONCURRENCY,
+        async (cid): Promise<[string, FileInfo | undefined]> => [cid, await fileInfo(cid)]
+      )
     )
   }
 
