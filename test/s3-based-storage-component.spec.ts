@@ -927,7 +927,23 @@ describe('S3 Storage review regressions', () => {
 
         await expect(
           createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), options)
-        ).rejects.toThrow(/requires a matching getId/)
+        ).rejects.toThrow(/must be supplied together; received only getKey/)
+      })
+    })
+
+    describe('and only the inverse is given', () => {
+      it('should refuse to construct rather than run a mixed mapping', async () => {
+        // TypeScript rejects this shape, so only a JavaScript caller reaches the guard. Accepting it
+        // would leave reads and writes on identity keys while enumeration decoded them, so every key
+        // would fail the round-trip check and the bucket would enumerate as empty.
+        const options = {
+          Bucket: 'example',
+          getId: (key: string) => key.slice(3)
+        } as unknown as S3ContentStorageOptions
+
+        await expect(
+          createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), options)
+        ).rejects.toThrow(/must be supplied together; received only getId/)
       })
     })
 
@@ -1152,5 +1168,35 @@ describe('S3 Storage enumeration of a bucket holding foreign keys', () => {
       // would skip fetching content the node does not have.
       expect(await collect()).toEqual([])
     })
+  })
+})
+
+describe('S3 Storage enumeration when the inverse rejects foreign keys', () => {
+  let storage: IContentStorageComponent
+  let fake: FakeS3Client
+
+  beforeEach(async () => {
+    // A strict inverse parses its own namespace and THROWS on anything outside it. That is a clear
+    // "not mine", but it used to propagate and fail the whole enumeration over a single object this
+    // storage does not own — making a shared bucket unenumerable.
+    fake = createFakeS3Client()
+    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+      Bucket: 'shared',
+      getKey: (hash: string) => `contents/${hash}`,
+      getId: (key: string) => {
+        const match = /^contents\/(.+)$/.exec(key)
+        if (!match) throw new Error(`not a key of this namespace: ${key}`)
+        return match[1]
+      }
+    })
+    await storage.storeStream('abcdef', bufferToStream(Buffer.from('real content')))
+    fake.objects.set('someone-elses/object', { body: Buffer.from('another tenant') })
+  })
+
+  it('should complete instead of rejecting on the foreign key', async () => {
+    const listed: string[] = []
+    for await (const each of storage.allFileIds()) listed.push(each)
+
+    expect(listed).toEqual(['abcdef'])
   })
 })

@@ -220,11 +220,17 @@ export async function createS3BasedFileSystemContentStorage(
   const logger = components.logs.getLogger('s3-based-content-storage')
   const getKey = options.getKey || ((hash: string) => hash)
   const Bucket = options.Bucket
-  if (options.getKey && !options.getId) {
+  // Both or neither. The type already enforces this, so only a JavaScript caller reaches it — and
+  // BOTH halves matter. Without `getId`, `allFileIds()` yields keys that do not resolve back through
+  // retrieve/exist/delete, and a delete of an enumerated id silently removes nothing because
+  // `DeleteObjects` is idempotent. Without `getKey`, the mapping is mixed: reads and writes address
+  // identity keys while enumeration decodes them, so every key fails the round-trip check below and
+  // enumeration reports an empty bucket — the silent-empty answer this component exists to avoid.
+  if (!!options.getKey !== !!options.getId) {
     throw new Error(
-      'A custom getKey requires a matching getId: allFileIds() enumerates keys, and without the inverse the ' +
-        'ids it yields do not resolve back through retrieve/exist/delete (a delete of an enumerated id silently ' +
-        'removes nothing, because DeleteObjects is idempotent).'
+      `getKey and getId must be supplied together; received only ${options.getKey ? 'getKey' : 'getId'}. ` +
+        'They are inverses: retrieve/exist/delete map an id to a key with getKey, while allFileIds() maps a ' +
+        'listed key back with getId, and each is unusable without the other.'
     )
   }
   const getId = options.getId || ((key: string) => key)
@@ -659,10 +665,13 @@ export async function createS3BasedFileSystemContentStorage(
   /**
    * Walks the bucket yielding stored IDS, not keys.
    *
-   * `prefix` filters ids, matching the folder-based contract. It is translated into a KEY prefix via
-   * `getKey` so the filtering still happens server-side — valid because `getKey` is required to be
-   * prefix-preserving in practice (it maps an id namespace into a key namespace); when the
-   * translation cannot be trusted the surviving ids are re-checked locally below.
+   * `prefix` filters IDS, matching the folder-based contract. It is pushed to S3 as a server-side
+   * `Prefix` only for the DEFAULT identity mapping, where an id prefix provably is a key prefix.
+   * `getKey` maps a complete id to a key, so applying it to a partial one is a category error: under
+   * a sharding mapping it yields a prefix no real key starts with, and every prefixed enumeration
+   * came back empty. A custom mapping therefore lists unprefixed and filters on the id here.
+   *
+   * Only keys the mapping round-trips are yielded — see the loop below.
    */
   async function* allFileIds(prefix?: string): AsyncIterable<string> {
     const params: ListObjectsV2CommandInput = {
@@ -689,7 +698,20 @@ export async function createS3BasedFileSystemContentStorage(
       if (output.Contents) {
         for (const content of output.Contents) {
           const key = content.Key!
-          const id = getId(key)
+          let id: string | undefined
+          let notOwnedBecause: string | undefined
+          try {
+            const candidate = getId(key)
+            const roundTripped = getKey(candidate)
+            if (roundTripped === key) id = candidate
+            else notOwnedBecause = `round-tripped to ${roundTripped}`
+          } catch (error: any) {
+            // A strict inverse that parses its own namespace THROWS on a key from outside it, which
+            // is a clear "not mine" rather than a fault. Letting it propagate would fail the entire
+            // enumeration over one object this storage does not own — turning a shared bucket into
+            // an unenumerable one. `getKey` is caller code too, so it is inside the same guard.
+            notOwnedBecause = `mapping threw: ${error?.message ?? String(error)}`
+          }
           // ROUND TRIP, not just an inverse call. `getId` is applied to every key the bucket returns,
           // including ones this mapping never produced — and a lossy inverse maps those onto ids that
           // look real. With `getKey: h => h.slice(0,4) + '/' + h`, a foreign `zz/abcdef` yields the id
@@ -701,14 +723,14 @@ export async function createS3BasedFileSystemContentStorage(
           // Filtering rather than yielding is the safe direction: a key that does not round-trip is
           // already unreachable through `retrieve`/`delete`, which would compute a different key for
           // that id, so nothing reachable is being hidden.
-          if (getKey(id) !== key) {
+          if (id === undefined) {
             if (!warnedAboutForeignKeys) {
               warnedAboutForeignKeys = true
               logger.warn(
                 `Skipping bucket keys that this storage's getKey/getId mapping does not round-trip; they are not ` +
                   `ids of content it owns. Enumerating them would report phantom ids, and a caller deleting what ` +
                   `it enumerated could remove real content stored under a different key.`,
-                { key, roundTripped: getKey(id) }
+                { key, reason: notOwnedBecause ?? 'unknown' }
               )
             }
             continue
