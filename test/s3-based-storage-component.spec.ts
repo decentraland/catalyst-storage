@@ -451,8 +451,15 @@ describe('S3 Storage retrieve error logging', () => {
       // The startup probe decides whether a 403 on a read is decidable. Denying it models a principal
       // without s3:ListBucket, for which a missing key genuinely answers 403.
       if (!canListBucket) {
+        // `AccessDenied` is what S3 returns for an authorization denial, and it is the ONLY 403 that
+        // says anything about this principal's `s3:ListBucket`. `ListObjectsV2` is a GET with an XML
+        // error body, so the code survives — unlike a HEAD, whose empty body is the whole reason the
+        // ambiguity exists.
         fake.on('ListObjectsV2Command', () => {
-          throw Object.assign(new Error('Forbidden'), { name: 'Forbidden', $metadata: { httpStatusCode: 403 } })
+          throw Object.assign(new Error('Access Denied'), {
+            name: 'AccessDenied',
+            $metadata: { httpStatusCode: 403 }
+          })
         })
       }
       const created = await createS3BasedFileSystemContentStorage({ logs } as any, fake, { Bucket: 'test' })
@@ -489,6 +496,39 @@ describe('S3 Storage retrieve error logging', () => {
         expect(logger.error).not.toHaveBeenCalled()
         expect(retrievalWarnings(logger)).toHaveLength(1)
         expect(retrievalWarnings(logger)[0][1]).toMatchObject({ key: 'some-key', statusCode: 403 })
+      })
+    })
+
+    describe('and the startup probe failed with a credential or clock 403', () => {
+      let storage: IContentStorageComponent
+      let headError: Error
+
+      beforeEach(async () => {
+        // `RequestTimeTooSkewed`, `InvalidAccessKeyId` and `SignatureDoesNotMatch` are 403s that say
+        // NOTHING about which permissions this principal holds. Crediting them would flip reads into
+        // the lenient mode on a startup blip, and the node would then answer "absent" for every id
+        // for its whole lifetime — the empty-node failure the probe exists to remove.
+        const { logs } = createSpyLogs()
+        const fake = createFakeS3Client()
+        fake.on('ListObjectsV2Command', () => {
+          throw Object.assign(new Error('The difference between the request time and the current time is too large'), {
+            name: 'RequestTimeTooSkewed',
+            $metadata: { httpStatusCode: 403 }
+          })
+        })
+        storage = await createS3BasedFileSystemContentStorage({ logs } as any, fake, { Bucket: 'test' })
+        headError = forbidden()
+        fake.on('HeadObjectCommand', () => {
+          throw headError
+        })
+      })
+
+      it('should still reject a 403 read rather than report it as absence', async () => {
+        await expect(storage.retrieve('some-key')).rejects.toBe(headError)
+      })
+
+      it('should construct rather than refuse over a fault unrelated to permissions', () => {
+        expect(storage).toBeDefined()
       })
     })
 
@@ -1010,5 +1050,41 @@ describe('S3 Storage multipart cleanup', () => {
     await expect(storage.storeStream('big-id', bufferToStream(Buffer.alloc(6 * 1024 * 1024, 7)))).rejects.toBeDefined()
 
     expect(aborted).toEqual(['upload-big-id'])
+  })
+})
+
+describe('S3 Storage identity content encoding', () => {
+  let storage: IContentStorageComponent
+  let size: number
+
+  beforeEach(async () => {
+    // `identity` is the RFC 9110 token for NOT encoded. Ranging and decoding already treated it that
+    // way; the metadata surfaces did not, so an object an operator or migration tagged with it
+    // reported its logical size as unknown while its bytes were plainly readable.
+    size = 12
+    const fake = createFakeS3Client()
+    fake.on('HeadObjectCommand', () => ({ ContentLength: size, ContentEncoding: 'identity', ETag: '"e"' }))
+    fake.on('GetObjectCommand', () => ({ Body: bufferToStream(Buffer.from('twelve bytes')), ContentLength: size }))
+    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+      Bucket: 'example'
+    })
+  })
+
+  it('should report fileInfo contentSize as the known size, not unknown', async () => {
+    expect(await storage.fileInfo('id')).toEqual({ encoding: null, size, contentSize: size })
+  })
+
+  it('should have retrieve agree with fileInfo about the same id', async () => {
+    const item = await storage.retrieve('id')
+
+    expect({ encoding: item!.encoding, size: item!.size, contentSize: item!.contentSize }).toEqual(
+      await storage.fileInfo('id')
+    )
+  })
+
+  it('should serve a range of it', async () => {
+    const item = await storage.retrieve('id', { start: 0, end: 3 })
+
+    expect(item!.size).toBe(4)
   })
 })

@@ -13,6 +13,20 @@ const IDENTITY_ENCODINGS = new Set(['', 'identity'])
 const ignoreStreamError = (): void => undefined
 
 /**
+ * The value a `ContentItem` reports as its `encoding`, given a raw `Content-Encoding`.
+ *
+ * Only the identity tokens collapse to `null`: they mean "not encoded", so reporting them verbatim
+ * forces every caller to special-case a value that carries no information. Any other coding is passed
+ * through unchanged, because a caller forwarding the header needs the original. Exported so backends
+ * normalize identically and their `fileInfo`/`retrieve` surfaces cannot disagree about one id.
+ *
+ * @public
+ */
+export function normalizeContentEncoding(encoding: string | null | undefined): string | null {
+  return typeof encoding === 'string' && IDENTITY_ENCODINGS.has(encoding.toLowerCase()) ? null : (encoding ?? null)
+}
+
+/**
  * Codings that describe the TRANSFER of the bytes rather than the content itself, and so are already
  * undone by the time a body reaches us. `aws-chunked` is written by S3 on flexible-checksum uploads,
  * frequently alongside a real coding (`gzip, aws-chunked`).
@@ -84,12 +98,11 @@ export class SimpleContentItem implements ContentItem {
     encoding: string | null,
     contentSize?: number | null
   ) {
-    // `typeof`, not `!== null`: this is a published CJS library, so a JavaScript caller can pass
-    // fewer arguments than the signature declares, and `undefined.toLowerCase()` crashed the
-    // constructor of a `@public` class with a message naming neither it nor the argument.
-    this.encoding =
-      typeof encoding === 'string' && IDENTITY_ENCODINGS.has(encoding.toLowerCase()) ? null : (encoding ?? null)
-    this.contentSize = contentSize !== undefined ? contentSize : this.encoding ? null : size
+    // Tolerates `undefined`: this is a published CJS library, so a JavaScript caller can pass fewer
+    // arguments than the signature declares, and dereferencing it crashed the constructor of a
+    // `@public` class with a message naming neither it nor the argument.
+    this.encoding = normalizeContentEncoding(encoding)
+    this.contentSize = contentSize !== undefined ? contentSize : contentCodingOf(this.encoding) === null ? size : null
   }
 
   static fromBuffer(buffer: Uint8Array): SimpleContentItem {

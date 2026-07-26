@@ -20,7 +20,7 @@ import {
   RangeNotSupportedError,
   validateRange
 } from './types'
-import { contentCodingOf, SimpleContentItem } from './content-item'
+import { contentCodingOf, normalizeContentEncoding, SimpleContentItem } from './content-item'
 import { isAbortError, runStoreWithSignal } from './cancellation'
 import { mapWithConcurrency } from './concurrency'
 import {
@@ -229,22 +229,27 @@ export async function createS3BasedFileSystemContentStorage(
   )
 
   /**
-   * Whether this principal holds `s3:ListBucket`, which is what makes a 403 decidable.
+   * Whether a 403 on a read may be reported as absence.
    *
-   * Without that permission S3 answers a MISSING key with 403 instead of 404, and the response
-   * carries nothing separating that from a genuine denial — so "not here" is the only answer the
-   * bucket policy leaves available. With it, missing keys answer 404 and a 403 can only be a real
-   * authorization failure, which must reject rather than masquerade as an empty bucket.
+   * Only ONE situation justifies that: a principal without `s3:ListBucket` gets 403 instead of 404
+   * for a MISSING key, and the response carries nothing separating that from a real denial. Every
+   * other 403 — rotated credentials, a bad signature, clock skew, a revoked policy — is the storage
+   * refusing to answer, and reporting it as absence is what makes a broken node look like an empty
+   * one.
    *
-   * Resolved ONCE at construction, so it costs nothing per read.
+   * Defaults to FALSE and is only enabled on positive evidence (see `probeBucketAccess`), because the
+   * two readings are not symmetric: answering "cannot read" for content that is genuinely absent
+   * costs a retry, while answering "absent" for content that is present and unreadable is a silent
+   * data-loss report. Resolved ONCE at construction, so it costs nothing per read.
    */
-  let canListBucket = false
+  let report403AsAbsent = false
   await probeBucketAccess()
 
   async function probeBucketAccess(): Promise<void> {
     try {
       await s3.send(new ListObjectsV2Command({ Bucket, MaxKeys: 1 }))
-      canListBucket = true
+      // Listing works, so missing keys answer 404 and every 403 is a real authorization failure.
+      return
     } catch (error: any) {
       const statusCode = error?.$metadata?.httpStatusCode
       const code = error?.name
@@ -259,7 +264,17 @@ export async function createS3BasedFileSystemContentStorage(
             `Original error: ${error?.message ?? String(error)}`
         )
       }
-      if (statusCode === 403) {
+      // A 403 is only evidence about `s3:ListBucket` when it is an authorization DENIAL. The
+      // credential and clock failures below are 403s too, and they say nothing about which
+      // permissions this principal holds — crediting them would switch reads into the lenient mode on
+      // a startup blip, and the node would then answer "absent" for every id for its whole lifetime.
+      // That is precisely the empty-node failure this probe exists to remove, so it must not be
+      // reachable through the probe itself.
+      //
+      // `ListObjectsV2` is a GET with an XML error body, so the SDK surfaces the real code here —
+      // unlike `HeadObject`, whose empty body is why the ambiguity exists in the first place.
+      if (statusCode === 403 && code === 'AccessDenied') {
+        report403AsAbsent = true
         logger.warn(
           `This principal cannot s3:ListBucket on '${Bucket}', so a 403 on a read cannot be distinguished from a ` +
             `missing key and will be reported as absent. Grant s3:ListBucket so missing keys return 404 and a real ` +
@@ -269,12 +284,14 @@ export async function createS3BasedFileSystemContentStorage(
         )
         return
       }
-      // Anything else (a network blip, a throttle) says nothing about permissions and must not stop a
-      // component whose reads and writes would surface the same fault themselves. Stay conservative:
-      // 403 keeps meaning "absent" until a restart proves otherwise.
+      // Anything else — a credential or clock 403, a network blip, a throttle — says nothing about
+      // permissions and must not stop a component whose reads and writes would surface the same fault
+      // themselves. Reads stay STRICT: an unverified 403 rejects, which is the answer that keeps a
+      // broken node distinguishable from an empty one.
       logger.warn(
-        `Could not verify s3:ListBucket on '${Bucket}'; a 403 on a read will be reported as absent until a ` +
-          `restart can confirm the permission.`,
+        `Could not verify s3:ListBucket on '${Bucket}'; a 403 on a read will be surfaced as an error rather than ` +
+          `reported as absence. If this principal genuinely lacks s3:ListBucket, grant it so missing keys return ` +
+          `404, or restart once the underlying problem is resolved.`,
         { error: error?.message ?? String(error) }
       )
     }
@@ -303,7 +320,7 @@ export async function createS3BasedFileSystemContentStorage(
     // (`InvalidAccessKeyId`, `SignatureDoesNotMatch`, `RequestTimeTooSkewed`, a revoked policy) and
     // must REJECT. Reporting those as absent made a node whose key had been rotated, or whose clock
     // had drifted, answer "I hold nothing" for every id — while its writes rejected loudly.
-    return statusCode === 403 && !canListBucket
+    return statusCode === 403 && report403AsAbsent
   }
 
   function logContextFor(id: string, error: any): Record<string, string | number> {
@@ -547,11 +564,13 @@ export async function createS3BasedFileSystemContentStorage(
         },
         itemSize,
         encoding,
-        // Same rule `fileInfo` applies: S3 keeps no uncompressed-size metadata, so for encoded
-        // content the logical size is genuinely unknown. Letting SimpleContentItem default it to
-        // `itemSize` passed the COMPRESSED byte count off as the content size to callers doing
-        // `contentSize ?? size`. `null` is the documented "unknown".
-        encoding ? null : itemSize
+        // Same rule `fileInfo` applies, via the same predicate: S3 keeps no uncompressed-size
+        // metadata, so for genuinely encoded content the logical size is unknown, and letting this
+        // default to `itemSize` would pass the COMPRESSED byte count off as the content size to
+        // callers doing `contentSize ?? size`. Codings that encode nothing — `identity`, and the
+        // `aws-chunked` S3 writes itself — must NOT be caught by that: those bytes are the content,
+        // and their size is known.
+        contentCodingOf(encoding) === null ? itemSize : null
       )
     } catch (error: any) {
       // Caller-facing range problems, not storage faults: re-raised BEFORE `logStorageFailure`, which
@@ -672,10 +691,15 @@ export async function createS3BasedFileSystemContentStorage(
     try {
       const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
       const size = obj.ContentLength ?? null
+      const encoding = obj.ContentEncoding || null
+      // Normalized exactly as `retrieve` normalizes it, so the two surfaces never disagree about one
+      // id: an object tagged `Content-Encoding: identity` is not encoded, so it reports a known
+      // `contentSize` and a `null` encoding rather than claiming its size is unknown.
+      const coding = contentCodingOf(encoding)
       return {
-        encoding: obj.ContentEncoding || null,
+        encoding: normalizeContentEncoding(encoding),
         size,
-        contentSize: obj.ContentEncoding ? null : size
+        contentSize: coding === null ? size : null
       }
     } catch (error: any) {
       if (isNotFound(error)) {
