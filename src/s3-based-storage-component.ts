@@ -88,7 +88,9 @@ const BATCH_CONCURRENCY = 32
  */
 export async function createAwsS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, 'config' | 'logs'>,
-  bucket: string
+  bucket: string,
+  /** Forwarded to {@link createS3BasedFileSystemContentStorage}; see `fileTypeLoader` there. */
+  options?: Pick<S3ContentStorageOptions, 'fileTypeLoader'>
 ): Promise<IContentStorageComponent> {
   const { config, logs } = components
 
@@ -104,7 +106,10 @@ export async function createAwsS3BasedFileSystemContentStorage(
   // A supervisor retrying a misconfigured deployment would otherwise leak a socket pool per attempt.
   let storage: IContentStorageComponent
   try {
-    storage = await createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: bucket })
+    storage = await createS3BasedFileSystemContentStorage({ logs }, s3, {
+      Bucket: bucket,
+      fileTypeLoader: options?.fileTypeLoader
+    })
   } catch (error) {
     s3.destroy()
     throw error

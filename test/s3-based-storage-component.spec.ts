@@ -1,6 +1,7 @@
 import {
   createAwsS3BasedFileSystemContentStorage,
   createS3BasedFileSystemContentStorage,
+  FileTypeLoader,
   IContentStorageComponent,
   S3ContentStorageOptions
 } from '../src'
@@ -12,10 +13,53 @@ import { PutObjectCommand } from '@aws-sdk/client-s3'
 import { createLogComponent } from '@well-known-components/logger'
 import { createConfigComponent } from '@well-known-components/env-config-provider'
 
+/**
+ * The real detector is ESM-only and reached through a dynamic import that Jest's module registry
+ * does not own, so once ANY test file's environment is torn down it fails for every file after it —
+ * intermittently failing this suite's MIME assertions and the run's exit code. Every construction
+ * here therefore injects a detector.
+ *
+ * What that gives up is `file-type`'s own identification, which is not this repository's to verify.
+ * What it keeps is the integration this component owns: that `peekHead` hands the detector the first
+ * bytes of the content even when the body is far larger than the detection window, and that the type
+ * it returns is what gets stored.
+ */
+const undetectingLoader: FileTypeLoader = async () => ({ fileTypeFromBuffer: async () => undefined })
+
+const createStorage = (
+  components: Parameters<typeof createS3BasedFileSystemContentStorage>[0],
+  client: Parameters<typeof createS3BasedFileSystemContentStorage>[1],
+  options: Parameters<typeof createS3BasedFileSystemContentStorage>[2]
+) => createS3BasedFileSystemContentStorage(components, client, { fileTypeLoader: undetectingLoader, ...options })
+
+const createAwsStorage = (
+  components: Parameters<typeof createAwsS3BasedFileSystemContentStorage>[0],
+  bucket: string,
+  options?: Parameters<typeof createAwsS3BasedFileSystemContentStorage>[2]
+) => createAwsS3BasedFileSystemContentStorage(components, bucket, { fileTypeLoader: undetectingLoader, ...options })
+
+/**
+ * Identifies the three formats this suite stores, from the head it is handed. Stands in for
+ * `file-type` so the assertions stay about THIS component's contribution: that the detector receives
+ * the leading bytes of content far larger than the detection window, and that what it returns is what
+ * ends up on the object.
+ */
+const magicByteLoader: FileTypeLoader = async () => ({
+  fileTypeFromBuffer: async (buffer: Uint8Array) => {
+    const head = Buffer.from(buffer)
+    if (head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+      return { mime: 'image/png' }
+    }
+    if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return { mime: 'image/jpeg' }
+    if (head.subarray(0, 4).toString('utf8') === 'glTF') return { mime: 'model/gltf-binary' }
+    return undefined
+  }
+})
+
 describe('S3 Storage using ', () => {
   it('creates storage with right config', async () => {
     await expect(
-      createAwsS3BasedFileSystemContentStorage(
+      createAwsStorage(
         {
           config: createConfigComponent({ AWS_REGION: 'eu-west-1' }),
           logs: await createLogComponent({})
@@ -35,7 +79,7 @@ describe('S3 Storage', () => {
 
   beforeEach(async () => {
     const logs = await createLogComponent({})
-    storage = await createS3BasedFileSystemContentStorage({ logs }, createFakeS3Client(), { Bucket: 'example' })
+    storage = await createStorage({ logs }, createFakeS3Client(), { Bucket: 'example' })
 
     id = 'some-id'
     content = Buffer.from('123')
@@ -248,8 +292,9 @@ describe('S3 Storage MIME type detection', () => {
 
   beforeEach(async () => {
     fakeS3 = createFakeS3Client()
-    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fakeS3, {
-      Bucket: 'example'
+    storage = await createStorage({ logs: await createLogComponent({}) }, fakeS3, {
+      Bucket: 'example',
+      fileTypeLoader: magicByteLoader
     })
   })
 
@@ -296,7 +341,7 @@ describe('S3 Storage enumeration', () => {
         requests++
         return { Contents: [{ Key: 'only-key' }], IsTruncated: true, NextContinuationToken: undefined }
       })
-      const storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+      const storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
         Bucket: 'example'
       })
       // Construction probes s3:ListBucket once to decide whether a 403 can mean "absent"; this
@@ -321,7 +366,7 @@ describe('S3 Storage client lifecycle', () => {
     let storage: IContentStorageComponent
 
     beforeEach(async () => {
-      storage = await createAwsS3BasedFileSystemContentStorage(
+      storage = await createAwsStorage(
         {
           config: createConfigComponent({ AWS_REGION: 'eu-west-1' }),
           logs: await createLogComponent({})
@@ -341,13 +386,9 @@ describe('S3 Storage client lifecycle', () => {
     let storage: IContentStorageComponent
 
     beforeEach(async () => {
-      storage = await createS3BasedFileSystemContentStorage(
-        { logs: await createLogComponent({}) },
-        createFakeS3Client(),
-        {
-          Bucket: 'example'
-        }
-      )
+      storage = await createStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), {
+        Bucket: 'example'
+      })
     })
 
     it('should not take ownership of a client it did not create', () => {
@@ -363,7 +404,7 @@ describe('S3 Storage delete', () => {
   beforeEach(async () => {
     fakeS3 = createFakeS3Client()
     const logs = await createLogComponent({})
-    storage = await createS3BasedFileSystemContentStorage({ logs }, fakeS3, { Bucket: 'example' })
+    storage = await createStorage({ logs }, fakeS3, { Bucket: 'example' })
   })
 
   describe('when more ids than one DeleteObjects request accepts are deleted', () => {
@@ -416,7 +457,7 @@ describe('S3 Storage content size', () => {
       // callers doing `contentSize ?? size` the wrong number under a field documented as the
       // uncompressed one. S3 stores no uncompressed size, so `null` ("unknown") is the honest answer.
       fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentLength: 133, ContentEncoding: 'gzip' }))
-      const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
+      const storage = await createStorage({ logs }, fake, { Bucket: 'test' })
       item = (await storage.retrieve('encoded-id'))!
     })
 
@@ -432,7 +473,7 @@ describe('S3 Storage content size', () => {
       const fake = createFakeS3Client()
       const logs = await createLogComponent({})
       fake.on('HeadObjectCommand', () => ({ ETag: '"abc"', ContentLength: 133, ContentEncoding: 'gzip' }))
-      const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'test' })
+      const storage = await createStorage({ logs }, fake, { Bucket: 'test' })
 
       expect((await storage.fileInfo('encoded-id'))!.contentSize).toBe(item.contentSize)
     })
@@ -463,7 +504,7 @@ describe('S3 Storage retrieve error logging', () => {
           })
         })
       }
-      const created = await createS3BasedFileSystemContentStorage({ logs } as any, fake, { Bucket: 'test' })
+      const created = await createStorage({ logs } as any, fake, { Bucket: 'test' })
       fake.on('HeadObjectCommand', () => {
         throw headError
       })
@@ -517,7 +558,7 @@ describe('S3 Storage retrieve error logging', () => {
             $metadata: { httpStatusCode: 403 }
           })
         })
-        storage = await createS3BasedFileSystemContentStorage({ logs } as any, fake, { Bucket: 'test' })
+        storage = await createStorage({ logs } as any, fake, { Bucket: 'test' })
         headError = forbidden()
         fake.on('HeadObjectCommand', () => {
           throw headError
@@ -624,7 +665,7 @@ describe('S3 Storage response bodies', () => {
     const fake = createFakeS3Client()
     await fake.send(new PutObjectCommand({ Bucket: 'example', Key: 'bodiless-id', Body: Buffer.from('x') }))
     fake.on('GetObjectCommand', () => ({ ContentLength: 1 }))
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
 
     const item = await storage.retrieve('bodiless-id')
 
@@ -636,7 +677,7 @@ describe('S3 Storage response bodies', () => {
     const fake = createFakeS3Client()
     await fake.send(new PutObjectCommand({ Bucket: 'example', Key: 'blob-id', Body: Buffer.from('x') }))
     fake.on('GetObjectCommand', () => ({ Body: new Date(), ContentLength: 1 }))
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
 
     const item = await storage.retrieve('blob-id')
 
@@ -651,7 +692,7 @@ describe('S3 Storage upload cancellation', () => {
     const logs = await createLogComponent({})
     const fake = createFakeS3Client()
     const inFlight = fake.hang('PutObjectCommand')
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
     const controller = new AbortController()
     const reason = new Error('deployment deadline exceeded')
 
@@ -686,7 +727,7 @@ describe('S3 Storage upload cancellation', () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 10))
       throw accessDenied
     })
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
     const controller = new AbortController()
 
     const reason = new Error('cancelled while the upload was failing')
@@ -709,7 +750,7 @@ describe('S3 Storage upload cancellation', () => {
         return { ETag: '"x"', UploadId: 'u' }
       })
     }
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
     const controller = new AbortController()
     const reason = new Error('cancelled during the head read')
     const source = bufferToStream(Buffer.alloc(5000, 1))
@@ -735,7 +776,7 @@ describe('S3 Storage upload cancellation', () => {
       fake.objects.set(input.Key, { body: Buffer.alloc(0) })
       return { ETag: '"x"' }
     })
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
     const controller = new AbortController()
     const reason = new Error('cancelled mid-put')
 
@@ -772,7 +813,7 @@ describe('S3 Storage upload cancellation', () => {
       return {}
     })
     const inFlight = fake.hang('UploadPartCommand')
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
     const controller = new AbortController()
     const reason = new Error('cancelled mid-multipart')
 
@@ -802,7 +843,7 @@ describe('S3 Storage upload cancellation', () => {
     try {
       const fake = createFakeS3Client()
       const inFlight = fake.hang('PutObjectCommand')
-      const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+      const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
       const controller = new AbortController()
       const reason = new Error('cancelled with a broken abort')
 
@@ -835,7 +876,7 @@ describe('S3 Storage upload cancellation', () => {
     try {
       const fake = createFakeS3Client()
       const inFlight = fake.hang('PutObjectCommand')
-      const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+      const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
       const controller = new AbortController()
       const reason = new Error('cancelled with an async-rejecting abort')
 
@@ -869,7 +910,7 @@ describe('S3 Storage upload cancellation', () => {
       uploadRejected = true
       throw uploadFault
     })
-    const storage = await createS3BasedFileSystemContentStorage({ logs }, fake, { Bucket: 'example' })
+    const storage = await createStorage({ logs }, fake, { Bucket: 'example' })
     const source = bufferToStream(Buffer.from('some content'))
     // Throw only for the cleanup destroy after the upload failed: an unconditional override would
     // also break the async-iterator teardown the head read performs before the upload exists.
@@ -903,9 +944,9 @@ describe('S3 Storage review regressions', () => {
     })
 
     it('should refuse to construct rather than report every id as absent', async () => {
-      await expect(
-        createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, { Bucket: 'absent' })
-      ).rejects.toThrow(/Refusing to start/)
+      await expect(createStorage({ logs: await createLogComponent({}) }, fake, { Bucket: 'absent' })).rejects.toThrow(
+        /Refusing to start/
+      )
     })
   })
 
@@ -926,7 +967,7 @@ describe('S3 Storage review regressions', () => {
         const options = { Bucket: 'example', getKey: (hash: string) => `contents/${hash}` } as S3ContentStorageOptions
 
         await expect(
-          createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), options)
+          createStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), options)
         ).rejects.toThrow(/must be supplied together; received only getKey/)
       })
     })
@@ -942,7 +983,7 @@ describe('S3 Storage review regressions', () => {
         } as unknown as S3ContentStorageOptions
 
         await expect(
-          createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), options)
+          createStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), options)
         ).rejects.toThrow(/must be supplied together; received only getId/)
       })
     })
@@ -953,7 +994,7 @@ describe('S3 Storage review regressions', () => {
 
       beforeEach(async () => {
         fake = createFakeS3Client()
-        storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+        storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
           Bucket: 'example',
           getKey: (hash: string) => `contents/${hash}`,
           getId: (key: string) => key.replace(/^contents\//, '')
@@ -994,7 +1035,7 @@ describe('S3 Storage review regressions', () => {
       // inflated into the whole object while advertising the requested length.
       const fake = createFakeS3Client()
       fake.on('HeadObjectCommand', () => ({ ContentLength: 40, ContentEncoding: 'gzip', ETag: '"e"' }))
-      storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+      storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
         Bucket: 'example'
       })
     })
@@ -1018,7 +1059,7 @@ describe('S3 Storage prefix enumeration with a sharding key mapping', () => {
     // produced a server-side Prefix no real key starts with, and enumeration silently returned
     // nothing for every prefix — a prefix-sharded GC sweep concluded the bucket was empty.
     fake = createFakeS3Client()
-    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+    storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
       Bucket: 'example',
       getKey: (hash: string) => `${hash.slice(0, 2)}/${hash}`,
       getId: (key: string) => key.slice(3)
@@ -1061,7 +1102,7 @@ describe('S3 Storage multipart cleanup', () => {
     // complete request that fails leaves every uploaded part in the bucket, billed indefinitely.
     fake = createFakeS3Client()
     aborted = []
-    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+    storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
       Bucket: 'example'
     })
     fake.on('CompleteMultipartUploadCommand', () => {
@@ -1092,7 +1133,7 @@ describe('S3 Storage identity content encoding', () => {
     const fake = createFakeS3Client()
     fake.on('HeadObjectCommand', () => ({ ContentLength: size, ContentEncoding: 'identity', ETag: '"e"' }))
     fake.on('GetObjectCommand', () => ({ Body: bufferToStream(Buffer.from('twelve bytes')), ContentLength: size }))
-    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+    storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
       Bucket: 'example'
     })
   })
@@ -1125,7 +1166,7 @@ describe('S3 Storage enumeration of a bucket holding foreign keys', () => {
     // A lossy inverse maps those onto ids that look real: here a foreign `zz/abcdef` yields the id
     // `abcdef`, whose actual key is `ab/abcdef`.
     fake = createFakeS3Client()
-    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+    storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
       Bucket: 'shared',
       getKey: (hash: string) => `${hash.slice(0, 2)}/${hash}`,
       getId: (key: string) => key.slice(3)
@@ -1180,7 +1221,7 @@ describe('S3 Storage enumeration when the inverse rejects foreign keys', () => {
     // "not mine", but it used to propagate and fail the whole enumeration over a single object this
     // storage does not own — making a shared bucket unenumerable.
     fake = createFakeS3Client()
-    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+    storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
       Bucket: 'shared',
       getKey: (hash: string) => `contents/${hash}`,
       getId: (key: string) => {
@@ -1211,17 +1252,13 @@ describe('S3 Storage injected content-type detector', () => {
       // memoizes internally, so passing the loader itself to every store hid this: a custom loader
       // was re-invoked per store and could fail after construction had already succeeded.
       calls = 0
-      storage = await createS3BasedFileSystemContentStorage(
-        { logs: await createLogComponent({}) },
-        createFakeS3Client(),
-        {
-          Bucket: 'example',
-          fileTypeLoader: async () => {
-            calls++
-            return { fileTypeFromBuffer: async () => ({ mime: 'image/png' }) }
-          }
+      storage = await createStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), {
+        Bucket: 'example',
+        fileTypeLoader: async () => {
+          calls++
+          return { fileTypeFromBuffer: async () => ({ mime: 'image/png' }) }
         }
-      )
+      })
     })
 
     it('should call it once for construction alone', () => {
@@ -1252,7 +1289,7 @@ describe('S3 Storage injected content-type detector', () => {
       // retried — the same reason the bundled loader refuses to cache a rejection.
       calls = 0
       fake = createFakeS3Client()
-      storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+      storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
         Bucket: 'example',
         fileTypeLoader: async () => {
           calls++

@@ -19,6 +19,7 @@ import {
   streamToBuffer
 } from '../src'
 import { intentNameFor } from './file-system-utils'
+import { createDecompressCache } from '../src/folder-based/decompress-cache'
 
 /**
  * Regression tests for the defects found in the deep review. Each block names the failure it pins,
@@ -1138,5 +1139,63 @@ describe('when enumerating a directory through allFileIds', () => {
     it('should yield it after reading only the entries it needed', () => {
       expect(readWhenFirstYielded).toBe(1)
     })
+  })
+})
+
+describe('when a cached entry is touched while a size-eviction pass is already running', () => {
+  let unlinked: string[]
+
+  beforeEach(async () => {
+    // The TTL loop re-reads `lastAccess` per entry, so it already skips an entry touched mid-pass.
+    // The SIZE loop cannot: it works from a snapshot sorted by `lastAccess`, so a victim chosen
+    // before the touch was still evicted afterwards — LRU deleting a file that had just become the
+    // most recently used, out from under the reader that touched it. Admission-triggered passes made
+    // that window wide, because eviction now starts while callers are still working.
+    unlinked = []
+    let firstUnlinkSeen: () => void = () => undefined
+    let releaseFirstUnlink: () => void = () => undefined
+    const firstUnlink = new Promise<void>((resolve) => (firstUnlinkSeen = resolve))
+    const gate = new Promise<void>((resolve) => (releaseFirstUnlink = resolve))
+
+    const cache = createDecompressCache(
+      {
+        logger: { log() {}, info() {}, debug() {}, warn() {}, error() {} } as any,
+        fsInvariants: {
+          existsForInvariant: async () => false,
+          noFailUnlink: async (target: string) => {
+            unlinked.push(target)
+            if (unlinked.length === 1) {
+              firstUnlinkSeen()
+              await gate
+            }
+            return true
+          }
+        }
+      },
+      { ttl: 3_600_000, maxSize: 100 }
+    )
+
+    // Three small entries, oldest first, then one large enough to cross the budget. Recording the
+    // large one is what starts the pass, whose snapshot therefore ranks '/a' before '/b' before '/c'.
+    for (const name of ['/a', '/b', '/c']) {
+      cache.record(name, 10)
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+    cache.record('/big', 100)
+
+    await firstUnlink
+    // '/b' is used after the pass has already chosen it as a victim.
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    cache.touch('/b')
+    releaseFirstUnlink()
+    await cache.evict()
+  })
+
+  it('should evict the oldest entry it selected', () => {
+    expect(unlinked).toContain('/a')
+  })
+
+  it('should not evict the entry that was touched after the pass chose it', () => {
+    expect(unlinked).not.toContain('/b')
   })
 })

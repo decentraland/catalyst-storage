@@ -114,9 +114,25 @@ export function createDecompressCache(
   // Unlinks an evicted cache file under the path lock, re-checking the entry is still current: a
   // store may have promoted the path to primary content (forgetting the entry) between the eviction
   // scan and this delete — unlinking then would destroy the only copy of the new content.
-  async function evictEntry(filePath: string, entry: { size: number; lastAccess: number }): Promise<void> {
+  async function evictEntry(
+    filePath: string,
+    entry: { size: number; lastAccess: number },
+    /**
+     * The entry's `lastAccess` when the pass selected it. A pass takes its snapshot and then awaits
+     * an unlink per entry, so by the time this runs the entry may have been TOUCHED by a read that
+     * started afterwards — and `touch` mutates the same object, so the identity check above still
+     * matches and the entry would be evicted anyway. LRU then does the opposite of what it promises:
+     * the most recently used file is the one deleted, and the reader that touched it finds its
+     * lazily-opened stream gone. Admission-triggered passes made this window wide, because eviction
+     * now begins while the caller is still working rather than only on the timer.
+     *
+     * Omitted by `evictAll`, which is shutdown and must not be deferred by concurrent activity.
+     */
+    expectedLastAccess?: number
+  ): Promise<void> {
     await withPathLock(filePath, async () => {
       if (entries.get(filePath) !== entry) return
+      if (expectedLastAccess !== undefined && entry.lastAccess !== expectedLastAccess) return
       await noFailUnlink(filePath)
       // Keep the tracking when the file survives the unlink, so the next eviction tick retries it
       // instead of leaving an untracked (unaccounted, never-retried) cache file on disk.
@@ -139,9 +155,13 @@ export function createDecompressCache(
    * The entry stays tracked, so the next tick retries it — recovering on its own once the underlying
    * fault is fixed.
    */
-  async function evictEntrySafely(filePath: string, entry: { size: number; lastAccess: number }): Promise<void> {
+  async function evictEntrySafely(
+    filePath: string,
+    entry: { size: number; lastAccess: number },
+    expectedLastAccess?: number
+  ): Promise<void> {
     try {
-      await evictEntry(filePath, entry)
+      await evictEntry(filePath, entry, expectedLastAccess)
     } catch (error) {
       logger.warn(`Could not evict the cached decompressed file at ${filePath}; it stays tracked for a later retry`, {
         error: error instanceof Error ? error.message : String(error)
@@ -161,7 +181,7 @@ export function createDecompressCache(
     // TTL eviction
     for (const [filePath, entry] of entries) {
       if (now - entry.lastAccess > options.ttl) {
-        await evictEntrySafely(filePath, entry)
+        await evictEntrySafely(filePath, entry, entry.lastAccess)
       }
     }
 
@@ -175,9 +195,12 @@ export function createDecompressCache(
       // just-recorded entry may not be the most recent by the time a pass runs, and its lazily-opened
       // stream can still fail ENOENT. Callers already have to treat that as a retryable miss (see the
       // read contract). The cache holds at most `maxSize` plus one file; TTL reclaims the survivor.
-      for (const [filePath, entry] of sorted.slice(0, -1)) {
+      // `lastAccess` is captured with the snapshot, so an entry touched after the pass chose it is
+      // no longer a valid LRU victim and is skipped.
+      const candidates = sorted.slice(0, -1).map(([filePath, entry]) => ({ filePath, entry, at: entry.lastAccess }))
+      for (const { filePath, entry, at } of candidates) {
         if (totalCacheSize <= options.maxSize) break
-        await evictEntrySafely(filePath, entry)
+        await evictEntrySafely(filePath, entry, at)
       }
     }
 
