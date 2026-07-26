@@ -20,9 +20,10 @@ import {
   RangeNotSupportedError,
   validateRange
 } from './types'
-import { contentCodingOf, normalizeContentEncoding, SimpleContentItem } from './content-item'
+import { assertStorableStream, contentCodingOf, normalizeContentEncoding, SimpleContentItem } from './content-item'
 import { isAbortError, runStoreWithSignal } from './cancellation'
-import { mapWithConcurrency } from './concurrency'
+import { destroyQuietly } from './stream-teardown'
+import { forEachWithConcurrency, mapWithConcurrency } from './concurrency'
 import {
   DEFAULT_MIME_TYPE,
   detectMimeTypeFromBuffer,
@@ -32,20 +33,15 @@ import {
   peekHead
 } from './mime-detection'
 
-/** Absorbs a torn-down stream's trailing 'error', which would otherwise be an uncaught exception. */
-const ignoreStreamError = (): void => undefined
-
 /**
- * How ids map to bucket keys.
+ * An id IS its bucket key.
  *
- * The mapping is either the default identity or a MATCHED PAIR: `getKey` and `getId` must be supplied
- * together, which the type enforces so a TypeScript caller migrating to this version gets the error
- * at compile time rather than at construction. The runtime check remains for JavaScript callers.
- *
- * The pairing is not bookkeeping. `allFileIds()` enumerates the bucket, which yields KEYS, while
- * every other surface takes IDS: without the inverse, a GC sweep that enumerated and then deleted
- * issued a double-prefixed key, and because `DeleteObjects` is idempotent S3 reported success while
- * deleting nothing, forever.
+ * There is deliberately no key-mapping hook. `allFileIds()` enumerates the bucket, which yields keys,
+ * while every other surface takes ids — so a custom mapping is only sound as a matched, total,
+ * round-tripping pair, and getting it wrong produced silent data loss: a GC sweep that enumerated and
+ * then deleted issued a double-prefixed key, and because `DeleteObjects` is idempotent S3 reported
+ * success while deleting nothing, forever. A caller who wants a key prefix should point the storage at
+ * a bucket (or a dedicated bucket) rather than reshaping ids underneath it.
  *
  * @public
  */
@@ -64,18 +60,37 @@ export type S3ContentStorageOptions = {
    * failure does not permanently downgrade every later store.
    */
   fileTypeLoader?: FileTypeLoader
-} & (
-  | { getKey?: undefined; getId?: undefined }
-  | {
-      /** Maps a COMPLETE content id to its bucket key. Never called with a partial id. */
-      getKey: (hash: string) => string
-      /** The exact inverse of `getKey`. Keys that do not round-trip are skipped by `allFileIds()`. */
-      getId: (key: string) => string
-    }
-)
+  /**
+   * Answers a 403 on a READ as "the content is absent" instead of rejecting. Defaults to `false`.
+   *
+   * Set this ONLY for a principal that genuinely lacks `s3:ListBucket`. Without that permission S3
+   * answers a MISSING key with 403 instead of 404, and nothing in the response separates that from a
+   * real denial — so for such a principal every read of absent content would otherwise reject.
+   *
+   * It is a deliberate opt-in rather than something this component infers, because the signal it would
+   * have to infer from is not sound. A 403 `AccessDenied` on the startup `ListObjectsV2` probe is
+   * ALSO what an IAM policy scoped to `arn:aws:s3:::my-bucket` returns for a bucket that is not that
+   * one — including a MISSPELLED one, since the implicit deny is evaluated before S3 ever checks
+   * whether the bucket exists, so the `NoSuchBucket`/404 guard never fires. Crediting it turned a
+   * one-character typo in `Bucket` into a node that answered "I hold nothing" for every id, for its
+   * whole lifetime, while its writes rejected loudly — precisely the silently-empty node the startup
+   * probe exists to prevent, reached through the probe itself.
+   *
+   * Granting `s3:ListBucket` is the better fix: missing keys then return 404 and a genuine
+   * authorization failure (rotated credentials, clock skew, a revoked policy) surfaces as an error.
+   */
+  report403AsAbsent?: boolean
+}
 
 /** S3's hard per-request limit for `DeleteObjects`; the SDK does not split a larger list. */
 const DELETE_OBJECTS_MAX_KEYS = 1000
+
+/**
+ * How many `DeleteObjects` requests a single `delete()` may have in flight. Each carries up to 1000
+ * keys, so this is already 8000 keys of work at once — well clear of the SDK's default socket pool while
+ * turning a 1000-round-trip sweep into 125.
+ */
+const DELETE_CHUNK_CONCURRENCY = 8
 
 /**
  * How many ids a batch surface (`existMultiple`, `fileInfoMultiple`) may have in flight at once. Well
@@ -89,8 +104,8 @@ const BATCH_CONCURRENCY = 32
 export async function createAwsS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, 'config' | 'logs'>,
   bucket: string,
-  /** Forwarded to {@link createS3BasedFileSystemContentStorage}; see `fileTypeLoader` there. */
-  options?: Pick<S3ContentStorageOptions, 'fileTypeLoader'>
+  /** Forwarded to {@link createS3BasedFileSystemContentStorage}; see the options documented there. */
+  options?: Pick<S3ContentStorageOptions, 'fileTypeLoader' | 'report403AsAbsent'>
 ): Promise<IContentStorageComponent> {
   const { config, logs } = components
 
@@ -98,17 +113,15 @@ export async function createAwsS3BasedFileSystemContentStorage(
     region: await config.requireString('AWS_REGION')
   })
 
-  // Keys are ids verbatim here, which is the default mapping — and the one case where `allFileIds`
-  // round-trips without an explicit inverse.
-  //
-  // Destroyed on a failed construction: this factory OWNS the client, and construction can now throw
-  // (a missing bucket, an invalid getKey/getId pair) before the `stop()` below exists to release it.
+  // Destroyed on a failed construction: this factory OWNS the client, and construction can throw (a
+  // missing or unreachable bucket) before the `stop()` below exists to release it.
   // A supervisor retrying a misconfigured deployment would otherwise leak a socket pool per attempt.
   let storage: IContentStorageComponent
   try {
     storage = await createS3BasedFileSystemContentStorage({ logs }, s3, {
       Bucket: bucket,
-      fileTypeLoader: options?.fileTypeLoader
+      fileTypeLoader: options?.fileTypeLoader,
+      report403AsAbsent: options?.report403AsAbsent
     })
   } catch (error) {
     s3.destroy()
@@ -151,13 +164,14 @@ function describeBody(body: unknown): string {
 type SendOptions = NonNullable<Parameters<S3Client['send']>[1]>
 
 /**
- * Requests the cancellation signal must NOT be attached to, keyed by command constructor name.
+ * Requests the cancellation signal must NOT be attached to, identified by command constructor name.
  *
- * - `AbortMultipartUploadCommand` is the cleanup that removes uploaded parts, and lib-storage issues
- *   it precisely when the upload was aborted; attaching the already-aborted signal would cancel the
- *   cleanup and leave the parts to accumulate.
+ * `AbortMultipartUploadCommand` is the cleanup that removes uploaded parts, and lib-storage issues it
+ * precisely when the upload was aborted; attaching the already-aborted signal would cancel the cleanup
+ * and leave the parts to accumulate.
+ *
  * `CompleteMultipartUploadCommand` is deliberately NOT exempt. Exempting it would close the
- * part-leak window described in `abortMultipartUpload` below, but at the cost of letting a cancelled
+ * part-leak window the store's own failure path closes, but at the cost of letting a cancelled
  * store run the complete request to completion — committing the object for the entire duration of
  * that request, which for a multi-GB upload is seconds to minutes, not the last-packet race the
  * cancellation contract documents. The leak is closed at the call site instead.
@@ -176,7 +190,7 @@ const UNCANCELLABLE_COMMANDS = new Set(['AbortMultipartUploadCommand'])
  * resolver, `requestHandler`, `forcePathStyle` — resolves to the real client's own values through the
  * prototype chain, with only `send` replaced.
  *
- * Two commands are deliberately EXEMPT (see `UNCANCELLABLE_COMMANDS`). They are matched by
+ * One command is deliberately EXEMPT (see `UNCANCELLABLE_COMMANDS`). It is matched by
  * constructor name rather than `instanceof` because client-s3 is a PEER dependency of lib-storage: an
  * install that hoists two copies would fail an identity check and silently break the exemption.
  *
@@ -239,22 +253,7 @@ export async function createS3BasedFileSystemContentStorage(
   options: S3ContentStorageOptions
 ): Promise<IContentStorageComponent> {
   const logger = components.logs.getLogger('s3-based-content-storage')
-  const getKey = options.getKey || ((hash: string) => hash)
   const Bucket = options.Bucket
-  // Both or neither. The type already enforces this, so only a JavaScript caller reaches it — and
-  // BOTH halves matter. Without `getId`, `allFileIds()` yields keys that do not resolve back through
-  // retrieve/exist/delete, and a delete of an enumerated id silently removes nothing because
-  // `DeleteObjects` is idempotent. Without `getKey`, the mapping is mixed: reads and writes address
-  // identity keys while enumeration decodes them, so every key fails the round-trip check below and
-  // enumeration reports an empty bucket — the silent-empty answer this component exists to avoid.
-  if (!!options.getKey !== !!options.getId) {
-    throw new Error(
-      `getKey and getId must be supplied together; received only ${options.getKey ? 'getKey' : 'getId'}. ` +
-        'They are inverses: retrieve/exist/delete map an id to a key with getKey, while allFileIds() maps a ' +
-        'listed key back with getId, and each is unusable without the other.'
-    )
-  }
-  const getId = options.getId || ((key: string) => key)
 
   // Warm the ESM loader now rather than on the first store, so a resolution problem shows up in the
   // logs before traffic arrives instead of silently degrading every object's content type.
@@ -298,18 +297,30 @@ export async function createS3BasedFileSystemContentStorage(
    * refusing to answer, and reporting it as absence is what makes a broken node look like an empty
    * one.
    *
-   * Defaults to FALSE and is only enabled on positive evidence (see `probeBucketAccess`), because the
-   * two readings are not symmetric: answering "cannot read" for content that is genuinely absent
-   * costs a retry, while answering "absent" for content that is present and unreadable is a silent
-   * data-loss report. Resolved ONCE at construction, so it costs nothing per read.
+   * CONFIGURED, never inferred (see `report403AsAbsent` in the options). The startup probe cannot tell
+   * "this principal cannot list an existing bucket" from "this bucket is not the one the policy grants"
+   * — a scoped policy denies both identically — so inferring it made a misspelled bucket name enable
+   * the lenient mode and report every id absent forever. The two readings are not symmetric: answering
+   * "cannot read" for content that is genuinely absent costs a retry, while answering "absent" for
+   * content that is present and unreadable is a silent data-loss report, so the default is the strict
+   * one and widening it is the operator's explicit choice. Read once per request from a constant, so it
+   * costs nothing.
    */
-  let report403AsAbsent = false
+  const report403AsAbsent = options.report403AsAbsent === true
   await probeBucketAccess()
 
   async function probeBucketAccess(): Promise<void> {
     try {
       await s3.send(new ListObjectsV2Command({ Bucket, MaxKeys: 1 }))
       // Listing works, so missing keys answer 404 and every 403 is a real authorization failure.
+      if (report403AsAbsent) {
+        logger.warn(
+          `report403AsAbsent is enabled, but this principal CAN s3:ListBucket on '${Bucket}', so S3 answers a ` +
+            `missing key with 404 and every 403 is a genuine authorization failure. Leaving the option on turns ` +
+            `rotated credentials, clock skew or a revoked policy into "this node holds nothing" for every id. ` +
+            `Remove it.`
+        )
+      }
       return
     } catch (error: any) {
       const statusCode = error?.$metadata?.httpStatusCode
@@ -325,35 +336,39 @@ export async function createS3BasedFileSystemContentStorage(
             `Original error: ${error?.message ?? String(error)}`
         )
       }
-      // A 403 is only evidence about `s3:ListBucket` when it is an authorization DENIAL. The
-      // credential and clock failures below are 403s too, and they say nothing about which
-      // permissions this principal holds — crediting them would switch reads into the lenient mode on
-      // a startup blip, and the node would then answer "absent" for every id for its whole lifetime.
-      // That is precisely the empty-node failure this probe exists to remove, so it must not be
-      // reachable through the probe itself.
+      // A 403 here is NOT evidence that this principal lacks `s3:ListBucket` on an existing bucket, and
+      // it used to be credited as exactly that. An IAM policy scoped to `arn:aws:s3:::my-bucket`
+      // returns 403 `AccessDenied` for any OTHER bucket — including a misspelled one — because the
+      // implicit deny is evaluated before S3 checks whether the bucket exists, so the `NoSuchBucket`
+      // branch above never fires. Crediting it turned a one-character typo into a node that answered
+      // "absent" for every id for its whole lifetime while its writes rejected loudly: the silently
+      // empty node this probe exists to prevent, produced BY the probe. The credential and clock 403s
+      // (`InvalidAccessKeyId`, `SignatureDoesNotMatch`, `RequestTimeTooSkewed`) say nothing about
+      // permissions either.
       //
-      // `ListObjectsV2` is a GET with an XML error body, so the SDK surfaces the real code here —
-      // unlike `HeadObject`, whose empty body is why the ambiguity exists in the first place.
-      if (statusCode === 403 && code === 'AccessDenied') {
-        report403AsAbsent = true
+      // So the probe no longer decides. It reports what it saw and reads stay STRICT unless the
+      // operator has said otherwise, which keeps a broken node distinguishable from an empty one.
+      if (statusCode === 403) {
         logger.warn(
-          `This principal cannot s3:ListBucket on '${Bucket}', so a 403 on a read cannot be distinguished from a ` +
-            `missing key and will be reported as absent. Grant s3:ListBucket so missing keys return 404 and a real ` +
-            `authorization failure (rotated credentials, clock skew, a revoked policy) surfaces as an error ` +
-            `instead of an empty node.`,
-          { error: error?.message ?? String(error) }
+          report403AsAbsent
+            ? `Could not verify s3:ListBucket on '${Bucket}', and report403AsAbsent is enabled: a 403 on a read ` +
+                `will be reported as absent content. If this 403 is a misspelled bucket, expired credentials or ` +
+                `clock skew rather than a missing s3:ListBucket grant, this node will report that it holds ` +
+                `NOTHING for every id. Verify the bucket name and the credentials.`
+            : `S3 returned 403 for the startup s3:ListBucket probe on '${Bucket}'. Reads stay strict, so a 403 on ` +
+                `a read will surface as an error rather than as absent content. If the bucket name is correct and ` +
+                `this principal genuinely cannot list it, grant s3:ListBucket so missing keys return 404 — or set ` +
+                `report403AsAbsent if you accept that a 403 can no longer be told apart from a missing object.`,
+          { error: error?.message ?? String(error), code: code ?? 'unknown' }
         )
         return
       }
-      // Anything else — a credential or clock 403, a network blip, a throttle — says nothing about
-      // permissions and must not stop a component whose reads and writes would surface the same fault
-      // themselves. Reads stay STRICT: an unverified 403 rejects, which is the answer that keeps a
-      // broken node distinguishable from an empty one.
+      // A network blip or a throttle says nothing about permissions and must not stop a component
+      // whose reads and writes would surface the same fault themselves.
       logger.warn(
-        `Could not verify s3:ListBucket on '${Bucket}'; a 403 on a read will be surfaced as an error rather than ` +
-          `reported as absence. If this principal genuinely lacks s3:ListBucket, grant it so missing keys return ` +
-          `404, or restart once the underlying problem is resolved.`,
-        { error: error?.message ?? String(error) }
+        `Could not verify s3:ListBucket on '${Bucket}'; the probe failed for a reason unrelated to permissions. ` +
+          `Reads follow the configured report403AsAbsent setting (${report403AsAbsent}).`,
+        { error: error?.message ?? String(error), code: code ?? 'unknown' }
       )
     }
   }
@@ -375,17 +390,17 @@ export async function createS3BasedFileSystemContentStorage(
     const statusCode = error?.$metadata?.httpStatusCode
     const code = error?.name
     if (code === 'NotFound' || code === 'NoSuchKey' || statusCode === 404) return true
-    // 403 is "absent" ONLY while this principal's read of a missing key is genuinely indistinguishable
-    // from a denial — see `canListBucket`. Once the startup probe has proven `s3:ListBucket`, S3
-    // answers a missing key with 404, so every remaining 403 is a real authorization failure
-    // (`InvalidAccessKeyId`, `SignatureDoesNotMatch`, `RequestTimeTooSkewed`, a revoked policy) and
-    // must REJECT. Reporting those as absent made a node whose key had been rotated, or whose clock
-    // had drifted, answer "I hold nothing" for every id — while its writes rejected loudly.
+    // 403 is "absent" only when the operator has said this principal cannot `s3:ListBucket` — see
+    // `report403AsAbsent`. Otherwise S3 answers a missing key with 404, so a 403 is a real
+    // authorization failure (`InvalidAccessKeyId`, `SignatureDoesNotMatch`, `RequestTimeTooSkewed`, a
+    // revoked policy) and must REJECT. Reporting those as absent made a node whose key had been
+    // rotated, or whose clock had drifted, answer "I hold nothing" for every id — while its writes
+    // rejected loudly.
     return statusCode === 403 && report403AsAbsent
   }
 
   function logContextFor(id: string, error: any): Record<string, string | number> {
-    const context: Record<string, string | number> = { key: getKey(id) }
+    const context: Record<string, string | number> = { key: id }
     if (error?.name) context.code = error.name
     if (error?.$metadata?.httpStatusCode) context.statusCode = error.$metadata.httpStatusCode
     return context
@@ -395,9 +410,10 @@ export async function createS3BasedFileSystemContentStorage(
   function warnIfForbidden(operation: string, id: string, error: any): void {
     if (error?.$metadata?.httpStatusCode !== 403) return
     logger.warn(
-      `S3 returned 403 Forbidden while ${operation}; reporting the content as not found. If the object is simply ` +
-        `missing, grant the principal s3:ListBucket so missing keys return 404; otherwise check the object/bucket ` +
-        `permissions.`,
+      `S3 returned 403 Forbidden while ${operation}; reporting the content as not found because report403AsAbsent ` +
+        `is enabled. If the object is simply missing, grant the principal s3:ListBucket so missing keys return 404 ` +
+        `and this option can be removed; otherwise check the bucket name, the credentials and the object/bucket ` +
+        `permissions — this node is reporting content as absent that it may simply be unable to read.`,
       logContextFor(id, error)
     )
   }
@@ -411,7 +427,7 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function exist(id: string): Promise<boolean> {
     try {
-      await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
+      await s3.send(new HeadObjectCommand({ Bucket, Key: id }))
       // A HeadObject that succeeds IS the existence answer. Requiring an ETag on top of it is
       // stricter than the contract and reports a present object as absent on any S3-compatible
       // implementation that omits the header.
@@ -438,9 +454,9 @@ export async function createS3BasedFileSystemContentStorage(
     // Set only when WE abort the upload. `Upload.done()` races the upload against an abort watcher
     // that rejects with lib-storage's own `AbortError` as soon as abort() fires, so every rejection
     // after our teardown carries that shape — including one that would otherwise have been a real
-    // S3 failure, which the SDK discards above this layer and we therefore cannot recover.
-    // a shape the shared translator deliberately refuses to credit (a transport can raise one for
-    // its own reasons). Tracking our own teardown here is the provenance that lets this call site
+    // S3 failure, which the SDK discards above this layer and we therefore cannot recover. It is also
+    // a shape the shared translator deliberately refuses to credit (a transport can raise one for its
+    // own reasons). Tracking our own teardown here is the provenance that lets this call site
     // attribute the rejection, the same way the compression pipeline attributes its own.
     let abortedUpload = false
     const abortUpload = (): void => {
@@ -478,23 +494,16 @@ export async function createS3BasedFileSystemContentStorage(
         // releases it. `peekHead` has already pulled up to the detection window by then, and its
         // body generator has not started — `Readable.from` does not pull until first read — so its
         // own `iterator.return()` cleanup never runs and the source's descriptor would be held for
-        // the life of the process. The reachable throw here is a caller-supplied `getKey`, evaluated
-        // inside the params literal below.
+        // the life of the process.
         try {
           await uploadTo(id, stream, signal)
         } catch (error) {
           // Release the source stream if the upload stopped consuming the body (e.g. it failed
           // before reading anything, so peekHead's generator never started and can't self-clean).
           // Destroying the source releases its underlying resources (e.g. file descriptors).
-          // No-op if already ended/destroyed. Guarded so a custom stream whose destroy() throws
-          // cannot replace the upload error the caller needs to see. The listener is attached first:
-          // a stream torn down mid-open still emits 'error' afterwards.
-          try {
-            stream.on('error', ignoreStreamError)
-            stream.destroy()
-          } catch {
-            // best-effort cleanup; the upload error below is what matters
-          }
+          // No-op if already ended/destroyed, and guarded so a custom stream whose destroy() throws
+          // cannot replace the upload error the caller needs to see.
+          destroyQuietly(stream)
           // Remove any parts this upload left behind. lib-storage issues its own
           // `AbortMultipartUpload` only on the paths that run BEFORE `CompleteMultipartUpload`, so a
           // complete request that was cancelled or failed leaves every uploaded part in the bucket —
@@ -504,13 +513,29 @@ export async function createS3BasedFileSystemContentStorage(
           // replace the error the caller needs to see.
           if (multipartUploadId) {
             try {
-              await s3.send(new AbortMultipartUploadCommand({ Bucket, Key: getKey(id), UploadId: multipartUploadId }))
+              await s3.send(new AbortMultipartUploadCommand({ Bucket, Key: id, UploadId: multipartUploadId }))
             } catch (cleanupError: any) {
-              logger.warn(`Could not abort the multipart upload of ${id}; its parts may persist in the bucket`, {
-                key: getKey(id),
-                uploadId: multipartUploadId,
-                error: cleanupError?.message ?? String(cleanupError)
-              })
+              // `NoSuchUpload` (or a 404) means there is nothing left to abort — lib-storage already
+              // aborted it on every path that runs BEFORE `CompleteMultipartUpload`, which is the
+              // ordinary `UploadPart` failure (a 503 SlowDown). Reporting that as "its parts may
+              // persist in the bucket" told operators to hunt a part leak that does not exist, on the
+              // most common failure of all. Only a cleanup that genuinely could not run is worth a
+              // warning; the window this call exists for is the cancelled-or-failed COMPLETE request,
+              // which lib-storage does not clean up.
+              const cleanupCode = cleanupError?.name
+              const cleanupStatus = cleanupError?.$metadata?.httpStatusCode
+              if (cleanupCode === 'NoSuchUpload' || cleanupStatus === 404) {
+                logger.debug(`The multipart upload of ${id} was already aborted; no parts remain`, {
+                  key: id,
+                  uploadId: multipartUploadId
+                })
+              } else {
+                logger.warn(`Could not abort the multipart upload of ${id}; its parts may persist in the bucket`, {
+                  key: id,
+                  uploadId: multipartUploadId,
+                  error: cleanupError?.message ?? String(cleanupError)
+                })
+              }
             }
           }
           // We aborted this upload, so its AbortError is provably our teardown: report the caller's
@@ -528,6 +553,11 @@ export async function createS3BasedFileSystemContentStorage(
     )
 
     async function uploadTo(id: string, stream: Readable, signal: AbortSignal | undefined): Promise<void> {
+      // A source that cannot supply content is refused, not uploaded: `peekHead` sees an immediate
+      // `{done: true}` from an already-consumed stream and reports "no content", so this stored a
+      // 0-byte object under the id and resolved. Same rule the folder-based and in-memory backends
+      // apply — see `assertStorableStream`.
+      assertStorableStream(stream)
       // Inspect only the head for MIME detection, then stream the body straight to S3 so large
       // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
       // upload, buffering only part-sized chunks rather than the whole file.
@@ -546,18 +576,15 @@ export async function createS3BasedFileSystemContentStorage(
         abortController: uploadAbort,
         params: {
           Bucket,
-          Key: getKey(id),
+          Key: id,
           Body: body,
           ContentType: mimeType
         }
       })
-      // Re-checked because `getKey` above is CALLER-supplied code evaluated inside the params
-      // literal, i.e. after the checkpoint and before `upload` is assigned. A `getKey` that aborts
-      // the signal lands while the abort listener still sees `upload === undefined` and so tears
-      // nothing down, leaving an already-cancelled store to run to completion and commit. Nothing
-      // else in this gap can move the signal — the constructor and `done()`'s prologue are
-      // synchronous — but the caller's own callback can, so the upload is torn down here, where it
-      // provably exists.
+      // Re-checked because the abort listener tears down `upload`, and `upload` was undefined for the
+      // whole of the two awaits above — so a signal that fired during them found nothing to tear down.
+      // The constructor and `done()`'s prologue are synchronous, so this is the first point at which
+      // the upload provably exists and can be cancelled.
       if (signal?.aborted) {
         abortUpload()
         signal.throwIfAborted()
@@ -569,7 +596,7 @@ export async function createS3BasedFileSystemContentStorage(
   async function retrieve(id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
     if (range) validateRange(range)
     try {
-      const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
+      const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: id }))
 
       const size = obj.ContentLength ?? null
       const encoding = obj.ContentEncoding || null
@@ -590,7 +617,7 @@ export async function createS3BasedFileSystemContentStorage(
       // object an operator tagged `Content-Encoding: identity` permanently un-rangeable.
       if (range && contentCodingOf(encoding) !== null) {
         throw new RangeNotSupportedError(
-          `Cannot serve a range of ${getKey(id)}: it is stored with Content-Encoding '${encoding}', and S3 ranges ` +
+          `Cannot serve a range of ${id}: it is stored with Content-Encoding '${encoding}', and S3 ranges ` +
             `address the compressed bytes. Read it whole with retrieve(id) and slice the decoded stream, or store ` +
             `it unencoded.`
         )
@@ -604,7 +631,7 @@ export async function createS3BasedFileSystemContentStorage(
           const output = await s3.send(
             new GetObjectCommand({
               Bucket,
-              Key: getKey(id),
+              Key: id,
               Range: range ? `bytes=${range.start}-${clampedEnd ?? range.end}` : undefined
             })
           )
@@ -616,7 +643,7 @@ export async function createS3BasedFileSystemContentStorage(
           const body = output.Body
           if (!isReadable(body)) {
             throw new Error(
-              `S3 returned no readable body for ${getKey(id)}; received ${describeBody(body)}. This storage ` +
+              `S3 returned no readable body for ${id}; received ${describeBody(body)}. This storage ` +
                 `requires a Node-style stream body — check that the client is an @aws-sdk/client-s3 S3Client ` +
                 `running on Node.`
             )
@@ -657,16 +684,23 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function deleteFn(ids: string[]): Promise<void> {
     // S3 caps DeleteObjects at DELETE_OBJECTS_MAX_KEYS keys per request and the SDK does not split
-    // the list, so a larger batch was rejected outright as MalformedXML. An EMPTY list is rejected
-    // the same way, and simply never enters the loop — matching the other backends, where deleting
-    // nothing is a no-op rather than an error.
+    // the list, so a larger batch was rejected outright as MalformedXML. An EMPTY list produces no
+    // chunks at all — matching the other backends, where deleting nothing is a no-op rather than the
+    // MalformedXML an empty request would return.
+    const chunks: string[][] = []
     for (let from = 0; from < ids.length; from += DELETE_OBJECTS_MAX_KEYS) {
-      const batch = ids.slice(from, from + DELETE_OBJECTS_MAX_KEYS)
+      chunks.push(ids.slice(from, from + DELETE_OBJECTS_MAX_KEYS))
+    }
+    // Issued concurrently rather than one after another: the chunks share no state, and serializing
+    // them made a million-id GC sweep 1000 sequential round trips — minutes of pure latency for work
+    // that parallelizes perfectly. The folder-based backend already bounds its equivalent loop the
+    // same way. `forEachWithConcurrency` starts no new chunk after the first failure.
+    await forEachWithConcurrency(chunks, DELETE_CHUNK_CONCURRENCY, async (batch) => {
       const output = await s3.send(
         new DeleteObjectsCommand({
           Bucket,
           Delete: {
-            Objects: batch.map(($) => ({ Key: getKey($) })),
+            Objects: batch.map(($) => ({ Key: $ })),
             // Only `Errors` is read below, and quiet mode still returns those in full. Without it S3
             // echoes a <Deleted> element for every key — 1000 per request — all parsed out of XML and
             // discarded.
@@ -684,18 +718,19 @@ export async function createS3BasedFileSystemContentStorage(
           .slice(0, 5)
           .map((each) => `${each.Key} (${each.Code ?? 'unknown'})`)
           .join(', ')
-        // Names the CALLER's scope, not this chunk's. The request may span many chunks: earlier ones
-        // are already deleted and later ones are never attempted, so a message counting only this
-        // batch left callers unable to tell what remains. `delete` is idempotent, so retrying the
-        // whole list is safe and is the intended recovery.
+        // Names the CALLER's scope, not this chunk's, and deliberately claims NOTHING about which
+        // other keys were removed. The chunks are issued concurrently, so an earlier index is not
+        // necessarily done and a later one is not necessarily untouched — the previous wording said
+        // exactly that, and keeping it after parallelising the loop would have made the library lie
+        // about its own state. `delete` is idempotent, so retrying the whole list is the recovery.
         throw new Error(
-          `Failed to delete ${errors.length} object(s) from S3 while deleting ${ids.length} requested ` +
-            `(failing in the chunk starting at index ${from}; objects before it are already deleted and ` +
-            `objects after it were not attempted): ${shown}` +
+          `Failed to delete ${errors.length} object(s) from S3 while deleting ${ids.length} requested. ` +
+            `Chunks are issued concurrently, so the remaining keys may be partially deleted; delete is ` +
+            `idempotent, so retry the whole list. Failures: ${shown}` +
             (errors.length > 5 ? ', …' : '')
         )
       }
-    }
+    })
   }
 
   async function existMultiple(cids: string[]): Promise<Map<string, boolean>> {
@@ -708,94 +743,42 @@ export async function createS3BasedFileSystemContentStorage(
   }
 
   /**
-   * Walks the bucket yielding stored IDS, not keys.
+   * Walks the bucket yielding stored ids.
    *
-   * `prefix` filters IDS, matching the folder-based contract. It is pushed to S3 as a server-side
-   * `Prefix` only for the DEFAULT identity mapping, where an id prefix provably is a key prefix.
-   * `getKey` maps a complete id to a key, so applying it to a partial one is a category error: under
-   * a sharding mapping it yields a prefix no real key starts with, and every prefixed enumeration
-   * came back empty. A custom mapping therefore lists unprefixed and filters on the id here.
-   *
-   * Only keys the mapping round-trips are yielded — see the loop below.
+   * An id IS its key, so enumeration round-trips by construction and `prefix` is pushed down to S3 as a
+   * server-side `Prefix` — the whole listing never crosses the wire just to be filtered locally.
    */
   async function* allFileIds(prefix?: string): AsyncIterable<string> {
     const params: ListObjectsV2CommandInput = {
       Bucket,
-      ContinuationToken: undefined
+      ContinuationToken: undefined,
+      Prefix: prefix
     }
-
-    // Server-side filtering ONLY for the identity mapping, where an id prefix provably is a key
-    // prefix. `getKey` maps a COMPLETE id to a key, so handing it a partial one is a category error:
-    // with a sharding mapping like `h => h.slice(0,4) + '/' + h`, `getKey('ab')` produced a Prefix no
-    // real key starts with, S3 returned nothing, and a prefix-sharded GC sweep concluded the bucket
-    // was empty. A local re-filter cannot repair that — it can only narrow what the server returned.
-    if (prefix && !options.getKey) {
-      params.Prefix = prefix
-    }
-
-    // Warned about once per enumeration rather than per key: a foreign bucket would otherwise emit a
-    // line per object, and one is enough to act on.
-    let warnedAboutForeignKeys = false
 
     let output: ListObjectsV2CommandOutput
     do {
       output = await s3.send(new ListObjectsV2Command(params))
       if (output.Contents) {
         for (const content of output.Contents) {
-          const key = content.Key!
-          let id: string | undefined
-          let notOwnedBecause: string | undefined
-          try {
-            const candidate = getId(key)
-            const roundTripped = getKey(candidate)
-            if (roundTripped === key) id = candidate
-            else notOwnedBecause = `round-tripped to ${roundTripped}`
-          } catch (error: any) {
-            // A strict inverse that parses its own namespace THROWS on a key from outside it, which
-            // is a clear "not mine" rather than a fault. Letting it propagate would fail the entire
-            // enumeration over one object this storage does not own — turning a shared bucket into
-            // an unenumerable one. `getKey` is caller code too, so it is inside the same guard.
-            notOwnedBecause = `mapping threw: ${error?.message ?? String(error)}`
-          }
-          // ROUND TRIP, not just an inverse call. `getId` is applied to every key the bucket returns,
-          // including ones this mapping never produced — and a lossy inverse maps those onto ids that
-          // look real. With `getKey: h => h.slice(0,4) + '/' + h`, a foreign `zz/abcdef` yields the id
-          // `abcdef`, whose actual key is `ab/abcdef`: enumeration reported that id TWICE, and a GC
-          // sweep that deleted what it enumerated destroyed the real object while leaving the foreign
-          // one untouched. Requiring `getKey(id) === key` is the same invariant the folder-based
-          // backend enforces on its paths, and it makes storing and enumerating provably inverse.
-          //
-          // Filtering rather than yielding is the safe direction: a key that does not round-trip is
-          // already unreachable through `retrieve`/`delete`, which would compute a different key for
-          // that id, so nothing reachable is being hidden.
-          if (id === undefined) {
-            if (!warnedAboutForeignKeys) {
-              warnedAboutForeignKeys = true
-              logger.warn(
-                `Skipping bucket keys that this storage's getKey/getId mapping does not round-trip; they are not ` +
-                  `ids of content it owns. Enumerating them would report phantom ids, and a caller deleting what ` +
-                  `it enumerated could remove real content stored under a different key.`,
-                { key, reason: notOwnedBecause ?? 'unknown' }
-              )
-            }
-            continue
-          }
-          // Always re-checked against the ID. For a custom mapping this is the ONLY prefix filter,
-          // since the request above was unprefixed; for the identity mapping it is a cheap
-          // confirmation.
-          if (prefix && !id.startsWith(prefix)) continue
-          yield id
+          yield content.Key!
         }
       }
       params.ContinuationToken = output.NextContinuationToken
-      // A truncated page with no continuation token would otherwise re-request the FIRST page
-      // forever, yielding the same keys on every pass.
-    } while (output.IsTruncated && params.ContinuationToken)
+      // Continue on any continuation token unless the server explicitly said this page was the last.
+      //
+      // Both halves matter, in opposite directions. Requiring a TOKEN stops the infinite loop a
+      // truncated page without one would cause, re-requesting the first page forever and yielding the
+      // same keys on every pass. But requiring `IsTruncated` to be TRUE silently truncated the
+      // enumeration on an S3-compatible endpoint (MinIO, Ceph, a gateway) that returns
+      // `NextContinuationToken` and omits `IsTruncated`: exactly one page was listed and the iterator
+      // ended normally, so a GC or sync sweep concluded the bucket held only its first 1000 keys.
+      // AWS S3 itself always sets the flag, so `!== false` costs nothing there.
+    } while (params.ContinuationToken && output.IsTruncated !== false)
   }
 
   async function fileInfo(id: string): Promise<FileInfo | undefined> {
     try {
-      const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
+      const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: id }))
       const size = obj.ContentLength ?? null
       const encoding = obj.ContentEncoding || null
       // Normalized exactly as `retrieve` normalizes it, so the two surfaces never disagree about one

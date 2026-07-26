@@ -18,7 +18,34 @@ export async function mapWithConcurrency<T, R>(
   limit: number,
   fn: (item: T, index: number) => Promise<R>
 ): Promise<R[]> {
-  const results = new Array<R>(items.length)
+  return runWithConcurrency(items, limit, fn, true) as Promise<R[]>
+}
+
+/**
+ * `mapWithConcurrency` for callers that discard the results, with identical concurrency and failure
+ * semantics.
+ *
+ * Exists because the results array is not free at bulk sizes: `delete()` over a million ids allocated
+ * an 8MB array of `undefined`s that nothing ever read, and the ids a GC sweep deletes are exactly the
+ * scale that reaches for this helper.
+ *
+ * @public
+ */
+export async function forEachWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<unknown>
+): Promise<void> {
+  await runWithConcurrency(items, limit, fn, false)
+}
+
+async function runWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+  collectResults: boolean
+): Promise<R[] | void> {
+  const results = collectResults ? new Array<R>(items.length) : undefined
   let next = 0
   let failure: unknown
   let failed = false
@@ -27,7 +54,8 @@ export async function mapWithConcurrency<T, R>(
     while (next < items.length && !failed) {
       const index = next++
       try {
-        results[index] = await fn(items[index], index)
+        const result = await fn(items[index], index)
+        if (results) results[index] = result
       } catch (error) {
         // Keep the FIRST failure: it is the one that best explains why the batch stopped, and later
         // ones are frequently just the same fault observed again.

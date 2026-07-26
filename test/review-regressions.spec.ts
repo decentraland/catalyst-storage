@@ -6,18 +6,18 @@ import { Readable, Writable } from 'stream'
 import { gzipSync } from 'zlib'
 import { createLogComponent } from '@well-known-components/logger'
 import {
-  assertAddressableContentId,
   bufferToStream,
   createFolderBasedFileSystemContentStorage,
   createFsComponent,
   createInMemoryStorage,
   IContentStorageComponent,
   IFileSystemComponent,
-  mapWithConcurrency,
-  PathNotContainedError,
   SimpleContentItem,
   streamToBuffer
 } from '../src'
+import { mapWithConcurrency } from '../src/concurrency'
+import { assertAddressableContentId } from '../src/content-id'
+import { PathNotContainedError } from '../src/folder-based/errors'
 import { intentNameFor } from './file-system-utils'
 import { createDecompressCache } from '../src/folder-based/decompress-cache'
 
@@ -374,56 +374,6 @@ describe('folder-based review regressions', () => {
     })
   })
 
-  describe('when a range is requested on gzip-only content without rename support', () => {
-    let noRename: IContentStorageComponent
-    let payload: Buffer
-
-    beforeEach(async () => {
-      // Without rename there is nowhere to publish a decompressed copy atomically, so the inflation
-      // used to stream straight onto the canonical path — where a concurrent reader could stat the
-      // half-written file and be served truncated bytes as valid content.
-      root = mkdtempSync(path.join(os.tmpdir(), 'no-rename-range-'))
-      payload = Buffer.from(Array.from({ length: 5000 }, (_, index) => String.fromCharCode(97 + (index % 26))).join(''))
-      const base = realFs()
-      const withoutRename = { ...base }
-      delete (withoutRename as { rename?: unknown }).rename
-      const shard = shardOf(root)
-      await nodeFs.mkdir(shard, { recursive: true })
-      await nodeFs.writeFile(path.join(shard, `${id}.gzip`), gzipSync(payload))
-      noRename = await createFolderBasedFileSystemContentStorage(
-        { fs: withoutRename as IFileSystemComponent, logs: await logs() },
-        root
-      )
-      storage = noRename
-    })
-
-    it('should serve exactly the requested slice of the decompressed content', async () => {
-      const item = await noRename.retrieve(id, { start: 100, end: 199 })
-
-      expect((await streamToBuffer(await item!.asStream())).equals(payload.subarray(100, 200))).toBe(true)
-    })
-
-    it('should report an unknown length rather than one derived from the gzip trailer', async () => {
-      // The trailer is stored, attacker-controlled data that is only accurate mod 2^32 and describes
-      // just the last member of a multi-member gzip, so it must not bound a read.
-      const item = await noRename.retrieve(id, { start: 100, end: 199 })
-
-      expect(item!.size).toBeNull()
-    })
-
-    it('should not publish a decompressed copy at the canonical path', async () => {
-      await noRename.retrieve(id, { start: 0, end: 9 })
-
-      expect(await realFs().existPath(path.join(shardOf(root), id))).toBe(false)
-    })
-
-    it('should clamp a range that runs past the end of the content', async () => {
-      const item = await noRename.retrieve(id, { start: 4990, end: 99999 })
-
-      expect((await streamToBuffer(await item!.asStream())).equals(payload.subarray(4990))).toBe(true)
-    })
-  })
-
   describe('when many ids are deleted at once', () => {
     let ids: string[]
 
@@ -562,103 +512,6 @@ describe('review regressions: remaining branches', () => {
 
     it('should destroy the caller source rather than leak it', () => {
       expect(source.destroyed).toBe(true)
-    })
-  })
-
-  describe('when a legacy in-place store cannot remove the previous gzip and cannot roll back', () => {
-    let root: string
-    let storage: IContentStorageComponent
-    let failure: unknown
-
-    beforeEach(async () => {
-      // The old rollback was unverified and unconditional: it claimed "rolled back" while the raw
-      // survived, and — when the gzip removal had already succeeded and only its verification threw —
-      // it removed the raw too, destroying both representations.
-      root = mkdtempSync(path.join(os.tmpdir(), 'inplace-rollback-'))
-      const base = createFsComponent()
-      const noRename: IFileSystemComponent = {
-        ...base,
-        unlink: (async (_target: any) => {
-          // Neither the gzip nor the rollback of the raw can be removed.
-          throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
-        }) as IFileSystemComponent['unlink']
-      }
-      delete (noRename as { rename?: unknown }).rename
-      storage = await createFolderBasedFileSystemContentStorage(
-        { fs: noRename, logs: await createLogComponent({}) },
-        root
-      )
-      const shard = path.join(root, '9584')
-      await nodeFs.mkdir(shard, { recursive: true })
-      await nodeFs.writeFile(path.join(shard, 'some-id.gzip'), gzipSync(Buffer.from('previous version')))
-
-      failure = await storage.storeStream('some-id', bufferToStream(Buffer.from('new content'))).then(
-        () => undefined,
-        (error: unknown) => error
-      )
-    })
-
-    afterEach(async () => {
-      await storage.stop?.()
-      rmSync(root, { recursive: true, force: true })
-    })
-
-    it('should report that both representations are on disk instead of claiming a rollback', () => {
-      expect((failure as Error).message).toMatch(/both its previous gzip and the newly written raw/)
-    })
-  })
-
-  describe('when a legacy in-place store cannot verify whether the previous gzip survived', () => {
-    let root: string
-    let storage: IContentStorageComponent
-    let failure: unknown
-
-    beforeEach(async () => {
-      // The gzip unlink SUCCEEDS and only its verification throws: removing the raw as well would
-      // leave the id with no representation at all.
-      root = mkdtempSync(path.join(os.tmpdir(), 'inplace-kept-raw-'))
-      const base = createFsComponent()
-      let statShouldFail = false
-      const noRename: IFileSystemComponent = {
-        ...base,
-        stat: (async (target: any, ...rest: any[]) => {
-          if (statShouldFail && String(target).endsWith('.gzip')) {
-            throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' })
-          }
-          return (base.stat as any)(target, ...rest)
-        }) as IFileSystemComponent['stat'],
-        unlink: (async (target: any) => {
-          const result = await base.unlink(target)
-          if (String(target).endsWith('.gzip')) statShouldFail = true
-          return result
-        }) as IFileSystemComponent['unlink']
-      }
-      delete (noRename as { rename?: unknown }).rename
-      storage = await createFolderBasedFileSystemContentStorage(
-        { fs: noRename, logs: await createLogComponent({}) },
-        root
-      )
-      const shard = path.join(root, '9584')
-      await nodeFs.mkdir(shard, { recursive: true })
-      await nodeFs.writeFile(path.join(shard, 'some-id.gzip'), gzipSync(Buffer.from('previous version')))
-
-      failure = await storage.storeStream('some-id', bufferToStream(Buffer.from('new content'))).then(
-        () => undefined,
-        (error: unknown) => error
-      )
-    })
-
-    afterEach(async () => {
-      await storage.stop?.()
-      rmSync(root, { recursive: true, force: true })
-    })
-
-    it('should report that the gzip state could not be determined instead of guessing', () => {
-      expect((failure as Error).message).toMatch(/could not determine whether its previous gzip/)
-    })
-
-    it('should leave the newly written raw on disk', async () => {
-      expect(await createFsComponent().existPath(path.join(root, '9584', 'some-id'))).toBe(true)
     })
   })
 
@@ -929,47 +782,6 @@ describe('when a root carries an intent journal written by a pre-sha256 version'
   })
 })
 
-describe('when a legacy-mode range spans many chunks of the inflated stream', () => {
-  let root: string
-  let storage: IContentStorageComponent
-  let payload: Buffer
-
-  beforeEach(async () => {
-    // A payload far larger than one stream chunk, so the slice transform's "entirely before" and
-    // "entirely after" branches are actually taken rather than the whole body arriving at once.
-    root = mkdtempSync(path.join(os.tmpdir(), 'multi-chunk-range-'))
-    payload = Buffer.alloc(600_000)
-    for (let index = 0; index < payload.length; index++) payload[index] = index % 251
-    const base = createFsComponent()
-    const withoutRename = { ...base }
-    delete (withoutRename as { rename?: unknown }).rename
-    const shard = path.join(root, '9584')
-    await nodeFs.mkdir(shard, { recursive: true })
-    await nodeFs.writeFile(path.join(shard, 'some-id.gzip'), gzipSync(payload))
-    storage = await createFolderBasedFileSystemContentStorage(
-      { fs: withoutRename as IFileSystemComponent, logs: await createLogComponent({}) },
-      root
-    )
-  })
-
-  afterEach(async () => {
-    await storage.stop?.()
-    rmSync(root, { recursive: true, force: true })
-  })
-
-  it('should serve exactly the requested bytes from the middle of the content', async () => {
-    const item = await storage.retrieve('some-id', { start: 300_000, end: 300_099 })
-
-    expect((await streamToBuffer(await item!.asStream())).equals(payload.subarray(300_000, 300_100))).toBe(true)
-  })
-
-  it('should serve a range that starts inside one chunk and ends inside a later one', async () => {
-    const item = await storage.retrieve('some-id', { start: 65_000, end: 200_000 })
-
-    expect((await streamToBuffer(await item!.asStream())).equals(payload.subarray(65_000, 200_001))).toBe(true)
-  })
-})
-
 describe('when the staging directory is healed in flat mode', () => {
   let root: string
   let storage: IContentStorageComponent
@@ -1072,6 +884,13 @@ describe('when enumerating a directory through allFileIds', () => {
       // Directory order must not decide the answer: the raw is reached before its `.gzip` is seen,
       // and both are one id.
       const root = mkdtempSync(path.join(os.tmpdir(), 'sibling-order-'))
+      // Both representations are written for real, so the forced listing DESCRIBES the directory
+      // rather than contradicting it. The skip is confirmed against the filesystem (a `gzipNames`
+      // entry from the first pass can be stale by the second), so a listing announcing a `.gzip` that
+      // was never created is not the state this test means to pin — it is the id-hiding bug the
+      // confirmation exists to catch.
+      await nodeFs.writeFile(path.join(root, 'some-id'), 'the decompressed cache')
+      await nodeFs.writeFile(path.join(root, 'some-id.gzip'), gzipSync(Buffer.from('the content')))
       const base = createFsComponent()
       const ordered: IFileSystemComponent = {
         ...base,

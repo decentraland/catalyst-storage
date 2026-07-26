@@ -8,14 +8,14 @@ import * as fsPromises from 'fs/promises'
  */
 export type IFileSystemComponent = Pick<typeof fs, 'createReadStream'> &
   Pick<typeof fs, 'createWriteStream'> &
-  Pick<typeof fsPromises, 'opendir' | 'stat' | 'unlink' | 'mkdir' | 'readdir' | 'readFile'> & {
+  Pick<typeof fsPromises, 'opendir' | 'stat' | 'unlink' | 'rename' | 'mkdir' | 'readdir' | 'readFile'> & {
     existPath(path: string): Promise<boolean>
-    // Optional so adding it is not a breaking change for existing IFileSystemComponent implementers.
-    // When present, storeStream writes atomically (temp file + rename); when absent it falls back to a
-    // direct write. The bundled createFsComponent always provides it.
-    rename?: typeof fsPromises.rename
-    // Optional for the same compatibility reason. When present, the folder-based storage rejects a
-    // symlinked reserved temp path at construction (stat follows symlinks, so staged writes and the
-    // sweep would otherwise operate outside the root). The bundled createFsComponent provides it.
+    /**
+     * Optional. When present, the folder-based storage rejects a symlinked reserved temp path at
+     * construction (`stat` follows symlinks, so staged writes and the sweep would otherwise operate
+     * outside the root), and measures a link rather than its target when sizing a compression. The
+     * bundled `createFsComponent` provides it; without it those two checks degrade to the documented
+     * weaker guarantee, which is why it stays optional where `rename` does not.
+     */
     lstat?: typeof fsPromises.lstat
   }

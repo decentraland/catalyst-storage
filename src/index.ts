@@ -1,22 +1,37 @@
-export * from './s3-based-storage-component'
-export * from './folder-based-storage-component'
-export * from './types'
-export * from './fs/fs-component'
-export * from './fs/types'
-export * from './in-memory-storage-component'
-export * from './content-item'
-// `compressContentFile` is documented as callable on its own, and marked @public, but was reachable
-// only through a deep import into dist/ because the entry point never re-exported it.
-export * from './extras/compression'
-// The read contract asks callers to tell a non-containable id from a storage fault; without these
-// exported the only way to do that was to match on an error message.
-export * from './folder-based/errors'
-// The id-shape rules every backend enforces, so callers can validate an id before it reaches storage
-// rather than discovering the difference between backends in production.
-export * from './content-id'
-// Batch surfaces bound their own concurrency; exported so callers mapping their own id lists can
-// reuse the same bounded fan-out instead of reaching for `Promise.all`.
-export * from './concurrency'
-// `FileTypeLoader` is part of the S3 options surface, and `peekHead`/`detectMimeTypeFromBuffer` are
-// documented as usable on their own.
-export * from './mime-detection'
+/**
+ * The public surface of this package.
+ *
+ * Listed EXPLICITLY rather than re-exported wholesale. Wildcard re-exports made every helper a module
+ * happened to export public by accident — the MIME detector's ESM loader memo, the id validators, the
+ * bounded-map helper, the stream-teardown utilities, the internal error classes — none of which any
+ * consumer imports, and each of which is something this package would then have to keep working
+ * forever. What stays is what the four factories genuinely need a caller to be able to name.
+ *
+ * Everything withdrawn still exists and is still used internally; it is simply no longer contract.
+ * Paired with the `exports` map in package.json, which stops `dist/*` paths from being importable, so
+ * this list is now the whole of what a consumer can reach.
+ */
+
+// The four backends and the filesystem adapter they take.
+export { createFolderBasedFileSystemContentStorage } from './folder-based-storage-component'
+export type { FolderStorageOptions } from './folder-based-storage-component'
+export {
+  createAwsS3BasedFileSystemContentStorage,
+  createS3BasedFileSystemContentStorage
+} from './s3-based-storage-component'
+export type { S3ContentStorageOptions } from './s3-based-storage-component'
+export { createInMemoryStorage } from './in-memory-storage-component'
+export { createFsComponent } from './fs/fs-component'
+export type { IFileSystemComponent } from './fs/types'
+
+// The component contract every backend implements, and the shapes it hands back.
+export type { AppComponents, ContentItem, FileInfo, IContentStorageComponent } from './types'
+
+// Stream helpers: a caller has to be able to build a source for `storeStream` and drain what
+// `retrieve` returns, and `SimpleContentItem` is how a consumer implementing its own storage produces
+// a conforming `ContentItem`.
+export { bufferToStream, SimpleContentItem, streamToBuffer } from './content-item'
+
+// Names the injectable detector in `S3ContentStorageOptions`, so that option is usable from a typed
+// callback rather than only from an inline literal.
+export type { FileTypeLoader } from './mime-detection'

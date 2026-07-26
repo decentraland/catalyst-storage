@@ -11,8 +11,8 @@ export type FsInvariants = {
    * Existence check for recovery invariants. `existPath()` tests F_OK|R_OK, so a file left behind by
    * a failed unlink in an UNREADABLE state (mode/ACL damage, transient permission problem) would
    * read as absent — letting a must-succeed cleanup be falsely considered complete, and the mixed
-   * state resurface later with no repair signal. Here only ENOENT/ENOTDIR mean absent; any other
-   * error fails the repair/commit path loudly.
+   * state resurface later with no repair signal. Here only ENOENT/ENOTDIR/ENAMETOOLONG mean absent;
+   * any other error fails the repair/commit path loudly.
    */
   existsForInvariant(target: string): Promise<boolean>
   /**
@@ -29,7 +29,13 @@ export function createFsInvariants(fs: IFileSystemComponent): FsInvariants {
         await fs.stat(target)
         return true
       } catch (err: any) {
-        if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return false
+        // ENAMETOOLONG belongs with ENOENT/ENOTDIR: no file of that name CAN exist, so it is provably
+        // absent rather than a storage fault. `statForRead` already classifies it that way for reads,
+        // and the disagreement was observable — `exist`/`fileInfo`/`retrieve` reported a 300-character
+        // id as absent while `delete()` rejected with a bare ENAMETOOLONG from this invariant, aborting
+        // the whole batch and failing identically on every retry. A store of the same id failed the
+        // same way from inside its commit.
+        if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR' || err?.code === 'ENAMETOOLONG') return false
         throw err
       }
     },

@@ -1,7 +1,7 @@
 import destroy from 'destroy'
 import * as nodeFs from 'fs'
 import * as path from 'path'
-import { Readable, Writable } from 'stream'
+import { Readable, Transform, Writable } from 'stream'
 import { pipeline } from 'stream/promises'
 import { createGzip } from 'zlib'
 import { ILoggerComponent } from '@well-known-components/interfaces'
@@ -27,6 +27,13 @@ const NATIVE_FS: CompressionFileSystem = {
   stat: nodeFs.promises.stat,
   lstat: nodeFs.promises.lstat
 }
+
+/**
+ * Stops a compression that has already grown too large to satisfy the 1.1 rule. A sentinel, not a
+ * failure: it never escapes `gzipCompressFile`, which turns it into the same "not compressed" answer
+ * the post-hoc ratio check produces.
+ */
+const NOT_WORTH_COMPRESSING = new Error('The compressed output cannot beat the original by enough to keep it')
 
 /**
  * What a successful compression measured. Internal: `compressContentFile` reports only whether the
@@ -96,17 +103,55 @@ async function gzipCompressFile(
   // the in-place mode is a canonical `.gzip` that reads would prefer over the real content.
   let source: Readable | undefined
   let destination: Writable | undefined
+  // Built once the original's size is known, so it is declared out here for the teardown below.
+  let counter: Transform | undefined
+  let originalSize = 0
+  let compressedSize = 0
 
   try {
     try {
       source = fs.createReadStream(input)
+      // Probed AFTER the source is constructed but BEFORE the destination, and both halves of that are
+      // load-bearing:
+      // - after the source, so a failure here still runs the teardown that attaches its 'error'
+      //   handler; a stream destroyed with its `open(2)` still in flight goes on to emit one, and with
+      //   no listener that is an uncaught exception.
+      // - before the destination, so a failure here never leaves an output file behind. Opening the
+      //   destination first meant its `open(2)` could still be in flight when this probe rejected, and
+      //   complete AFTER the cleanup unlink — re-creating the very `.gzip` that was just removed, which
+      //   in the in-place mode is a canonical empty `.gzip` that reads prefer over the real content.
+      //
+      // lstat when the adapter has it (the bundled component does): both paths are files this storage
+      // created, and measuring a link rather than its target keeps a symlinked path from reporting
+      // someone else's size. `stat` is the fallback, since lstat is optional. Called ON the component,
+      // never detached into a local: an adapter whose methods rely on `this` (a class instance, for
+      // example) would break if the function were pulled off the object first.
+      originalSize = (fs.lstat ? await fs.lstat(input) : await fs.stat(input)).size
+      // Stops the compression the moment its output can no longer satisfy the 1.1 rule. 8MB of
+      // incompressible media (a PNG, a JPEG, a GLB — the bulk of Decentraland content by bytes) cost a
+      // measured 128ms of CPU at every zlib level, plus an 8MB staged write and an 8MB read back, to
+      // produce a file that was then deleted. EXACT, not a heuristic: the pipeline is abandoned only
+      // once the output has passed the point where `compressedSize * 1.1 > originalSize` is already
+      // guaranteed, so which files end up compressed does not change. It also counts the output size, so
+      // the second post-pipeline size probe is gone too.
+      const usefulOutputLimit = originalSize / 1.1
+      counter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          compressedSize += chunk.length
+          if (compressedSize > usefulOutputLimit) {
+            callback(NOT_WORTH_COMPRESSING)
+            return
+          }
+          callback(null, chunk)
+        }
+      })
       destination = fs.createWriteStream(output)
       // This @types/node version requires `signal` in PipelineOptions, so branch instead of
       // passing an options object without one.
       if (signal) {
-        await pipeline(source, gzip, destination, { signal })
+        await pipeline(source, gzip, counter, destination, { signal })
       } else {
-        await pipeline(source, gzip, destination)
+        await pipeline(source, gzip, counter, destination)
       }
     } finally {
       // Either may be undefined when its construction threw.
@@ -121,37 +166,37 @@ async function gzipCompressFile(
       // `createWriteStream` throws, `pipeline` never takes ownership of it, so nothing else will
       // ever destroy it and its native zlib deflate state (~16KB) is held until GC — on a failure
       // loop, once per attempt.
-      for (const stream of [source, gzip, destination]) {
+      for (const stream of [source, gzip, counter, destination]) {
         if (!stream) continue
         stream.on('error', () => undefined)
         destroy(stream)
       }
     }
 
-    // lstat when the adapter has it (the bundled component does): both paths are files this
-    // storage created, and measuring a link rather than its target keeps a symlinked path from
-    // reporting someone else's size. `stat` is the fallback, since lstat is optional. Each is called
-    // ON the component, never detached into a local: an adapter whose methods rely on `this` (a class
-    // instance, for example) would break if the function were pulled off the object first.
-    const originalSize = fs.lstat ? await fs.lstat(input) : await fs.stat(input)
-    const newSize = fs.lstat ? await fs.lstat(output) : await fs.stat(output)
-
-    if (newSize.size * 1.1 > originalSize.size) {
-      // if the new file is bigger than the original file then we delete the compressed file
-      // the 1.1 magic constant is to establish a gain of at least 10% of the size to justify the
-      // extra CPU of the decompression. Awaited so the .gzip is gone before we return.
-      await removeOutput(output, 'a non-beneficial compression ratio', fs, logger)
-      return null
-    }
-
+    // Reaching here means the 1.1 rule is already satisfied, so there is nothing left to check: the
+    // counter above bails out on `compressedSize > originalSize / 1.1`, which is the same condition as
+    // the `compressedSize * 1.1 > originalSize` this used to re-test afterwards. The rule — a gain of at
+    // least 10% to justify the CPU of decompressing on every read — is enforced in exactly one place
+    // now, at the earliest point it can be decided, and the compressed size is COUNTED as the bytes flow
+    // through rather than probed from the filesystem afterwards.
     return {
-      originalSize: originalSize.size,
-      compressedSize: newSize.size
+      originalSize,
+      compressedSize
     }
   } catch (err) {
+    // The early bail-out arrives here too, but it is NOT a failure: it is the 1.1 rule reaching its
+    // verdict before the whole file had to be compressed to prove it. It gets its own reason so a
+    // stray output that cannot be cleaned up is not reported to an operator as a compression fault.
+    const notWorthCompressing = err === NOT_WORTH_COMPRESSING
     // On any failure (read/write/gzip error) remove the partial .gzip so it can't shadow the
     // source file and be served as corrupt content on a later read.
-    await removeOutput(output, 'a compression failure', fs, logger)
+    await removeOutput(
+      output,
+      notWorthCompressing ? 'a non-beneficial compression ratio' : 'a compression failure',
+      fs,
+      logger
+    )
+    if (notWorthCompressing) return null
     throw err
   }
 }
