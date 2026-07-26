@@ -835,18 +835,29 @@ export async function createFolderBasedFileSystemContentStorage(
         end: gzipSize - 1
       })
       const buffer = await streamToBuffer(stream)
+      if (buffer.length === 4) return buffer.readUInt32LE(0)
+
       // Fewer than 4 bytes means the file SHRANK between the stat that produced `gzipSize` and this
       // read of its last four bytes — a concurrent overwrite with smaller content. Reading on would
-      // throw ERR_BUFFER_OUT_OF_BOUNDS, and the probe below cannot recognise the race either because
-      // the path still EXISTS (it was replaced, not removed).
+      // throw ERR_BUFFER_OUT_OF_BOUNDS, and the caller's probe cannot recognise the race either,
+      // because the path still EXISTS (it was replaced, not removed).
       //
-      // The answer is `null` (size unknown), NOT `undefined`. `undefined` means "this representation
-      // is gone, try the other one" — and when the newer version is gzip-primary there IS no other
-      // one, so a present id was reported ABSENT. Measured at ~1.3% of reads under concurrent
-      // compressing writes. The gzip is there and perfectly servable; only its declared logical size
-      // is unknowable from a stat that no longer describes the file.
-      if (buffer.length < 4) return null
-      return buffer.readUInt32LE(0)
+      // Re-read against a FRESH stat rather than reporting a non-answer. The two non-answers are both
+      // actively harmful here: `undefined` means "this representation is gone, try the other one",
+      // and when the new version is gzip-primary there is no other one, so a present id was reported
+      // ABSENT (~1.3% of reads under concurrent compressing writes). `null` means "size unknown", and
+      // the consumer this field exists for bounds range requests with `contentSize ?? size`, so it
+      // would silently substitute the COMPRESSED size and serve a truncated range. Re-reading gives
+      // the real answer for the overwrite that actually happened.
+      const current = await statForRead(filePath)
+      if (current === undefined) return undefined
+      if (current.size < 8) return null
+      const retried = await streamToBuffer(
+        components.fs.createReadStream(filePath, { start: current.size - 4, end: current.size - 1 })
+      )
+      // Still short: the file is being rewritten repeatedly. Only now is the size genuinely unknown,
+      // and `null` says exactly that rather than inventing a number.
+      return retried.length === 4 ? retried.readUInt32LE(0) : null
     } catch (err) {
       // `null` is a legitimate answer — content whose size the format cannot express (a >4GB original,
       // where ISIZE wraps) genuinely has no declared size — so it must not double as "we could not
