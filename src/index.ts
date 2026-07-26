@@ -17,3 +17,6 @@ export * from './content-id'
 // Batch surfaces bound their own concurrency; exported so callers mapping their own id lists can
 // reuse the same bounded fan-out instead of reaching for `Promise.all`.
 export * from './concurrency'
+// `FileTypeLoader` is part of the S3 options surface, and `peekHead`/`detectMimeTypeFromBuffer` are
+// documented as usable on their own.
+export * from './mime-detection'

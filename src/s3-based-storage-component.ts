@@ -26,6 +26,7 @@ import { mapWithConcurrency } from './concurrency'
 import {
   DEFAULT_MIME_TYPE,
   detectMimeTypeFromBuffer,
+  FileTypeLoader,
   loadFileType,
   MIME_DETECTION_BYTES,
   peekHead
@@ -48,7 +49,18 @@ const ignoreStreamError = (): void => undefined
  *
  * @public
  */
-export type S3ContentStorageOptions = { Bucket: string } & (
+export type S3ContentStorageOptions = {
+  Bucket: string
+  /**
+   * Supplies the module that identifies content types, defaulting to the bundled `file-type`.
+   *
+   * `file-type` is ESM-only, so the default reaches it through a dynamic import. Injecting a loader
+   * lets a consumer use their own detector, skip the ESM dependency entirely, or — in a test — avoid
+   * a dynamic import whose resolution is not tied to the caller's lifecycle. Resolved once, during
+   * construction.
+   */
+  fileTypeLoader?: FileTypeLoader
+} & (
   | { getKey?: undefined; getId?: undefined }
   | {
       /** Maps a COMPLETE content id to its bucket key. Never called with a partial id. */
@@ -237,7 +249,17 @@ export async function createS3BasedFileSystemContentStorage(
 
   // Warm the ESM loader now rather than on the first store, so a resolution problem shows up in the
   // logs before traffic arrives instead of silently degrading every object's content type.
-  void loadFileType().catch((error: any) =>
+  //
+  // AWAITED, not fire-and-forget. `file-type` is ESM-only, so this enters the dynamic loader, and
+  // leaving it in flight meant the import could still be resolving after whatever started it had gone
+  // away: under Jest that surfaced as `You are trying to import a file after the Jest environment has
+  // been torn down` — 77 of them in one run — and, because the memo is cleared when the load rejects,
+  // it could also poison detection for a store that raced it, silently storing content as
+  // `application/octet-stream`. Construction is the right place to pay for it: the module is memoized
+  // per process, so only the first component built here waits, and a failure still only warns —
+  // detection is metadata, and a store must not fail because the detector is unavailable.
+  const fileTypeLoader = options.fileTypeLoader ?? loadFileType
+  await fileTypeLoader().catch((error: any) =>
     logger.warn(
       `Could not preload the MIME detection module; stores will retry and fall back to ${DEFAULT_MIME_TYPE}`,
       { error: error?.message ?? String(error) }
@@ -487,7 +509,7 @@ export async function createS3BasedFileSystemContentStorage(
       // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
       // upload, buffering only part-sized chunks rather than the whole file.
       const { head, body } = await peekHead(stream, MIME_DETECTION_BYTES)
-      const mimeType = await detectMimeTypeFromBuffer(head, logger)
+      const mimeType = await detectMimeTypeFromBuffer(head, logger, fileTypeLoader)
       // LOAD-BEARING, and it must stay immediately before the upload is constructed. An abort
       // landing during the two awaits above found `upload` still undefined, so the listener's
       // teardown did nothing — and with a small source already fully buffered into the head the
