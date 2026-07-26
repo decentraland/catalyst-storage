@@ -10,17 +10,84 @@ import {
   createFsComponent,
   createInMemoryStorage,
   createS3BasedFileSystemContentStorage,
+  streamToBuffer,
   FileTypeLoader,
   IContentStorageComponent,
   IFileSystemComponent,
-  streamToBuffer
+  PathNotContainedError,
+  RangeNotSupportedError,
+  UncommittedIntentSurvivedError
 } from '../src'
-import { PathNotContainedError } from '../src/folder-based/errors'
 import { createFakeS3Client } from './fake-s3-client'
 import { MAX_BUFFERED_DIRECTORY_ENTRIES } from '../src/folder-based-storage-component'
 
 /** The real detector is ESM-only and reached through an import Jest's registry does not own. */
 const undetectingLoader: FileTypeLoader = async () => ({ fileTypeFromBuffer: async () => undefined })
+
+describe('when an error reaches a caller through a public method', () => {
+  // An error a public method can actually throw at a caller is contract, and a caller can only act on
+  // it if the class is importable as a RUNTIME value — `instanceof` against a type-only import is not a
+  // thing. The README asks callers to treat `PathNotContainedError` as a bad request and
+  // `RangeNotSupportedError` as a 416, so both have to be reachable from the package root; withdrawing
+  // them while keeping that documented would have left the advice unfollowable.
+  //
+  // The converse is pinned too: `DecompressionLimitExceededError` is caught by `retrieve()` and
+  // reported as `undefined`, so it is deliberately NOT exported and this suite asserts the behaviour
+  // callers actually observe instead.
+  let root: string
+  let storage: IContentStorageComponent
+
+  beforeEach(async () => {
+    root = mkdtempSync(path.join(os.tmpdir(), 'public-errors-'))
+    storage = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      root,
+      // Small enough that a ranged read of the compressible id below trips the decompression cap.
+      { decompressMaxFileSize: 50 }
+    )
+  })
+
+  afterEach(async () => {
+    await storage.stop?.()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('should export the escaping error classes as runtime values from the package root', () => {
+    for (const errorClass of [PathNotContainedError, RangeNotSupportedError, UncommittedIntentSurvivedError]) {
+      expect(typeof errorClass).toBe('function')
+      expect(Object.getPrototypeOf(errorClass.prototype)).toBe(Error.prototype)
+    }
+  })
+
+  it.each(['exist', 'fileInfo'] as const)(
+    'should let an unaddressable id be recognised by instanceof from %s',
+    async (surface) => {
+      await expect(storage[surface]('../evil')).rejects.toBeInstanceOf(PathNotContainedError)
+    }
+  )
+
+  it('should let an unaddressable id be recognised by instanceof from delete', async () => {
+    await expect(storage.delete(['../evil'])).rejects.toBeInstanceOf(PathNotContainedError)
+  })
+
+  it('should let an unaddressable id be recognised by instanceof from storeStream', async () => {
+    await expect(storage.storeStream('../evil', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+      PathNotContainedError
+    )
+  })
+
+  it('should report an unaddressable id as nothing to serve from retrieve, not as a throw', async () => {
+    await expect(storage.retrieve('../evil')).resolves.toBeUndefined()
+  })
+
+  it('should report a decompression-cap breach as nothing to serve rather than a typed error', async () => {
+    await storage.storeStreamAndCompress('over-cap', bufferToStream(Buffer.from('a'.repeat(20000))))
+
+    // Gzip-primary, so serving a range has to inflate — which trips the 50-byte cap above.
+    expect((await storage.fileInfo('over-cap'))?.encoding).toBe('gzip')
+    await expect(storage.retrieve('over-cap', { start: 0, end: 10 })).resolves.toBeUndefined()
+  })
+})
 
 describe('when a store is handed a source that has already been consumed', () => {
   // Piping a consumed stream writes ZERO bytes and RESOLVES, so this committed an empty object under

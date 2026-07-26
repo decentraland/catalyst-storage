@@ -27,6 +27,30 @@ export type { IFileSystemComponent } from './fs/types'
 // The component contract every backend implements, and the shapes it hands back.
 export type { AppComponents, ContentItem, FileInfo, IContentStorageComponent } from './types'
 
+/**
+ * The errors a public method can actually REACH A CALLER with, exported as runtime values so an
+ * `instanceof` check against them is stable.
+ *
+ * The test is escape, not existence: an error class that is only ever thrown and caught inside this
+ * package is not something a consumer can branch on, so exporting it would be inventing contract.
+ * Verified per class rather than assumed —
+ *
+ * - `PathNotContainedError` escapes `exist`, `fileInfo`, `delete`, `storeStream` and
+ *   `storeStreamAndCompress` on the folder-based and in-memory backends. (`retrieve` deliberately
+ *   converts it to `undefined`: an id that names no storable object has nothing to serve.)
+ * - `RangeNotSupportedError` escapes the S3 `retrieve` when a range is asked of an object that has a
+ *   `Content-Encoding`; the read contract asks callers to answer 416 for it, which requires this.
+ * - `UncommittedIntentSurvivedError` escapes `storeStream`/`storeStreamAndCompress` when a commit
+ *   failed AND its journal could not be cleared. Its `stagedPath` is the actionable part, and it is
+ *   the one error here that tells an operator a retry is safe.
+ *
+ * `DecompressionLimitExceededError` is deliberately NOT here: every path that raises it is caught by
+ * `retrieve`, which answers `undefined`. It became unreachable when the legacy no-rename range path
+ * was removed — that was the one place it surfaced on a consumer's stream.
+ */
+export { RangeNotSupportedError } from './types'
+export { PathNotContainedError, UncommittedIntentSurvivedError } from './folder-based/errors'
+
 // Stream helpers: a caller has to be able to build a source for `storeStream` and drain what
 // `retrieve` returns, and `SimpleContentItem` is how a consumer implementing its own storage produces
 // a conforming `ContentItem`.
