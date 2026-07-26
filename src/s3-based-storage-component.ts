@@ -56,8 +56,12 @@ export type S3ContentStorageOptions = {
    *
    * `file-type` is ESM-only, so the default reaches it through a dynamic import. Injecting a loader
    * lets a consumer use their own detector, skip the ESM dependency entirely, or — in a test — avoid
-   * a dynamic import whose resolution is not tied to the caller's lifecycle. Resolved once, during
-   * construction.
+   * a dynamic import whose resolution is not tied to the caller's lifecycle.
+   *
+   * Called ONCE, during construction, and the module it returns is reused by every store. The single
+   * exception is a loader that REJECTS: construction then only warns (detection is metadata, and a
+   * store must not fail because the detector is unavailable) and stores retry it, so a transient
+   * failure does not permanently downgrade every later store.
    */
   fileTypeLoader?: FileTypeLoader
 } & (
@@ -258,13 +262,27 @@ export async function createS3BasedFileSystemContentStorage(
   // `application/octet-stream`. Construction is the right place to pay for it: the module is memoized
   // per process, so only the first component built here waits, and a failure still only warns —
   // detection is metadata, and a store must not fail because the detector is unavailable.
-  const fileTypeLoader = options.fileTypeLoader ?? loadFileType
-  await fileTypeLoader().catch((error: any) =>
+  const configuredFileTypeLoader = options.fileTypeLoader ?? loadFileType
+  let resolvedDetector: Awaited<ReturnType<FileTypeLoader>> | undefined
+  try {
+    resolvedDetector = await configuredFileTypeLoader()
+  } catch (error: any) {
     logger.warn(
       `Could not preload the MIME detection module; stores will retry and fall back to ${DEFAULT_MIME_TYPE}`,
       { error: error?.message ?? String(error) }
     )
-  )
+  }
+  // The RESOLVED detector is what stores use, not the loader that produced it. Handing the loader
+  // itself to every store meant "resolved once, during construction" only held for the bundled
+  // loader, which memoizes internally; an injected one was re-invoked per store and could fail after
+  // construction had already succeeded — the caller having no way to know their loader was on the
+  // hot path at all.
+  //
+  // The FAILED case deliberately keeps calling the original loader. A transient resolution failure
+  // must not permanently downgrade every later store to `application/octet-stream`, which is the same
+  // reason `loadFileType` refuses to cache a rejection.
+  const detector = resolvedDetector
+  const fileTypeLoader: FileTypeLoader = detector ? async () => detector : configuredFileTypeLoader
 
   /**
    * Whether a 403 on a read may be reported as absence.

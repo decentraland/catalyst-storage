@@ -1200,3 +1200,82 @@ describe('S3 Storage enumeration when the inverse rejects foreign keys', () => {
     expect(listed).toEqual(['abcdef'])
   })
 })
+
+describe('S3 Storage injected content-type detector', () => {
+  describe('and the loader resolves at construction', () => {
+    let calls: number
+    let storage: IContentStorageComponent
+
+    beforeEach(async () => {
+      // "Called once, during construction" has to hold for an INJECTED loader too. The bundled one
+      // memoizes internally, so passing the loader itself to every store hid this: a custom loader
+      // was re-invoked per store and could fail after construction had already succeeded.
+      calls = 0
+      storage = await createS3BasedFileSystemContentStorage(
+        { logs: await createLogComponent({}) },
+        createFakeS3Client(),
+        {
+          Bucket: 'example',
+          fileTypeLoader: async () => {
+            calls++
+            return { fileTypeFromBuffer: async () => ({ mime: 'image/png' }) }
+          }
+        }
+      )
+    })
+
+    it('should call it once for construction alone', () => {
+      expect(calls).toBe(1)
+    })
+
+    it('should not call it again for any number of stores', async () => {
+      await storage.storeStream('one', bufferToStream(Buffer.from('first')))
+      await storage.storeStream('two', bufferToStream(Buffer.from('second')))
+
+      expect(calls).toBe(1)
+    })
+
+    it('should use the resolved detector for those stores', async () => {
+      await storage.storeStream('one', bufferToStream(Buffer.from('first')))
+
+      expect(await storage.fileInfo('one')).toBeDefined()
+    })
+  })
+
+  describe('and the loader rejects at construction', () => {
+    let calls: number
+    let storage: IContentStorageComponent
+    let fake: FakeS3Client
+
+    beforeEach(async () => {
+      // A transient failure must not permanently downgrade every later store, so the loader is
+      // retried — the same reason the bundled loader refuses to cache a rejection.
+      calls = 0
+      fake = createFakeS3Client()
+      storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+        Bucket: 'example',
+        fileTypeLoader: async () => {
+          calls++
+          if (calls === 1) throw new Error('detector unavailable')
+          return { fileTypeFromBuffer: async () => ({ mime: 'image/png' }) }
+        }
+      })
+    })
+
+    it('should construct rather than fail over an unavailable detector', () => {
+      expect(storage).toBeDefined()
+    })
+
+    it('should retry the loader on a later store', async () => {
+      await storage.storeStream('one', bufferToStream(Buffer.from('first')))
+
+      expect(calls).toBe(2)
+    })
+
+    it('should recover the detected type once the loader works', async () => {
+      await storage.storeStream('one', bufferToStream(Buffer.from('first')))
+
+      expect(fake.objects.get('one')!.contentType).toBe('image/png')
+    })
+  })
+})
