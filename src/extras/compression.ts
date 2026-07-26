@@ -117,7 +117,11 @@ async function gzipCompressFile(
       // terminates the process by default. Measured at 200/200 escapes without it and 0 with it.
       // Whatever arrives here is post-mortem noise; the failure that brought us here, or the value
       // already produced, is what the caller needs.
-      for (const stream of [source, destination]) {
+      // `gzip` is included even though it is constructed above the try: when `createReadStream` or
+      // `createWriteStream` throws, `pipeline` never takes ownership of it, so nothing else will
+      // ever destroy it and its native zlib deflate state (~16KB) is held until GC — on a failure
+      // loop, once per attempt.
+      for (const stream of [source, gzip, destination]) {
         if (!stream) continue
         stream.on('error', () => undefined)
         destroy(stream)

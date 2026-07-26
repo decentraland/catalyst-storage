@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'crypto'
+import { intentNameFor } from './file-system-utils'
 import { mkdtempSync, promises as nodeFs, rmSync, writeFileSync } from 'fs'
 import os from 'os'
 import path from 'path'
@@ -34,7 +35,7 @@ describe('fileSystemContentStorage', () => {
   let tmpRootDir: string
   let fileSystemContentStorage: IContentStorageComponent
 
-  // sha1('some-id') = 9584b661c135a43f2fbbe43cc5104f7bd693d048
+  // The intent journal is named sha256(id).intent; see intentNameFor.
   const id: string = 'some-id'
   const content = Buffer.from('123')
   let filePath: string
@@ -1225,15 +1226,18 @@ describe('fileSystemContentStorage', () => {
     })
   })
 
-  describe('when the storage itself cannot read a present id', () => {
+  describe('when the storage cannot create the shard directory it needs', () => {
     let faultyRoot: string
     let faultyStorage: IContentStorageComponent
     let outcome: unknown
 
     beforeEach(async () => {
-      // A fault in the storage's own tree is not a miss. Answering "not found" would make an
-      // unreadable disk look like an empty node — the caller stops retrying and starts serving 404s
-      // for content it has.
+      // Reads do not create directories, so a failing `mkdir` can only surface on a WRITE — which is
+      // where the fault has to be loud, because that is the operation the tree is actually needed
+      // for. A read of an id in a shard that does not exist is a genuine miss: nothing was ever
+      // stored there. The "a fault is not a miss" contract is upheld for content that IS present but
+      // unreadable, which the sibling suites below cover (a removed shard, a shard replaced by a
+      // file, and a non-miss stat error on a present file).
       faultyRoot = mkdtempSync(path.join(os.tmpdir(), 'fs-faulty-'))
       const realFs = createFsComponent()
       const faultyFs: IFileSystemComponent = {
@@ -1250,7 +1254,7 @@ describe('fileSystemContentStorage', () => {
         { fs: faultyFs, logs: await createLogComponent({}) },
         faultyRoot
       )
-      outcome = await faultyStorage.retrieve(id).then(
+      outcome = await faultyStorage.storeStream(id, bufferToStream(Buffer.from('content'))).then(
         (value) => value,
         (error: unknown) => error
       )
@@ -1261,8 +1265,19 @@ describe('fileSystemContentStorage', () => {
       rmSync(faultyRoot, { recursive: true, force: true })
     })
 
-    it('should reject with the underlying filesystem error', () => {
+    it('should reject the store with the underlying filesystem error', () => {
       expect((outcome as { code?: string }).code).toEqual('EACCES')
+    })
+
+    it('should report a read of the never-stored id as a miss rather than inventing a fault', async () => {
+      await expect(faultyStorage.retrieve(id)).resolves.toBeUndefined()
+      await expect(faultyStorage.exist(id)).resolves.toBe(false)
+    })
+
+    it('should not have created the shard directory just by reading', async () => {
+      await faultyStorage.exist(id)
+
+      expect(await createFsComponent().existPath(path.join(faultyRoot, '9584'))).toBe(false)
     })
   })
 
@@ -2420,7 +2435,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.writeFile(gzipPath, Buffer.from('stale gzip of the previous version'))
         await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
-          path.join(mixedRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
+          path.join(mixedRoot, '.tmp-writes', intentNameFor('some-id')),
           Buffer.from(JSON.stringify({ op: 'raw', id, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' }))
         )
         mixedStorage = await createFolderBasedFileSystemContentStorage(
@@ -2468,7 +2483,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.writeFile(rawPath + '.gzip', gzipSync(newBytes))
         await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
-          path.join(mixedRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
+          path.join(mixedRoot, '.tmp-writes', intentNameFor('some-id')),
           Buffer.from(JSON.stringify({ op: 'gzip', id, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' }))
         )
         mixedStorage = await createFolderBasedFileSystemContentStorage(
@@ -2506,7 +2521,7 @@ describe('fileSystemContentStorage', () => {
         failRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-unlink-fail-'))
         const shardDir = path.join(failRoot, '9584')
         gzipPath = path.join(shardDir, id) + '.gzip'
-        intentPath = path.join(failRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        intentPath = path.join(failRoot, '.tmp-writes', intentNameFor('some-id'))
         const realFs = createFsComponent()
         let failuresLeft = 1
         const failingFs: IFileSystemComponent = {
@@ -2652,7 +2667,7 @@ describe('fileSystemContentStorage', () => {
         // exposing the mixed state.
         quarantineRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-quarantine-'))
         gzipPath = path.join(quarantineRoot, '9584', id) + '.gzip'
-        intentPath = path.join(quarantineRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        intentPath = path.join(quarantineRoot, '.tmp-writes', intentNameFor('some-id'))
         const realFs = createFsComponent()
         let armed = true
         disarm = () => {
@@ -2734,7 +2749,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.writeFile(victimGzipPath, Buffer.from('victim gzip'))
         await nodeFs.mkdir(path.join(mismatchRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
-          path.join(mismatchRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
+          path.join(mismatchRoot, '.tmp-writes', intentNameFor('some-id')),
           Buffer.from(
             JSON.stringify({ op: 'raw', id: id2, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' })
           )
@@ -2775,7 +2790,7 @@ describe('fileSystemContentStorage', () => {
         doubleFailRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-double-fail-'))
         const rawPath = path.join(doubleFailRoot, '9584', id)
         gzipPath = rawPath + '.gzip'
-        intentPath = path.join(doubleFailRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        intentPath = path.join(doubleFailRoot, '.tmp-writes', intentNameFor('some-id'))
         const realFs = createFsComponent()
         let armed = false
         const failingFs: IFileSystemComponent = {
@@ -2866,7 +2881,7 @@ describe('fileSystemContentStorage', () => {
         unverifiableRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-unverifiable-'))
         const rawPath = path.join(unverifiableRoot, '9584', id)
         gzipPath = rawPath + '.gzip'
-        intentPath = path.join(unverifiableRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        intentPath = path.join(unverifiableRoot, '.tmp-writes', intentNameFor('some-id'))
         const realFs = createFsComponent()
         let armed = false
         const failingFs: IFileSystemComponent = {
@@ -2950,7 +2965,7 @@ describe('fileSystemContentStorage', () => {
         compressedFailRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-compress-double-'))
         rawPath = path.join(compressedFailRoot, '9584', id)
         const gzipPath = rawPath + '.gzip'
-        intentPath = path.join(compressedFailRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        intentPath = path.join(compressedFailRoot, '.tmp-writes', intentNameFor('some-id'))
         const realFs = createFsComponent()
         let armed = false
         const failingFs: IFileSystemComponent = {
@@ -3026,7 +3041,7 @@ describe('fileSystemContentStorage', () => {
         incompressibleFailRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-incompress-double-'))
         const rawPath = path.join(incompressibleFailRoot, '9584', id)
         gzipPath = rawPath + '.gzip'
-        intentPath = path.join(incompressibleFailRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        intentPath = path.join(incompressibleFailRoot, '.tmp-writes', intentNameFor('some-id'))
         const realFs = createFsComponent()
         let armed = false
         const failingFs: IFileSystemComponent = {
@@ -3163,7 +3178,7 @@ describe('fileSystemContentStorage', () => {
         gzipPath = path.join(crashRoot, '9584', id) + '.gzip'
         const stagedName = `deadbeefdeadbeef-${'a'.repeat(32)}`
         stagedPath = path.join(crashRoot, '.tmp-writes', stagedName)
-        intentPath = path.join(crashRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        intentPath = path.join(crashRoot, '.tmp-writes', intentNameFor('some-id'))
         await nodeFs.writeFile(stagedPath, Buffer.from('never committed'))
         await nodeFs.writeFile(intentPath, Buffer.from(JSON.stringify({ op: 'raw', id, staged: stagedName })))
         const realFs = createFsComponent()
@@ -3234,7 +3249,7 @@ describe('fileSystemContentStorage', () => {
         // The invariant check must treat only ENOENT/ENOTDIR as absent and fail loudly here.
         unreadableRoot = mkdtempSync(path.join(os.tmpdir(), 'cs-unreadable-'))
         gzipPath = path.join(unreadableRoot, '9584', id) + '.gzip'
-        intentPath = path.join(unreadableRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        intentPath = path.join(unreadableRoot, '.tmp-writes', intentNameFor('some-id'))
         const realFs = createFsComponent()
         let gzipUnreadable = false
         const failingFs: IFileSystemComponent = {
@@ -3436,7 +3451,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.writeFile(rawPath, content)
         await nodeFs.writeFile(gzipPath, Buffer.from('stale gzip of the previous version'))
         await nodeFs.mkdir(path.join(mixedRoot, '.tmp-writes'), { recursive: true })
-        intentPath = path.join(mixedRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent')
+        intentPath = path.join(mixedRoot, '.tmp-writes', intentNameFor('some-id'))
         await nodeFs.writeFile(
           intentPath,
           Buffer.from(JSON.stringify({ op: 'raw', id, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' }))
@@ -3547,7 +3562,7 @@ describe('fileSystemContentStorage', () => {
         await nodeFs.writeFile(path.join(shardDir, id), newBytes)
         await nodeFs.mkdir(path.join(consistentRoot, '.tmp-writes'), { recursive: true })
         await nodeFs.writeFile(
-          path.join(consistentRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
+          path.join(consistentRoot, '.tmp-writes', intentNameFor('some-id')),
           Buffer.from(JSON.stringify({ op: 'raw', id, staged: 'deadbeefdeadbeef-00000000000000000000000000000000' }))
         )
         consistentStorage = await createFolderBasedFileSystemContentStorage(
@@ -3599,7 +3614,7 @@ describe('fileSystemContentStorage', () => {
         stagedPath = path.join(crashRoot, '.tmp-writes', stagedName)
         await nodeFs.writeFile(stagedPath, Buffer.from('the new raw bytes that never committed'))
         await nodeFs.writeFile(
-          path.join(crashRoot, '.tmp-writes', '9584b661c135a43f2fbbe43cc5104f7bd693d048.intent'),
+          path.join(crashRoot, '.tmp-writes', intentNameFor('some-id')),
           Buffer.from(JSON.stringify({ op: 'raw', id, staged: stagedName }))
         )
         restartedStorage = await createFolderBasedFileSystemContentStorage(

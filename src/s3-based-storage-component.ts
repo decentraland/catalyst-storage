@@ -1,4 +1,5 @@
 import {
+  AbortMultipartUploadCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -10,17 +11,68 @@ import {
 import { Upload } from '@aws-sdk/lib-storage'
 import { Readable } from 'stream'
 
-import { AppComponents, clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
-import { SimpleContentItem } from './content-item'
+import {
+  AppComponents,
+  clampRange,
+  ContentItem,
+  FileInfo,
+  IContentStorageComponent,
+  RangeNotSupportedError,
+  validateRange
+} from './types'
+import { contentCodingOf, normalizeContentEncoding, SimpleContentItem } from './content-item'
 import { isAbortError, runStoreWithSignal } from './cancellation'
 import { mapWithConcurrency } from './concurrency'
 import {
   DEFAULT_MIME_TYPE,
   detectMimeTypeFromBuffer,
+  FileTypeLoader,
   loadFileType,
   MIME_DETECTION_BYTES,
   peekHead
 } from './mime-detection'
+
+/** Absorbs a torn-down stream's trailing 'error', which would otherwise be an uncaught exception. */
+const ignoreStreamError = (): void => undefined
+
+/**
+ * How ids map to bucket keys.
+ *
+ * The mapping is either the default identity or a MATCHED PAIR: `getKey` and `getId` must be supplied
+ * together, which the type enforces so a TypeScript caller migrating to this version gets the error
+ * at compile time rather than at construction. The runtime check remains for JavaScript callers.
+ *
+ * The pairing is not bookkeeping. `allFileIds()` enumerates the bucket, which yields KEYS, while
+ * every other surface takes IDS: without the inverse, a GC sweep that enumerated and then deleted
+ * issued a double-prefixed key, and because `DeleteObjects` is idempotent S3 reported success while
+ * deleting nothing, forever.
+ *
+ * @public
+ */
+export type S3ContentStorageOptions = {
+  Bucket: string
+  /**
+   * Supplies the module that identifies content types, defaulting to the bundled `file-type`.
+   *
+   * `file-type` is ESM-only, so the default reaches it through a dynamic import. Injecting a loader
+   * lets a consumer use their own detector, skip the ESM dependency entirely, or — in a test — avoid
+   * a dynamic import whose resolution is not tied to the caller's lifecycle.
+   *
+   * Called ONCE, during construction, and the module it returns is reused by every store. The single
+   * exception is a loader that REJECTS: construction then only warns (detection is metadata, and a
+   * store must not fail because the detector is unavailable) and stores retry it, so a transient
+   * failure does not permanently downgrade every later store.
+   */
+  fileTypeLoader?: FileTypeLoader
+} & (
+  | { getKey?: undefined; getId?: undefined }
+  | {
+      /** Maps a COMPLETE content id to its bucket key. Never called with a partial id. */
+      getKey: (hash: string) => string
+      /** The exact inverse of `getKey`. Keys that do not round-trip are skipped by `allFileIds()`. */
+      getId: (key: string) => string
+    }
+)
 
 /** S3's hard per-request limit for `DeleteObjects`; the SDK does not split a larger list. */
 const DELETE_OBJECTS_MAX_KEYS = 1000
@@ -36,7 +88,9 @@ const BATCH_CONCURRENCY = 32
  */
 export async function createAwsS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, 'config' | 'logs'>,
-  bucket: string
+  bucket: string,
+  /** Forwarded to {@link createS3BasedFileSystemContentStorage}; see `fileTypeLoader` there. */
+  options?: Pick<S3ContentStorageOptions, 'fileTypeLoader'>
 ): Promise<IContentStorageComponent> {
   const { config, logs } = components
 
@@ -44,9 +98,22 @@ export async function createAwsS3BasedFileSystemContentStorage(
     region: await config.requireString('AWS_REGION')
   })
 
-  const getKey = (hash: string) => hash
-
-  const storage = await createS3BasedFileSystemContentStorage({ logs }, s3, { Bucket: bucket, getKey })
+  // Keys are ids verbatim here, which is the default mapping — and the one case where `allFileIds`
+  // round-trips without an explicit inverse.
+  //
+  // Destroyed on a failed construction: this factory OWNS the client, and construction can now throw
+  // (a missing bucket, an invalid getKey/getId pair) before the `stop()` below exists to release it.
+  // A supervisor retrying a misconfigured deployment would otherwise leak a socket pool per attempt.
+  let storage: IContentStorageComponent
+  try {
+    storage = await createS3BasedFileSystemContentStorage({ logs }, s3, {
+      Bucket: bucket,
+      fileTypeLoader: options?.fileTypeLoader
+    })
+  } catch (error) {
+    s3.destroy()
+    throw error
+  }
 
   return {
     ...storage,
@@ -84,6 +151,20 @@ function describeBody(body: unknown): string {
 type SendOptions = NonNullable<Parameters<S3Client['send']>[1]>
 
 /**
+ * Requests the cancellation signal must NOT be attached to, keyed by command constructor name.
+ *
+ * - `AbortMultipartUploadCommand` is the cleanup that removes uploaded parts, and lib-storage issues
+ *   it precisely when the upload was aborted; attaching the already-aborted signal would cancel the
+ *   cleanup and leave the parts to accumulate.
+ * `CompleteMultipartUploadCommand` is deliberately NOT exempt. Exempting it would close the
+ * part-leak window described in `abortMultipartUpload` below, but at the cost of letting a cancelled
+ * store run the complete request to completion — committing the object for the entire duration of
+ * that request, which for a multi-GB upload is seconds to minutes, not the last-packet race the
+ * cancellation contract documents. The leak is closed at the call site instead.
+ */
+const UNCANCELLABLE_COMMANDS = new Set(['AbortMultipartUploadCommand'])
+
+/**
  * Returns a client that behaves exactly like `s3` but attaches `signal` to the requests it issues.
  *
  * This exists because `@aws-sdk/lib-storage` calls `client.send(command)` with no request options, so
@@ -95,11 +176,9 @@ type SendOptions = NonNullable<Parameters<S3Client['send']>[1]>
  * resolver, `requestHandler`, `forcePathStyle` — resolves to the real client's own values through the
  * prototype chain, with only `send` replaced.
  *
- * AbortMultipartUpload is deliberately EXEMPT: it is the cleanup that removes uploaded parts, and
- * lib-storage issues it precisely when the upload was aborted, so attaching the already-aborted
- * signal would cancel the cleanup and leave the parts to accumulate. It is matched by constructor
- * name rather than `instanceof` because client-s3 is a PEER dependency of lib-storage: an install
- * that hoists two copies would fail an identity check and silently break this exemption.
+ * Two commands are deliberately EXEMPT (see `UNCANCELLABLE_COMMANDS`). They are matched by
+ * constructor name rather than `instanceof` because client-s3 is a PEER dependency of lib-storage: an
+ * install that hoists two copies would fail an identity check and silently break the exemption.
  *
  * `command` is intentionally untyped. The SDK's own parameter type for it is the service-wide
  * `Command<ServiceInputTypes, ServiceInputTypes, ServiceOutputTypes, ServiceOutputTypes, …>`
@@ -108,13 +187,27 @@ type SendOptions = NonNullable<Parameters<S3Client['send']>[1]>
  * argument — the part this shim actually constructs, and the only place a mistake here could silently
  * disable cancellation — is fully type-checked.
  */
-function createAbortableClient(s3: S3Client, signal: AbortSignal): S3Client {
+function createAbortableClient(
+  s3: S3Client,
+  signal: AbortSignal,
+  onMultipartCreated: (uploadId: string) => void
+): S3Client {
   const send = (command: any, sendOptions?: SendOptions): unknown => {
-    if (command?.constructor?.name === 'AbortMultipartUploadCommand') {
+    if (UNCANCELLABLE_COMMANDS.has(command?.constructor?.name)) {
       return s3.send(command, sendOptions)
     }
     const withAbortSignal: SendOptions = { ...sendOptions, abortSignal: signal }
-    return s3.send(command, withAbortSignal)
+    const result = s3.send(command, withAbortSignal)
+    if (command?.constructor?.name === 'CreateMultipartUploadCommand') {
+      // Capture the upload id as it is issued. lib-storage keeps it private and only cleans it up on
+      // the paths that run BEFORE `CompleteMultipartUpload`, so this is what lets the caller abort an
+      // upload whose complete request was torn down — without reaching into the SDK's internals.
+      return Promise.resolve(result).then((output: any) => {
+        if (typeof output?.UploadId === 'string') onMultipartCreated(output.UploadId)
+        return output
+      })
+    }
+    return result
   }
   return Object.assign(Object.create(s3) as S3Client, { send: send as S3Client['send'] })
 }
@@ -143,20 +236,127 @@ function createAbortableClient(s3: S3Client, signal: AbortSignal): S3Client {
 export async function createS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, 'logs'>,
   s3: S3Client,
-  options: { Bucket: string; getKey?: (hash: string) => string }
+  options: S3ContentStorageOptions
 ): Promise<IContentStorageComponent> {
   const logger = components.logs.getLogger('s3-based-content-storage')
   const getKey = options.getKey || ((hash: string) => hash)
   const Bucket = options.Bucket
+  // Both or neither. The type already enforces this, so only a JavaScript caller reaches it — and
+  // BOTH halves matter. Without `getId`, `allFileIds()` yields keys that do not resolve back through
+  // retrieve/exist/delete, and a delete of an enumerated id silently removes nothing because
+  // `DeleteObjects` is idempotent. Without `getKey`, the mapping is mixed: reads and writes address
+  // identity keys while enumeration decodes them, so every key fails the round-trip check below and
+  // enumeration reports an empty bucket — the silent-empty answer this component exists to avoid.
+  if (!!options.getKey !== !!options.getId) {
+    throw new Error(
+      `getKey and getId must be supplied together; received only ${options.getKey ? 'getKey' : 'getId'}. ` +
+        'They are inverses: retrieve/exist/delete map an id to a key with getKey, while allFileIds() maps a ' +
+        'listed key back with getId, and each is unusable without the other.'
+    )
+  }
+  const getId = options.getId || ((key: string) => key)
 
   // Warm the ESM loader now rather than on the first store, so a resolution problem shows up in the
   // logs before traffic arrives instead of silently degrading every object's content type.
-  void loadFileType().catch((error: any) =>
+  //
+  // AWAITED, not fire-and-forget. `file-type` is ESM-only, so this enters the dynamic loader, and
+  // leaving it in flight meant the import could still be resolving after whatever started it had gone
+  // away: under Jest that surfaced as `You are trying to import a file after the Jest environment has
+  // been torn down` — 77 of them in one run — and, because the memo is cleared when the load rejects,
+  // it could also poison detection for a store that raced it, silently storing content as
+  // `application/octet-stream`. Construction is the right place to pay for it: the module is memoized
+  // per process, so only the first component built here waits, and a failure still only warns —
+  // detection is metadata, and a store must not fail because the detector is unavailable.
+  const configuredFileTypeLoader = options.fileTypeLoader ?? loadFileType
+  let resolvedDetector: Awaited<ReturnType<FileTypeLoader>> | undefined
+  try {
+    resolvedDetector = await configuredFileTypeLoader()
+  } catch (error: any) {
     logger.warn(
       `Could not preload the MIME detection module; stores will retry and fall back to ${DEFAULT_MIME_TYPE}`,
       { error: error?.message ?? String(error) }
     )
-  )
+  }
+  // The RESOLVED detector is what stores use, not the loader that produced it. Handing the loader
+  // itself to every store meant "resolved once, during construction" only held for the bundled
+  // loader, which memoizes internally; an injected one was re-invoked per store and could fail after
+  // construction had already succeeded — the caller having no way to know their loader was on the
+  // hot path at all.
+  //
+  // The FAILED case deliberately keeps calling the original loader. A transient resolution failure
+  // must not permanently downgrade every later store to `application/octet-stream`, which is the same
+  // reason `loadFileType` refuses to cache a rejection.
+  const detector = resolvedDetector
+  const fileTypeLoader: FileTypeLoader = detector ? async () => detector : configuredFileTypeLoader
+
+  /**
+   * Whether a 403 on a read may be reported as absence.
+   *
+   * Only ONE situation justifies that: a principal without `s3:ListBucket` gets 403 instead of 404
+   * for a MISSING key, and the response carries nothing separating that from a real denial. Every
+   * other 403 — rotated credentials, a bad signature, clock skew, a revoked policy — is the storage
+   * refusing to answer, and reporting it as absence is what makes a broken node look like an empty
+   * one.
+   *
+   * Defaults to FALSE and is only enabled on positive evidence (see `probeBucketAccess`), because the
+   * two readings are not symmetric: answering "cannot read" for content that is genuinely absent
+   * costs a retry, while answering "absent" for content that is present and unreadable is a silent
+   * data-loss report. Resolved ONCE at construction, so it costs nothing per read.
+   */
+  let report403AsAbsent = false
+  await probeBucketAccess()
+
+  async function probeBucketAccess(): Promise<void> {
+    try {
+      await s3.send(new ListObjectsV2Command({ Bucket, MaxKeys: 1 }))
+      // Listing works, so missing keys answer 404 and every 403 is a real authorization failure.
+      return
+    } catch (error: any) {
+      const statusCode = error?.$metadata?.httpStatusCode
+      const code = error?.name
+      // A missing or misnamed bucket answers `HeadObject` with a 404 byte-identical to a missing key,
+      // so without this probe EVERY id reported absent and nothing was logged — a silently empty
+      // node. It is a deployment error, not a runtime condition, so it fails construction where an
+      // operator will see it.
+      if (code === 'NoSuchBucket' || statusCode === 404) {
+        throw new Error(
+          `Refusing to start: the S3 bucket '${Bucket}' does not exist or is not reachable by this principal. ` +
+            `Every read would report content as absent, which is indistinguishable from an empty node. ` +
+            `Original error: ${error?.message ?? String(error)}`
+        )
+      }
+      // A 403 is only evidence about `s3:ListBucket` when it is an authorization DENIAL. The
+      // credential and clock failures below are 403s too, and they say nothing about which
+      // permissions this principal holds — crediting them would switch reads into the lenient mode on
+      // a startup blip, and the node would then answer "absent" for every id for its whole lifetime.
+      // That is precisely the empty-node failure this probe exists to remove, so it must not be
+      // reachable through the probe itself.
+      //
+      // `ListObjectsV2` is a GET with an XML error body, so the SDK surfaces the real code here —
+      // unlike `HeadObject`, whose empty body is why the ambiguity exists in the first place.
+      if (statusCode === 403 && code === 'AccessDenied') {
+        report403AsAbsent = true
+        logger.warn(
+          `This principal cannot s3:ListBucket on '${Bucket}', so a 403 on a read cannot be distinguished from a ` +
+            `missing key and will be reported as absent. Grant s3:ListBucket so missing keys return 404 and a real ` +
+            `authorization failure (rotated credentials, clock skew, a revoked policy) surfaces as an error ` +
+            `instead of an empty node.`,
+          { error: error?.message ?? String(error) }
+        )
+        return
+      }
+      // Anything else — a credential or clock 403, a network blip, a throttle — says nothing about
+      // permissions and must not stop a component whose reads and writes would surface the same fault
+      // themselves. Reads stay STRICT: an unverified 403 rejects, which is the answer that keeps a
+      // broken node distinguishable from an empty one.
+      logger.warn(
+        `Could not verify s3:ListBucket on '${Bucket}'; a 403 on a read will be surfaced as an error rather than ` +
+          `reported as absence. If this principal genuinely lacks s3:ListBucket, grant it so missing keys return ` +
+          `404, or restart once the underlying problem is resolved.`,
+        { error: error?.message ?? String(error) }
+      )
+    }
+  }
 
   /**
    * Whether an S3 failure means "there is no object to serve" rather than "this storage could not
@@ -174,7 +374,14 @@ export async function createS3BasedFileSystemContentStorage(
   function isNotFound(error: any): boolean {
     const statusCode = error?.$metadata?.httpStatusCode
     const code = error?.name
-    return code === 'NotFound' || code === 'NoSuchKey' || statusCode === 404 || statusCode === 403
+    if (code === 'NotFound' || code === 'NoSuchKey' || statusCode === 404) return true
+    // 403 is "absent" ONLY while this principal's read of a missing key is genuinely indistinguishable
+    // from a denial — see `canListBucket`. Once the startup probe has proven `s3:ListBucket`, S3
+    // answers a missing key with 404, so every remaining 403 is a real authorization failure
+    // (`InvalidAccessKeyId`, `SignatureDoesNotMatch`, `RequestTimeTooSkewed`, a revoked policy) and
+    // must REJECT. Reporting those as absent made a node whose key had been rotated, or whose clock
+    // had drifted, answer "I hold nothing" for every id — while its writes rejected loudly.
+    return statusCode === 403 && report403AsAbsent
   }
 
   function logContextFor(id: string, error: any): Record<string, string | number> {
@@ -255,59 +462,56 @@ export async function createS3BasedFileSystemContentStorage(
       uploadAbort.abort()
       abortedUpload = true
     }
+    // Set once lib-storage escalates to a multipart upload, so a failed or cancelled store can clean
+    // its parts up itself.
+    let multipartUploadId: string | undefined
     // Requests issued by the managed upload carry this signal, so cancelling tears the in-flight
     // request down instead of merely losing the race inside `done()`. See createAbortableClient.
-    const abortableClient = createAbortableClient(s3, uploadAbort.signal)
+    const abortableClient = createAbortableClient(s3, uploadAbort.signal, (uploadId) => {
+      multipartUploadId = uploadId
+    })
     await runStoreWithSignal(
       stream,
       signal,
       async () => {
-        // Inspect only the head for MIME detection, then stream the body straight to S3 so large
-        // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
-        // upload, buffering only part-sized chunks rather than the whole file.
-        const { head, body } = await peekHead(stream, MIME_DETECTION_BYTES)
-        const mimeType = await detectMimeTypeFromBuffer(head, logger)
-        // LOAD-BEARING, and it must stay immediately before the upload is constructed. An abort
-        // landing during the two awaits above found `upload` still undefined, so the listener's
-        // teardown did nothing — and with a small source already fully buffered into the head the
-        // upload no longer needs that source, so it would run to completion and commit content for
-        // an already-cancelled store. This is the checkpoint that stops it.
-        //
-        signal?.throwIfAborted()
-
-        upload = new Upload({
-          client: abortableClient,
-          abortController: uploadAbort,
-          params: {
-            Bucket,
-            Key: getKey(id),
-            Body: body,
-            ContentType: mimeType
-          }
-        })
-        // Re-checked because `getKey` above is CALLER-supplied code evaluated inside the params
-        // literal, i.e. after the checkpoint and before `upload` is assigned. A `getKey` that aborts
-        // the signal lands while the abort listener still sees `upload === undefined` and so tears
-        // nothing down, leaving an already-cancelled store to run to completion and commit. Nothing
-        // else in this gap can move the signal — the constructor and `done()`'s prologue are
-        // synchronous — but the caller's own callback can, so the upload is torn down here, where it
-        // provably exists.
-        if (signal?.aborted) {
-          abortUpload()
-          signal.throwIfAborted()
-        }
+        // Everything from the first read of the source onward is inside this try, so ANY failure
+        // releases it. `peekHead` has already pulled up to the detection window by then, and its
+        // body generator has not started — `Readable.from` does not pull until first read — so its
+        // own `iterator.return()` cleanup never runs and the source's descriptor would be held for
+        // the life of the process. The reachable throw here is a caller-supplied `getKey`, evaluated
+        // inside the params literal below.
         try {
-          await upload.done()
+          await uploadTo(id, stream, signal)
         } catch (error) {
           // Release the source stream if the upload stopped consuming the body (e.g. it failed
           // before reading anything, so peekHead's generator never started and can't self-clean).
           // Destroying the source releases its underlying resources (e.g. file descriptors).
           // No-op if already ended/destroyed. Guarded so a custom stream whose destroy() throws
-          // cannot replace the upload error the caller needs to see.
+          // cannot replace the upload error the caller needs to see. The listener is attached first:
+          // a stream torn down mid-open still emits 'error' afterwards.
           try {
+            stream.on('error', ignoreStreamError)
             stream.destroy()
           } catch {
             // best-effort cleanup; the upload error below is what matters
+          }
+          // Remove any parts this upload left behind. lib-storage issues its own
+          // `AbortMultipartUpload` only on the paths that run BEFORE `CompleteMultipartUpload`, so a
+          // complete request that was cancelled or failed leaves every uploaded part in the bucket —
+          // invisible, and billed until a lifecycle rule reaps it. Idempotent (a completed or
+          // already-aborted upload answers `NoSuchUpload`), issued on the REAL client so the signal
+          // that caused the teardown cannot cancel the cleanup too, and best-effort: it must never
+          // replace the error the caller needs to see.
+          if (multipartUploadId) {
+            try {
+              await s3.send(new AbortMultipartUploadCommand({ Bucket, Key: getKey(id), UploadId: multipartUploadId }))
+            } catch (cleanupError: any) {
+              logger.warn(`Could not abort the multipart upload of ${id}; its parts may persist in the bucket`, {
+                key: getKey(id),
+                uploadId: multipartUploadId,
+                error: cleanupError?.message ?? String(cleanupError)
+              })
+            }
           }
           // We aborted this upload, so its AbortError is provably our teardown: report the caller's
           // reason. An abort error we did NOT cause (an SDK-internal request abort racing the
@@ -322,6 +526,44 @@ export async function createS3BasedFileSystemContentStorage(
       // above attribute an AbortError to this cancellation.
       abortUpload
     )
+
+    async function uploadTo(id: string, stream: Readable, signal: AbortSignal | undefined): Promise<void> {
+      // Inspect only the head for MIME detection, then stream the body straight to S3 so large
+      // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
+      // upload, buffering only part-sized chunks rather than the whole file.
+      const { head, body } = await peekHead(stream, MIME_DETECTION_BYTES)
+      const mimeType = await detectMimeTypeFromBuffer(head, logger, fileTypeLoader)
+      // LOAD-BEARING, and it must stay immediately before the upload is constructed. An abort
+      // landing during the two awaits above found `upload` still undefined, so the listener's
+      // teardown did nothing — and with a small source already fully buffered into the head the
+      // upload no longer needs that source, so it would run to completion and commit content for
+      // an already-cancelled store. This is the checkpoint that stops it.
+      //
+      signal?.throwIfAborted()
+
+      upload = new Upload({
+        client: abortableClient,
+        abortController: uploadAbort,
+        params: {
+          Bucket,
+          Key: getKey(id),
+          Body: body,
+          ContentType: mimeType
+        }
+      })
+      // Re-checked because `getKey` above is CALLER-supplied code evaluated inside the params
+      // literal, i.e. after the checkpoint and before `upload` is assigned. A `getKey` that aborts
+      // the signal lands while the abort listener still sees `upload === undefined` and so tears
+      // nothing down, leaving an already-cancelled store to run to completion and commit. Nothing
+      // else in this gap can move the signal — the constructor and `done()`'s prologue are
+      // synchronous — but the caller's own callback can, so the upload is torn down here, where it
+      // provably exists.
+      if (signal?.aborted) {
+        abortUpload()
+        signal.throwIfAborted()
+      }
+      await upload.done()
+    }
   }
 
   async function retrieve(id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
@@ -330,8 +572,31 @@ export async function createS3BasedFileSystemContentStorage(
       const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
 
       const size = obj.ContentLength ?? null
-      const clampedEnd = range && size !== null ? clampRange(range, size) : undefined
       const encoding = obj.ContentEncoding || null
+
+      // A range over ENCODED content cannot be served from S3. The `Range` header slices the STORED
+      // (compressed) bytes, so the item would hand the caller a fragment of a gzip stream — which
+      // `asStream()` then fails to inflate (Z_DATA_ERROR), or, for a range starting at 0, inflates
+      // into the WHOLE object while advertising the requested length. Both are silently wrong
+      // answers to a request whose logical bounds S3 has no way to apply, because it stores no
+      // uncompressed-size metadata. This storage never writes `ContentEncoding` itself; an object
+      // that has one was put there by a migration or an operator.
+      //
+      // Rejecting, not `undefined`: the content IS here, this backend cannot serve this VIEW of it —
+      // the same distinction the rest of the read contract draws. The folder-based backend answers
+      // the identical call by inflating to its decompression cache, which has no S3 equivalent.
+      // Tested against the NORMALIZED coding: `identity` (and an empty header) mean the bytes are not
+      // encoded at all, so such an object is perfectly rangeable — rejecting it would have made any
+      // object an operator tagged `Content-Encoding: identity` permanently un-rangeable.
+      if (range && contentCodingOf(encoding) !== null) {
+        throw new RangeNotSupportedError(
+          `Cannot serve a range of ${getKey(id)}: it is stored with Content-Encoding '${encoding}', and S3 ranges ` +
+            `address the compressed bytes. Read it whole with retrieve(id) and slice the decoded stream, or store ` +
+            `it unencoded.`
+        )
+      }
+
+      const clampedEnd = range && size !== null ? clampRange(range, size) : undefined
       const itemSize = range ? (clampedEnd !== undefined ? clampedEnd - range.start + 1 : null) : size
 
       return new SimpleContentItem(
@@ -360,14 +625,18 @@ export async function createS3BasedFileSystemContentStorage(
         },
         itemSize,
         encoding,
-        // Same rule `fileInfo` applies: S3 keeps no uncompressed-size metadata, so for encoded
-        // content the logical size is genuinely unknown. Letting SimpleContentItem default it to
-        // `itemSize` passed the COMPRESSED byte count off as the content size to callers doing
-        // `contentSize ?? size`. `null` is the documented "unknown".
-        encoding ? null : itemSize
+        // Same rule `fileInfo` applies, via the same predicate: S3 keeps no uncompressed-size
+        // metadata, so for genuinely encoded content the logical size is unknown, and letting this
+        // default to `itemSize` would pass the COMPRESSED byte count off as the content size to
+        // callers doing `contentSize ?? size`. Codings that encode nothing — `identity`, and the
+        // `aws-chunked` S3 writes itself — must NOT be caught by that: those bytes are the content,
+        // and their size is known.
+        contentCodingOf(encoding) === null ? itemSize : null
       )
     } catch (error: any) {
-      if (error instanceof RangeError) throw error
+      // Caller-facing range problems, not storage faults: re-raised BEFORE `logStorageFailure`, which
+      // would otherwise emit one ERROR per request for what is a 416.
+      if (error instanceof RangeError || error instanceof RangeNotSupportedError) throw error
       // v3 reports the error code as `name` and the HTTP status under `$metadata`.
       if (isNotFound(error)) {
         warnIfForbidden('retrieving content', id, error)
@@ -397,7 +666,11 @@ export async function createS3BasedFileSystemContentStorage(
         new DeleteObjectsCommand({
           Bucket,
           Delete: {
-            Objects: batch.map(($) => ({ Key: getKey($) }))
+            Objects: batch.map(($) => ({ Key: getKey($) })),
+            // Only `Errors` is read below, and quiet mode still returns those in full. Without it S3
+            // echoes a <Deleted> element for every key — 1000 per request — all parsed out of XML and
+            // discarded.
+            Quiet: true
           }
         })
       )
@@ -427,30 +700,91 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function existMultiple(cids: string[]): Promise<Map<string, boolean>> {
     return new Map(
-      await mapWithConcurrency(
-        cids,
-        BATCH_CONCURRENCY,
-        async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]
-      )
+      await mapWithConcurrency(cids, BATCH_CONCURRENCY, async (cid): Promise<[string, boolean]> => [
+        cid,
+        await exist(cid)
+      ])
     )
   }
 
+  /**
+   * Walks the bucket yielding stored IDS, not keys.
+   *
+   * `prefix` filters IDS, matching the folder-based contract. It is pushed to S3 as a server-side
+   * `Prefix` only for the DEFAULT identity mapping, where an id prefix provably is a key prefix.
+   * `getKey` maps a complete id to a key, so applying it to a partial one is a category error: under
+   * a sharding mapping it yields a prefix no real key starts with, and every prefixed enumeration
+   * came back empty. A custom mapping therefore lists unprefixed and filters on the id here.
+   *
+   * Only keys the mapping round-trips are yielded — see the loop below.
+   */
   async function* allFileIds(prefix?: string): AsyncIterable<string> {
     const params: ListObjectsV2CommandInput = {
       Bucket,
       ContinuationToken: undefined
     }
 
-    if (prefix) {
+    // Server-side filtering ONLY for the identity mapping, where an id prefix provably is a key
+    // prefix. `getKey` maps a COMPLETE id to a key, so handing it a partial one is a category error:
+    // with a sharding mapping like `h => h.slice(0,4) + '/' + h`, `getKey('ab')` produced a Prefix no
+    // real key starts with, S3 returned nothing, and a prefix-sharded GC sweep concluded the bucket
+    // was empty. A local re-filter cannot repair that — it can only narrow what the server returned.
+    if (prefix && !options.getKey) {
       params.Prefix = prefix
     }
+
+    // Warned about once per enumeration rather than per key: a foreign bucket would otherwise emit a
+    // line per object, and one is enough to act on.
+    let warnedAboutForeignKeys = false
 
     let output: ListObjectsV2CommandOutput
     do {
       output = await s3.send(new ListObjectsV2Command(params))
       if (output.Contents) {
         for (const content of output.Contents) {
-          yield content.Key!
+          const key = content.Key!
+          let id: string | undefined
+          let notOwnedBecause: string | undefined
+          try {
+            const candidate = getId(key)
+            const roundTripped = getKey(candidate)
+            if (roundTripped === key) id = candidate
+            else notOwnedBecause = `round-tripped to ${roundTripped}`
+          } catch (error: any) {
+            // A strict inverse that parses its own namespace THROWS on a key from outside it, which
+            // is a clear "not mine" rather than a fault. Letting it propagate would fail the entire
+            // enumeration over one object this storage does not own — turning a shared bucket into
+            // an unenumerable one. `getKey` is caller code too, so it is inside the same guard.
+            notOwnedBecause = `mapping threw: ${error?.message ?? String(error)}`
+          }
+          // ROUND TRIP, not just an inverse call. `getId` is applied to every key the bucket returns,
+          // including ones this mapping never produced — and a lossy inverse maps those onto ids that
+          // look real. With `getKey: h => h.slice(0,4) + '/' + h`, a foreign `zz/abcdef` yields the id
+          // `abcdef`, whose actual key is `ab/abcdef`: enumeration reported that id TWICE, and a GC
+          // sweep that deleted what it enumerated destroyed the real object while leaving the foreign
+          // one untouched. Requiring `getKey(id) === key` is the same invariant the folder-based
+          // backend enforces on its paths, and it makes storing and enumerating provably inverse.
+          //
+          // Filtering rather than yielding is the safe direction: a key that does not round-trip is
+          // already unreachable through `retrieve`/`delete`, which would compute a different key for
+          // that id, so nothing reachable is being hidden.
+          if (id === undefined) {
+            if (!warnedAboutForeignKeys) {
+              warnedAboutForeignKeys = true
+              logger.warn(
+                `Skipping bucket keys that this storage's getKey/getId mapping does not round-trip; they are not ` +
+                  `ids of content it owns. Enumerating them would report phantom ids, and a caller deleting what ` +
+                  `it enumerated could remove real content stored under a different key.`,
+                { key, reason: notOwnedBecause ?? 'unknown' }
+              )
+            }
+            continue
+          }
+          // Always re-checked against the ID. For a custom mapping this is the ONLY prefix filter,
+          // since the request above was unprefixed; for the identity mapping it is a cheap
+          // confirmation.
+          if (prefix && !id.startsWith(prefix)) continue
+          yield id
         }
       }
       params.ContinuationToken = output.NextContinuationToken
@@ -463,10 +797,15 @@ export async function createS3BasedFileSystemContentStorage(
     try {
       const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
       const size = obj.ContentLength ?? null
+      const encoding = obj.ContentEncoding || null
+      // Normalized exactly as `retrieve` normalizes it, so the two surfaces never disagree about one
+      // id: an object tagged `Content-Encoding: identity` is not encoded, so it reports a known
+      // `contentSize` and a `null` encoding rather than claiming its size is unknown.
+      const coding = contentCodingOf(encoding)
       return {
-        encoding: obj.ContentEncoding || null,
+        encoding: normalizeContentEncoding(encoding),
         size,
-        contentSize: obj.ContentEncoding ? null : size
+        contentSize: coding === null ? size : null
       }
     } catch (error: any) {
       if (isNotFound(error)) {
@@ -480,11 +819,10 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function fileInfoMultiple(cids: string[]): Promise<Map<string, FileInfo | undefined>> {
     return new Map(
-      await mapWithConcurrency(
-        cids,
-        BATCH_CONCURRENCY,
-        async (cid): Promise<[string, FileInfo | undefined]> => [cid, await fileInfo(cid)]
-      )
+      await mapWithConcurrency(cids, BATCH_CONCURRENCY, async (cid): Promise<[string, FileInfo | undefined]> => [
+        cid,
+        await fileInfo(cid)
+      ])
     )
   }
 

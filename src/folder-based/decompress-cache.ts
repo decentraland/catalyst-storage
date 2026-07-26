@@ -114,9 +114,25 @@ export function createDecompressCache(
   // Unlinks an evicted cache file under the path lock, re-checking the entry is still current: a
   // store may have promoted the path to primary content (forgetting the entry) between the eviction
   // scan and this delete — unlinking then would destroy the only copy of the new content.
-  async function evictEntry(filePath: string, entry: { size: number; lastAccess: number }): Promise<void> {
+  async function evictEntry(
+    filePath: string,
+    entry: { size: number; lastAccess: number },
+    /**
+     * The entry's `lastAccess` when the pass selected it. A pass takes its snapshot and then awaits
+     * an unlink per entry, so by the time this runs the entry may have been TOUCHED by a read that
+     * started afterwards — and `touch` mutates the same object, so the identity check above still
+     * matches and the entry would be evicted anyway. LRU then does the opposite of what it promises:
+     * the most recently used file is the one deleted, and the reader that touched it finds its
+     * lazily-opened stream gone. Admission-triggered passes made this window wide, because eviction
+     * now begins while the caller is still working rather than only on the timer.
+     *
+     * Omitted by `evictAll`, which is shutdown and must not be deferred by concurrent activity.
+     */
+    expectedLastAccess?: number
+  ): Promise<void> {
     await withPathLock(filePath, async () => {
       if (entries.get(filePath) !== entry) return
+      if (expectedLastAccess !== undefined && entry.lastAccess !== expectedLastAccess) return
       await noFailUnlink(filePath)
       // Keep the tracking when the file survives the unlink, so the next eviction tick retries it
       // instead of leaving an untracked (unaccounted, never-retried) cache file on disk.
@@ -126,23 +142,82 @@ export function createDecompressCache(
     })
   }
 
+  /**
+   * Evicts one entry without letting its failure end the pass.
+   *
+   * `existsForInvariant` THROWS on anything that is not ENOENT/ENOTDIR — that is its purpose — so a
+   * single cache file on a damaged mount (EIO, EACCES) used to abort the whole loop. Map iteration is
+   * insertion-ordered, so every entry behind it was skipped and the size-eviction block below was
+   * never reached; the poisoned entry is never removed, so EVERY subsequent tick died in the same
+   * place and `maxSize` stopped being enforced for the life of the process. The same throw also
+   * rejected `stop()` through `evictAll`, leaving every tracked file on disk.
+   *
+   * The entry stays tracked, so the next tick retries it — recovering on its own once the underlying
+   * fault is fixed.
+   */
+  async function evictEntrySafely(
+    filePath: string,
+    entry: { size: number; lastAccess: number },
+    expectedLastAccess?: number
+  ): Promise<void> {
+    try {
+      await evictEntry(filePath, entry, expectedLastAccess)
+    } catch (error) {
+      logger.warn(`Could not evict the cached decompressed file at ${filePath}; it stays tracked for a later retry`, {
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+
+  /** Set when an admission crossed the budget while a pass was already running. */
+  let evictionRequestedAgain = false
+  /** Set when a pass ends over budget having freed nothing, so retries wait for the timer. */
+  let evictionStalled = false
+
   async function runEviction() {
     const now = Date.now()
+    const before = totalCacheSize
 
     // TTL eviction
     for (const [filePath, entry] of entries) {
       if (now - entry.lastAccess > options.ttl) {
-        await evictEntry(filePath, entry)
+        await evictEntrySafely(filePath, entry, entry.lastAccess)
       }
     }
 
     // Size eviction (LRU)
     if (totalCacheSize > options.maxSize) {
       const sorted = [...entries.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess)
-      for (const [filePath, entry] of sorted) {
+      // The most recently used entry is never evicted here, so a budget smaller than a single
+      // decompressed file cannot delete the copy the request that just created it is about to open —
+      // `retrieve` builds a LAZY ContentItem, so the file has to outlive the call. This is only a
+      // guarantee for the SINGLE-entry case: with concurrent inflations of different ids the
+      // just-recorded entry may not be the most recent by the time a pass runs, and its lazily-opened
+      // stream can still fail ENOENT. Callers already have to treat that as a retryable miss (see the
+      // read contract). The cache holds at most `maxSize` plus one file; TTL reclaims the survivor.
+      // `lastAccess` is captured with the snapshot, so an entry touched after the pass chose it is
+      // no longer a valid LRU victim and is skipped.
+      const candidates = sorted.slice(0, -1).map(([filePath, entry]) => ({ filePath, entry, at: entry.lastAccess }))
+      for (const { filePath, entry, at } of candidates) {
         if (totalCacheSize <= options.maxSize) break
-        await evictEntry(filePath, entry)
+        await evictEntrySafely(filePath, entry, at)
       }
+    }
+
+    // Entries admitted DURING this pass are missing from the snapshot above, and `evict()` turned
+    // every `record()` in that window into a no-op by handing back the in-flight promise. Without a
+    // re-arm a burst of range requests settled ~9x over budget and stayed there until the next timer
+    // tick. Only re-run while progress is being made: a pass that frees nothing (an unlinkable file,
+    // or nothing evictable left besides the protected MRU entry) would otherwise spin on every
+    // admission, retrying a failing unlink and logging each time.
+    const freedSomething = totalCacheSize < before
+    if (totalCacheSize > options.maxSize && !freedSomething) {
+      evictionStalled = true
+      return
+    }
+    if ((evictionRequestedAgain || totalCacheSize > options.maxSize) && freedSomething) {
+      evictionRequestedAgain = false
+      await runEviction()
     }
   }
 
@@ -152,7 +227,12 @@ export function createDecompressCache(
   // resolve while the actual eviction is still unlinking files.
   let inflightEviction: Promise<void> | undefined
   function evict(): Promise<void> {
-    if (inflightEviction) return inflightEviction
+    // A timer tick always clears the stall: whatever made the last pass unproductive may be gone.
+    evictionStalled = false
+    if (inflightEviction) {
+      evictionRequestedAgain = true
+      return inflightEviction
+    }
     inflightEviction = runEviction()
       .catch((error) => logger.warn(`Cache eviction failed: ${error}`))
       .finally(() => {
@@ -198,6 +278,20 @@ export function createDecompressCache(
       forget(filePath)
       entries.set(filePath, { size, lastAccess: Date.now() })
       totalCacheSize += size
+      // The budget was previously consulted ONLY by the periodic sweep, so it bounded nothing between
+      // ticks: a burst of range requests over distinct gzip-only ids (a sync or backfill pass is
+      // exactly that shape) could each inflate up to `decompressMaxFileSize` and write hundreds of
+      // gigabytes against a 5GB budget before the first tick fired. Crossing the limit now triggers
+      // an eviction immediately. `evict()` deduplicates itself, so a burst schedules one pass, not
+      // one per entry; it is deliberately not awaited — `record` runs inside a commit holding this
+      // path's lock, and the eviction it starts needs that same lock.
+      if (totalCacheSize > options.maxSize && !evictionStalled) {
+        if (inflightEviction) {
+          evictionRequestedAgain = true
+        } else {
+          void evict()
+        }
+      }
     },
     async remove(filePath: string): Promise<boolean> {
       const entry = entries.get(filePath)
@@ -220,8 +314,10 @@ export function createDecompressCache(
       }
     },
     async evictAll(): Promise<void> {
+      // Isolated per entry for the same reason as the periodic pass: one unreadable file must not
+      // reject stop() and strand every other cached file on disk.
       for (const [filePath, entry] of entries) {
-        await evictEntry(filePath, entry)
+        await evictEntrySafely(filePath, entry)
       }
     }
   }

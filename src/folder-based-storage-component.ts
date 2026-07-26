@@ -11,8 +11,18 @@ import { createFsInvariants } from './folder-based/fs-invariants'
 import { createDecompressCache, InvalidationToken } from './folder-based/decompress-cache'
 import { createIntentJournal, TEMP_DIR_NAME, UncommittedIntentSurvivedError } from './folder-based/intent-journal'
 import { DecompressionLimitExceededError, PathNotContainedError } from './folder-based/errors'
+import { assertValidContentId, GZIP_EXTENSION } from './content-id'
 
 const pipe = promisify(pipeline)
+
+/**
+ * Absorbs a stream's 'error' after it has been torn down.
+ *
+ * A stream destroyed while its `open(2)` is still in flight goes on to emit 'error', and with no
+ * listener that is an uncaught exception which terminates the process by default. Shared rather than
+ * re-created at each teardown site so there is one thing to reason about.
+ */
+const ignoreStreamError = (): void => undefined
 
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
@@ -176,14 +186,28 @@ export async function createFolderBasedFileSystemContentStorage(
   // operation that needs it fails loudly and `forgetDirectory` lets the retry recreate it.
   // Bounded by construction with hash prefixes (16^4 = 65,536 shards) and capped for flat mode,
   // where slash-containing ids can nest arbitrarily.
-  /** This storage's own suffix for an id's compressed representation. Reserved: ids may not end in it. */
-  const GZIP_EXTENSION = '.gzip'
-
   const MAX_KNOWN_DIRECTORIES = 100_000
   const knownDirectories = new Set<string>()
 
   function forgetDirectory(dirname: string): void {
     knownDirectories.delete(dirname)
+  }
+
+  /**
+   * Records a directory this instance has observed to exist, so its later disappearance is
+   * recognizable as damage rather than as an id that was never stored.
+   *
+   * Written by both the write path (which creates the directory) and the read path (which only
+   * observes it) — "created or observed", as the cache is documented.
+   */
+  function rememberDirectory(dirname: string): void {
+    if (knownDirectories.has(dirname)) return
+    // Clear wholesale rather than evicting one entry: the cache only holds directory names, so a
+    // rebuild costs one syscall per directory touched afterwards.
+    if (knownDirectories.size >= MAX_KNOWN_DIRECTORIES) {
+      knownDirectories.clear()
+    }
+    knownDirectories.add(dirname)
   }
 
   /**
@@ -225,7 +249,7 @@ export async function createFolderBasedFileSystemContentStorage(
       withPathLock,
       // Resolved lazily: reconciliation runs after construction, so getFilePath's state is ready by
       // then (it is declared above this call for that reason).
-      resolveFilePath: (id: string) => getFilePath(id)
+      resolveFilePath: (id: string) => resolveFilePath(id)
     },
     { tempDir, tempDirName, atomic: ATOMIC_MODE, useHashPrefix: USE_HASH_PREFIX }
   )
@@ -252,7 +276,17 @@ export async function createFolderBasedFileSystemContentStorage(
     parentAlreadyProvenIntact = false
   ): Promise<{ size: number } | undefined> {
     try {
-      return await components.fs.stat(filePath)
+      const stat = await components.fs.stat(filePath)
+      // Successfully statting a file PROVES its parent is an intact directory — nothing can be
+      // statted inside a path that is not one. Recording that observation is what lets a LATER
+      // disappearance of the same directory be classified as damage instead of as "nothing was ever
+      // stored here". Load-bearing since reads stopped creating directories: `getFilePath` used to
+      // populate this set on every read as a side effect of its `mkdir`, so an instance that only
+      // ever READS would otherwise never learn which shards exist, and would answer a destroyed
+      // shard with `false` for every id in it — the "broken storage looks like an empty node"
+      // outcome this contract exists to prevent, on exactly the read-heavy node most likely to hit it.
+      rememberDirectory(path.dirname(filePath))
+      return stat
     } catch (err: any) {
       // ENAMETOOLONG joins ENOENT/ENOTDIR as PROVABLY absent: no file of that name can exist, so it
       // is a miss rather than a storage fault. `exist()` answered `false` for it before switching to
@@ -266,62 +300,87 @@ export async function createFolderBasedFileSystemContentStorage(
       // downgrading a fault to a miss — is narrower than the races the read path already tolerates.
       if (parentAlreadyProvenIntact) return undefined
       // A missing-file error here has two very different meanings, and only one of them is a miss.
-      // `getFilePath` created the parent directory (or served it from the cache) immediately before
-      // this probe, so an INTACT DIRECTORY must be sitting there. Anything else means the tree this
-      // instance owns was damaged underneath it — the shard was removed, taking every id inside it,
-      // or something replaced it with a file — which is a storage fault, not this id being absent.
-      // Reporting absence would hand back a 404 for a broken store.
+      // The parent directory decides which — and it must be proven to be a DIRECTORY, not merely
+      // present: an access check passes for a regular file left at the shard path, while every stat
+      // beneath it fails with ENOTDIR, so "present" alone would classify a corrupted tree as a miss.
       //
-      // The parent must be proven to be a DIRECTORY, not merely present: an access check passes for a
-      // regular file left at the shard path, while every stat beneath it fails with ENOTDIR, so
-      // "present" alone would classify a corrupted tree as a miss. A probe that fails for any reason
-      // is likewise not proof, so it does not earn one either.
-      //
-      // Costs one syscall, and only after a stat has already failed — hits, the hot path this cache
-      // exists for, are untouched. Invalidating also lets a write recreate the tree once whatever is
-      // occupying the path is gone (a foreign file is never removed here: destroying something this
-      // storage cannot prove it owns is exactly what the reserved-namespace checks refuse to do).
+      // Costs one syscall, and only after a stat has already failed — hits, the hot path the
+      // directory cache exists for, are untouched.
       const dirname = path.dirname(filePath)
-      let parentIsIntact = false
+      let parent: { isDirectory(): boolean } | undefined
+      let parentProbeFailure: unknown
       try {
-        parentIsIntact = (await components.fs.stat(dirname)).isDirectory()
-      } catch {
-        parentIsIntact = false
+        parent = await components.fs.stat(dirname)
+      } catch (probeErr: any) {
+        parentProbeFailure = probeErr
       }
-      if (!parentIsIntact) {
+
+      // An intact directory that simply does not contain this file: the ordinary miss. Remembered
+      // for the same reason as a successful stat above — it is proof this shard exists right now.
+      if (parent?.isDirectory()) {
+        rememberDirectory(dirname)
+        return undefined
+      }
+
+      // Something is AT the shard path but is not a directory. Never a legitimate empty state — a
+      // regular file there makes every id in the shard unreadable — so it is a fault whoever created
+      // it. Invalidating the cache entry lets a write recreate the tree once whatever occupies the
+      // path is gone (a foreign file is never removed here: destroying something this storage cannot
+      // prove it owns is exactly what the reserved-namespace checks refuse to do).
+      if (parent) {
         forgetDirectory(dirname)
-        logger.warn(`Refusing to report ${filePath} as absent: its parent directory is missing or is not a directory`)
+        logger.warn(`Refusing to report ${filePath} as absent: its parent path exists but is not a directory`)
         throw err
       }
-      return undefined
+
+      // The parent could not be read at all. If the probe failed for a reason OTHER than the
+      // directory being absent (EACCES, EIO), this storage cannot answer the question and must not
+      // pretend the id is missing.
+      // ENOTDIR here means an ANCESTOR of the shard is not a directory — a hard obstruction that
+      // makes every id beneath it unreadable, never a legitimate empty state. It belongs with the
+      // "parent exists but is not a directory" case above, not with "the shard was never created".
+      const probeCode = (parentProbeFailure as { code?: string } | null)?.code
+      if (probeCode !== 'ENOENT') {
+        forgetDirectory(dirname)
+        logger.warn(`Refusing to report ${filePath} as absent: its parent directory could not be read`)
+        throw err
+      }
+
+      // The parent directory does not exist. Reads no longer create it (see `resolveFilePath`), so
+      // this is the normal answer for a shard nothing was ever stored in — the id is absent. It is a
+      // FAULT only when this instance created or observed that directory, which means the tree it
+      // owns was destroyed underneath it, taking every id inside with it.
+      if (!knownDirectories.has(dirname)) return undefined
+      forgetDirectory(dirname)
+      logger.warn(`Refusing to report ${filePath} as absent: its parent directory was removed underneath us`)
+      throw err
     }
   }
 
-  async function getFilePath(id: string): Promise<string> {
-    // An empty id resolves to the containment directory itself, which is a directory and not anyone's
-    // content. It is also the one input the round-trip check below cannot reject on its own, because
-    // an empty id and an empty relative path are equal.
-    if (id.length === 0) {
-      throw new PathNotContainedError('The id is empty, so it does not name a file inside the storage folder')
-    }
-
-    // `<id>.gzip` is this storage's own name for the compressed representation of `<id>`, so an id
-    // ending in it is not addressable: it occupies another id's second path. The damage is not
-    // hypothetical — storing `foo` and `foo.gzip` made `retrieve('foo')` serve `foo.gzip`'s bytes
-    // (inflating them, with a contentSize read out of the wrong file's last four bytes),
-    // `exist('foo.gzip')` answer false, and `allFileIds()` report a phantom `foo` twice while never
-    // listing `foo.gzip` — so a consumer syncing or GC-ing from it would delete real content.
-    if (id.endsWith(GZIP_EXTENSION)) {
-      throw new PathNotContainedError(
-        `The id ends in ${GZIP_EXTENSION}, which names the compressed representation of another id: ${JSON.stringify(id)}`
-      )
-    }
-
-    // A NUL byte cannot be part of a filename; `fs` rejects it with ERR_INVALID_ARG_VALUE, which is
-    // not one of the "provably absent" codes, so it would surface from `exist()` as a storage fault.
-    if (id.includes('\0')) {
-      throw new PathNotContainedError(`The id contains a NUL byte, which no filename can hold`)
-    }
+  /**
+   * Resolves an id to its canonical path, validating it, WITHOUT touching the filesystem.
+   *
+   * Read paths use this. `getFilePath` (which also creates the parent) is for writes only: creating
+   * a directory is a side effect a read has no business having, and it was not free. With hash
+   * prefixes it merely pre-created all 65,536 shards over time, but in flat mode ids nest, so every
+   * probe of a NEVER-STORED nested id — `exist('a/b/c/missing')` — left `a/b/c/` behind permanently.
+   * A caller passing through untrusted ids could grow the inode count without limit, and
+   * `allFileIds()` then walked those empty trees on every enumeration, forever.
+   */
+  async function resolveFilePath(id: string): Promise<string> {
+    // The id-shape rules shared with every other backend, so they cannot drift apart:
+    // - an empty id resolves to the containment directory itself, which is a directory and not
+    //   anyone's content (and is the one input the round-trip check below cannot reject on its own,
+    //   because an empty id and an empty relative path are equal);
+    // - `<id>.gzip` is this storage's own name for the compressed representation of `<id>`, so an id
+    //   ending in it is not addressable: it occupies another id's second path. The damage is not
+    //   hypothetical — storing `foo` and `foo.gzip` made `retrieve('foo')` serve `foo.gzip`'s bytes
+    //   (inflating them, with a contentSize read out of the wrong file's last four bytes),
+    //   `exist('foo.gzip')` answer false, and `allFileIds()` report a phantom `foo` twice while never
+    //   listing `foo.gzip` — so a consumer syncing or GC-ing from it would delete real content;
+    // - a NUL byte cannot be part of a filename; `fs` rejects it with ERR_INVALID_ARG_VALUE, which is
+    //   not one of the "provably absent" codes, so it would surface from `exist()` as a storage fault.
+    assertValidContentId(id)
 
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
     // for the file system to handle millions of files in the same directory.
@@ -331,9 +390,6 @@ export async function createFolderBasedFileSystemContentStorage(
     const directoryPath = path.normalize(USE_HASH_PREFIX ? path.join(root, hash) : root)
 
     const finalPath = path.normalize(path.join(directoryPath, id))
-
-    // recursively creates the directory structure if needed
-    const dirname = path.dirname(finalPath)
 
     // ALIASING check: the id must resolve to EXACTLY its own path. `path.join` normalizes what it
     // builds, so several distinct id strings can land on one file — `a/../victim`, `./victim`,
@@ -370,6 +426,18 @@ export async function createFolderBasedFileSystemContentStorage(
       throw new PathNotContainedError('Cannot manipulate files inside the reserved temp-write folder')
     }
 
+    return finalPath
+  }
+
+  /**
+   * Resolves an id AND ensures its parent directory exists. For WRITE paths only — see
+   * `resolveFilePath` for why reads must not create anything.
+   */
+  async function getFilePath(id: string): Promise<string> {
+    const finalPath = await resolveFilePath(id)
+    // recursively creates the directory structure if needed
+    const dirname = path.dirname(finalPath)
+
     if (!knownDirectories.has(dirname)) {
       if (!(await components.fs.existPath(dirname))) {
         await components.fs.mkdir(dirname, { recursive: true })
@@ -397,12 +465,16 @@ export async function createFolderBasedFileSystemContentStorage(
     id: string,
     encoding: string | null,
     range?: { start: number; end: number },
-    resolveContentSize = true
+    resolveContentSize = true,
+    // An id's two representations share a parent directory, so an earlier probe in the SAME operation
+    // that RESOLVED (rather than threw) has already proven it intact. `exist()` and `fileInfo()` both
+    // pass this along; without it `retrieve()` on a missing id paid four stats where three suffice.
+    parentProven = false
   ): Promise<ContentItem | undefined> => {
     const extension = encoding ? '.' + encoding : ''
-    const filePath = (await getFilePath(id)) + extension
+    const filePath = (await resolveFilePath(id)) + extension
 
-    const stat = await statForRead(filePath)
+    const stat = await statForRead(filePath, parentProven)
     if (!stat) return undefined
 
     if (range) {
@@ -433,6 +505,90 @@ export async function createFolderBasedFileSystemContentStorage(
     return new SimpleContentItem(async () => components.fs.createReadStream(filePath), stat.size, encoding, contentSize)
   }
 
+  /**
+   * Passes through only the bytes in `[start, end]` of the stream flowing through it, then ends.
+   *
+   * Used to serve a range straight from an inflating gzip when there is nowhere safe to cache the
+   * decompressed copy.
+   */
+  function createRangeSliceTransform(start: number, end: number, onWindowComplete: () => void): Transform {
+    let seen = 0
+    let completed = false
+    return new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        const chunkStart = seen
+        seen += chunk.length
+        if (seen <= start || chunkStart > end) {
+          // Entirely before or entirely after the window.
+          callback()
+          return
+        }
+        const from = Math.max(0, start - chunkStart)
+        const to = Math.min(chunk.length, end - chunkStart + 1)
+        callback(null, chunk.subarray(from, to))
+        // Everything asked for has been emitted. `push(null)` alone would NOT stop the work: it ends
+        // only this transform's readable side, leaving the writable side open so `pipeline` keeps
+        // pumping — measured, a 10-byte range off an 8MB gzip still inflated all 8MB after the
+        // consumer had its bytes. The source has to be destroyed explicitly.
+        if (!completed && seen > end) {
+          completed = true
+          this.push(null)
+          onWindowComplete()
+        }
+      }
+    })
+  }
+
+  /**
+   * Serves a range by inflating the gzip and slicing the decompressed stream, caching nothing.
+   *
+   * This is the LEGACY (no-`rename`) path. Everywhere else a range over gzip-only content is served
+   * from a decompressed copy written to the canonical raw path — but publishing that copy needs an
+   * atomic rename. Without one the inflation streams DIRECTLY onto the canonical path, and reads take
+   * no lock, so a concurrent reader could stat the half-written file and be served its truncated
+   * bytes as valid content, with no error. That is reachable from a purely READ-ONLY workload,
+   * because the decompression cache is itself a write on the read path — the mode's documented
+   * "reads concurrent with writes need rename" caveat does not cover it.
+   *
+   * The trade is per-request CPU: nothing is cached, so each range re-inflates. Correctness over
+   * throughput, in a mode that exists only for backward compatibility.
+   */
+  async function rangeFromGzipStream(
+    id: string,
+    range: { start: number; end: number }
+  ): Promise<ContentItem | undefined> {
+    const gzipItem = await retrieveWithEncoding(id, 'gzip')
+    if (!gzipItem) return undefined
+
+    // The range is NOT clamped against the gzip trailer. The cached path clamps against the measured
+    // size of the inflated file; the trailer is stored, attacker-controlled data that is only
+    // accurate mod 2^32 and reports just the last member of a multi-member gzip, so bounding a read
+    // with it made the two modes disagree about both the length of an id and whether a request was
+    // even valid. The slice simply ends at EOF, and `size` is `null` — the documented "unknown" —
+    // rather than a number this storage cannot stand behind.
+    validateRange(range)
+    const { start, end } = range
+
+    return new SimpleContentItem(
+      async () => {
+        const source = await gzipItem.asStream()
+        const slice = createRangeSliceTransform(start, end, () => {
+          // Listener first: the destroy races an in-flight read, and the resulting premature close
+          // must not surface as an uncaught 'error'.
+          source.on('error', ignoreStreamError)
+          source.destroy()
+        })
+        // Same cap as the cached path: a decompression bomb must not be able to stream unbounded
+        // data just because the output is not being written to disk.
+        pipeline(source, createSizeLimitTransform(MAX_DECOMPRESSED_SIZE), slice, () => undefined)
+        return slice
+      },
+      null,
+      null,
+      null
+    )
+  }
+
   async function gzipSourceVanishedForRead(gzipPath: string): Promise<boolean> {
     // Was a failed inflation the SOURCE disappearing under a concurrent delete — an expected race —
     // or this storage's own machinery breaking? The error cannot answer that: neither its code nor
@@ -459,7 +615,23 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
-  async function inflateGzipItemInto(gzipItem: ContentItem, target: string): Promise<void> {
+  /** Counts the bytes flowing through it, so a completed inflation knows its own output size. */
+  function createByteCounter(onTotal: (total: number) => void): Transform {
+    let total = 0
+    return new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        total += chunk.length
+        callback(null, chunk)
+      },
+      flush(callback) {
+        onTotal(total)
+        callback()
+      }
+    })
+  }
+
+  /** Returns how many bytes were written, so callers need no `stat` to register the result. */
+  async function inflateGzipItemInto(gzipItem: ContentItem, target: string): Promise<number> {
     // Both streams are created inside the try and torn down if anything fails before `pipe` takes
     // ownership: arguments evaluate left to right, so the source (and the file descriptor behind it)
     // already exists by the time the destination is constructed, and a custom adapter may throw
@@ -468,20 +640,27 @@ export async function createFolderBasedFileSystemContentStorage(
     // it has already destroyed both, so the teardown here is a no-op in the common failure case.
     let source: Readable | undefined
     let destination: Writable | undefined
+    let written = 0
     try {
       source = await gzipItem.asStream()
       destination = components.fs.createWriteStream(target)
       // Cap how much the gzip may inflate to so a decompression bomb cannot write an unbounded file
       // to disk. The gzip trailer's declared size is attacker-controllable, so the limit is enforced
       // on the actual inflated bytes.
-      await pipe(source, createSizeLimitTransform(MAX_DECOMPRESSED_SIZE), destination)
+      await pipe(
+        source,
+        createSizeLimitTransform(MAX_DECOMPRESSED_SIZE),
+        createByteCounter((total) => (written = total)),
+        destination
+      )
+      return written
     } catch (err) {
       for (const stream of [source, destination]) {
         try {
           // Listener first: a stream destroyed while its `open(2)` is still in flight still emits
           // 'error' afterwards, and with none attached that becomes an uncaught exception rather
           // than the failure being rethrown below.
-          stream?.on('error', () => undefined)
+          stream?.on('error', ignoreStreamError)
           stream?.destroy()
         } catch {
           // best-effort teardown; the failure below is what matters
@@ -506,21 +685,30 @@ export async function createFolderBasedFileSystemContentStorage(
     const gzipPath = uncompressedPath + '.gzip'
     const sourceVanished = () => gzipSourceVanishedForRead(gzipPath)
     const { rename } = components.fs
-    if (rename) {
+    // Callers only reach the decompression cache in atomic mode: without `rename` there is nowhere to
+    // publish the inflated copy atomically, so `retrieve` serves those ranges by streaming instead
+    // (see `rangeFromGzipStream`). The in-place variant that used to live here wrote straight onto the
+    // canonical path, where a concurrent reader could be served its truncated bytes.
+    if (!rename) {
+      throw new Error('The decompression cache requires rename support')
+    }
+    {
       // Stage the inflation in the temp dir so a process killed mid-decompress can never leave a
       // partial file at the canonical uncompressed path — a later range request would silently serve
       // its truncated bytes as valid content.
       const writePath = journal.newTempPath()
       try {
-        await inflateGzipItemInto(gzipItem, writePath)
+        const inflatedSize = await inflateGzipItemInto(gzipItem, writePath)
         // Commit under the path lock so this rename can never interleave with a store or delete on
         // the same canonical path; discard when the source gzip was replaced or the id deleted while
         // inflating.
         const committed = await withPathLock(uncompressedPath, async () => {
           if (token.invalidated) return false
           await rename(writePath, uncompressedPath)
-          const stat = await components.fs.stat(uncompressedPath)
-          cache.record(uncompressedPath, stat.size)
+          // Registered with the size the inflation itself counted, not a fresh `stat`: a stat that
+          // failed AFTER the rename had landed skipped `record` entirely, leaving a decompressed copy
+          // at the canonical path that eviction never knew about and `allFileIds` hides.
+          cache.record(uncompressedPath, inflatedSize)
           return true
         })
         if (!committed) {
@@ -529,6 +717,11 @@ export async function createFolderBasedFileSystemContentStorage(
       } catch (err) {
         // Remove the partial staged file; the canonical path was never touched.
         await noFailUnlink(writePath)
+        // The staged inflation lands in the same reserved directory as staged stores, and heals it
+        // the same way if it vanished underneath a live instance.
+        if ((err as { code?: string } | null)?.code === 'ENOENT') {
+          await journal.ensureTempDir().catch(() => undefined)
+        }
         // An invalidated token means the id was overwritten/deleted while inflating — the failure
         // belongs to the replaced gzip, not to the caller's request. Resolving lets the retry loop
         // observe the new representation instead of the error bubbling into a spurious undefined for
@@ -536,28 +729,53 @@ export async function createFolderBasedFileSystemContentStorage(
         if (token.invalidated || (await sourceVanished())) return
         throw err
       }
-      return
     }
+  }
 
-    // In-place (no rename) legacy path: there is no staging, so the ENTIRE inflate/register sequence
-    // runs under the path lock and honors the invalidation token — a concurrent store/delete
-    // completing first must not be overwritten by a stale decompression, and the cleanup of a failed
-    // inflation must not race a newer writer.
-    await withPathLock(uncompressedPath, async () => {
-      if (token.invalidated) return
-      try {
-        await inflateGzipItemInto(gzipItem, uncompressedPath)
-      } catch (err) {
-        // Under the lock the partial file is provably ours to remove.
-        await noFailUnlink(uncompressedPath)
-        // Defensive symmetry with the staged branch: writers take this same lock, so the token cannot
-        // flip mid-section today.
-        if (token.invalidated || (await sourceVanished())) return
-        throw err
+  /**
+   * Pipes a source into a freshly created write stream at `target`.
+   *
+   * The destination is constructed inside a try because native `fs` reports an open failure
+   * asynchronously but a custom adapter may THROW synchronously — and then `pipeline` never takes
+   * ownership of the source, leaving the caller's stream paused and undestroyed with its descriptor
+   * (or socket) held for the life of the process. `inflateGzipItemInto` and `compressContentFile`
+   * already guard this window; the three store pipes did not.
+   */
+  async function pipeTo(source: Readable, target: string): Promise<void> {
+    let destination: Writable
+    try {
+      destination = components.fs.createWriteStream(target)
+    } catch (err) {
+      // Listener first: a stream destroyed mid-open still emits 'error' afterwards, and with none
+      // attached that is an uncaught exception rather than the failure being rethrown here.
+      source.on('error', ignoreStreamError)
+      source.destroy()
+      throw err
+    }
+    await pipe(source, destination)
+  }
+
+  /**
+   * A staged write, which additionally heals the reserved staging directory.
+   *
+   * That directory is created once, at construction. If something removes it while this instance is
+   * live, EVERY store and every gzip range read failed at its staged write, permanently, because
+   * nothing recreated it — and `writingUnder` responded by invalidating the SHARD directory, which
+   * was never the problem. Shard directories already self-heal exactly this way.
+   *
+   * This store still fails: its source has already been consumed, so there is nothing left to
+   * re-pipe. What is restored is the directory, so the next store succeeds instead of inheriting a
+   * permanently broken instance.
+   */
+  async function pipeToStaged(source: Readable, target: string): Promise<void> {
+    try {
+      await pipeTo(source, target)
+    } catch (err) {
+      if ((err as { code?: string } | null)?.code === 'ENOENT') {
+        await journal.ensureTempDir().catch(() => undefined)
       }
-      const stat = await components.fs.stat(uncompressedPath)
-      cache.record(uncompressedPath, stat.size)
-    })
+      throw err
+    }
   }
 
   // Shared no-rename (legacy) direct write. MUST be called while holding the path lock. Writes the
@@ -579,10 +797,21 @@ export async function createFolderBasedFileSystemContentStorage(
     // resulting pipe failure follows this mode's usual non-atomic handling (the partial overwrite
     // is removed; the previous raw version cannot be preserved without rename support).
     signal?.throwIfAborted()
+    // Tracks whether the destructive gzip removal has been attempted. Before it, rolling the raw
+    // back restores the previous version exactly; after it, the previous gzip may already be gone,
+    // so removing the raw as well would leave the id with NOTHING.
+    let gzipRemovalAttempted = false
+    // Recorded by the try, never re-probed by the catch: a second probe can fail for its own reasons
+    // (a transient EIO), and treating that as "the gzip is gone" skipped the rollback while telling
+    // the operator the raw was the only remaining version — with both files sitting on disk, serving
+    // two different versions of one id, permanently, since legacy mode has no journal or quarantine.
+    let gzipSurvived: boolean | undefined
     try {
-      await pipe(stream, components.fs.createWriteStream(filePath))
+      await pipeTo(stream, filePath)
+      gzipRemovalAttempted = true
       await noFailUnlink(filePath + '.gzip')
-      if (await existsForInvariant(filePath + '.gzip')) {
+      gzipSurvived = await existsForInvariant(filePath + '.gzip')
+      if (gzipSurvived) {
         // A post-write invariant failure, never abort-caused: keep it visible past cancellation.
         throw markAsNonCancellationError(
           new Error(
@@ -594,9 +823,51 @@ export async function createFolderBasedFileSystemContentStorage(
       cache.forget(filePath)
       cache.invalidateInflight(filePath)
     } catch (err) {
-      // Clean up the partial output while still holding the lock: doing it after release could
-      // delete a queued writer's freshly committed content for the same id.
+      if (!gzipRemovalAttempted) {
+        // Clean up the partial output while still holding the lock: doing it after release could
+        // delete a queued writer's freshly committed content for the same id.
+        await noFailUnlink(filePath)
+        throw err
+      }
+      // Past the gzip removal the rollback is no longer unconditionally safe, and it was never
+      // VERIFIED: a `noFailUnlink` that silently failed left the raw in place while the error told
+      // the operator the store "was rolled back". Worse, when the gzip unlink SUCCEEDED and only its
+      // verification threw (EIO/EACCES on the stat), removing the raw too destroyed both
+      // representations of the id. Roll back only what can be proven safe, and say what is actually
+      // on disk otherwise.
+      if (gzipSurvived === false) {
+        // The gzip was provably removed before the failure, so the raw is the only representation
+        // left. Removing it too would leave the id with nothing.
+        throw markAsNonCancellationError(
+          new Error(
+            `Failed to complete the in-place store of ${id} after its previous gzip representation was already ` +
+              `removed; the newly written raw is KEPT as the only remaining version. Original error: ` +
+              `${err instanceof Error ? err.message : String(err)}`
+          )
+        )
+      }
+      if (gzipSurvived === undefined) {
+        // The verification itself failed, so which representations exist is unknown. Rolling back
+        // could destroy the only copy; not rolling back could leave two. Report the ambiguity rather
+        // than acting on a guess — reads of this id may be serving either version.
+        throw markAsNonCancellationError(
+          new Error(
+            `Failed to complete the in-place store of ${id}, and could not determine whether its previous gzip ` +
+              `representation survived; BOTH the new raw and a possible stale gzip may be on disk, so reads of ` +
+              `this id may disagree. Original error: ${err instanceof Error ? err.message : String(err)}`
+          )
+        )
+      }
       await noFailUnlink(filePath)
+      if (await existsForInvariant(filePath)) {
+        throw markAsNonCancellationError(
+          new Error(
+            `Failed to roll back the in-place store of ${id}: both its previous gzip and the newly written raw ` +
+              `are on disk, so reads would prefer the stale gzip while range reads see the new bytes. ` +
+              `Original error: ${err instanceof Error ? err.message : String(err)}`
+          )
+        )
+      }
       throw err
     }
   }
@@ -624,7 +895,7 @@ export async function createFolderBasedFileSystemContentStorage(
     const tempPath = journal.newTempPath()
     await writingUnder(filePath, async () => {
       try {
-        await pipe(stream, components.fs.createWriteStream(tempPath))
+        await pipeToStaged(stream, tempPath)
         // An abort observed once the source is consumed must still cancel the store before the
         // commit; the catch below removes the staged file and the canonical path stays untouched.
         signal?.throwIfAborted()
@@ -634,17 +905,36 @@ export async function createFolderBasedFileSystemContentStorage(
           // the irreversible commit below. Nothing has touched the canonical paths yet, so throwing
           // here is handled exactly like the pre-lock throw.
           signal?.throwIfAborted()
+          let committed = false
           try {
             // The raw and its .gzip are one versioned object: a gzip left from a previous version
             // would be preferred by retrieve() and serve stale bytes over the content just stored
             // (intent-journaled so even a crash mid-cleanup cannot leave the stale gzip preferred).
-            await journal.commitRepresentation('raw', id, tempPath, filePath, filePath + '.gzip', rename, signal)
+            await journal.commitRepresentation(
+              'raw',
+              id,
+              tempPath,
+              filePath,
+              filePath + '.gzip',
+              rename,
+              signal,
+              () => (committed = true)
+            )
           } finally {
-            // Run the bookkeeping even when the commit throws (a failed counterpart cleanup reports
-            // failure AFTER the rename landed): drop any stale decompress-cache tracking so eviction
-            // can never delete the new content, and tell an in-flight decompression it is outdated.
-            cache.forget(filePath)
-            cache.invalidateInflight(filePath)
+            // Gated on the rename having LANDED, not on reaching this line. The commit still needs
+            // this bookkeeping when it fails AFTER the rename (a failed counterpart cleanup), but it
+            // can also fail on either side of that point, and running it for a pre-rename failure
+            // was actively harmful: `forget` drops the tracking WITHOUT unlinking, so a decompressed
+            // range-cache file at this path became invisible to eviction and to `evictAll()` — an
+            // untracked copy that no longer counts against `decompressCacheMaxSize` and is never
+            // reclaimed — while `invalidateInflight` discarded a concurrent inflation that was still
+            // current, costing a redundant inflate and, twice over, a spurious `undefined` from a
+            // ranged read of a present id. Before the rename the canonical paths are untouched, so
+            // the cache state describing them is still accurate.
+            if (committed) {
+              cache.forget(filePath)
+              cache.invalidateInflight(filePath)
+            }
           }
         })
       } catch (err) {
@@ -703,10 +993,12 @@ export async function createFolderBasedFileSystemContentStorage(
       let contentItem: ContentItem | undefined = undefined
       if (!range) contentItem = await retrieveWithEncoding(id, 'gzip')
       if (!contentItem) {
-        contentItem = await retrieveWithEncoding(id, null, range)
+        // Reaching here without a range means the gzip probe above resolved, which is exactly the
+        // proof that the shared parent directory is intact.
+        contentItem = await retrieveWithEncoding(id, null, range, true, !range)
         if (contentItem && range) {
           // Update last access if this file is in the cache
-          cache.touch(await getFilePath(id))
+          cache.touch(await resolveFilePath(id))
         }
       }
 
@@ -716,8 +1008,15 @@ export async function createFolderBasedFileSystemContentStorage(
       // it inflates (its stale output is correctly discarded), leaving this request with neither a
       // cached file nor its result — the second attempt re-reads the id's current representation
       // instead of returning a spurious undefined for a valid id.
+      // Without `rename` there is no way to publish a decompressed copy atomically, so ranges are
+      // served straight from the inflating gzip instead of through a cache a concurrent reader could
+      // catch half-written.
+      if (!contentItem && range && !components.fs.rename) {
+        return await rangeFromGzipStream(id, range)
+      }
+
       for (let attempt = 0; attempt < 2 && !contentItem && range; attempt++) {
-        const uncompressedPath = await getFilePath(id)
+        const uncompressedPath = await resolveFilePath(id)
 
         // Deduplicated across concurrent callers of the same path, and handed the invalidation token
         // that says whether the gzip this inflation started from is still the current version.
@@ -777,7 +1076,7 @@ export async function createFolderBasedFileSystemContentStorage(
 
   async function exist(id: string): Promise<boolean> {
     await assertNotQuarantined(id)
-    const filePath = await getFilePath(id)
+    const filePath = await resolveFilePath(id)
     // Probed with `statForRead`, the same rule the rest of the read path uses: only a file PROVABLY
     // gone is absent. `existPath` tests F_OK|R_OK, so a present-but-unreadable file (mode/ACL damage,
     // EIO) read as `false` — the "a broken store looks like an empty one" answer this storage's read
@@ -798,8 +1097,24 @@ export async function createFolderBasedFileSystemContentStorage(
    * against the filename let it match the `.gzip` extension of a compressed representation.
    */
   const allFileIdsRec = async function* (folder: string, idBase: string, prefix?: string): AsyncIterable<string> {
-    const dirEntries = await components.fs.opendir(folder, { bufferSize: 4000 })
-    for await (const entry of dirEntries) {
+    // Which raw files have a compressed sibling, answered in memory rather than with one `access(2)`
+    // per raw file — that probe doubled the syscalls of a full walk (GC, sync reconciliation) to ask
+    // something the directory listing already contains, since an id's two representations always live
+    // in the SAME directory.
+    //
+    // Collected in a first STREAMING pass that keeps ONLY the compressed names. Buffering the whole
+    // listing instead — every name plus an object per entry — cost ~300 bytes per entry: measured at
+    // 47MB retained before the first id was yielded for a 200k-id flat-mode root, and ~290MB for a
+    // million, where the previous streaming implementation had been bounded by `opendir`'s buffer.
+    // Sharding keeps this irrelevant (a shard holds total/65,536 entries), so the exposure was
+    // exactly the flat-mode deployment that has no sharding to fall back on.
+    const gzipNames = new Set<string>()
+    for await (const entry of await components.fs.opendir(folder, { bufferSize: 4000 })) {
+      if (!entry.isDirectory() && entry.name.endsWith(GZIP_EXTENSION)) gzipNames.add(entry.name)
+    }
+
+    // Second pass, streamed: entries are yielded as they arrive, so nothing accumulates here.
+    for await (const entry of await components.fs.opendir(folder, { bufferSize: 4000 })) {
       const entryPath = path.resolve(folder, entry.name)
       if (entry.isDirectory()) {
         // The reserved temp-write dir only exists directly under the storage root; skip it there and
@@ -814,8 +1129,10 @@ export async function createFolderBasedFileSystemContentStorage(
       const isGzip = entry.name.endsWith(GZIP_EXTENSION)
       const id = path.relative(idBase, isGzip ? entryPath.slice(0, -GZIP_EXTENSION.length) : entryPath)
       if (prefix && !id.startsWith(prefix)) continue
-      // Skip cached uncompressed files when the .gzip version also exists: both are one id.
-      if (!isGzip && (await components.fs.existPath(entryPath + GZIP_EXTENSION))) continue
+      // Skip cached uncompressed files when the .gzip version also exists: both are one id. Answered
+      // from the first pass, so directory order does not matter — a gzip listed after its raw
+      // sibling is still known by the time the raw is reached.
+      if (!isGzip && gzipNames.has(entry.name + GZIP_EXTENSION)) continue
       yield id
     }
   }
@@ -839,29 +1156,52 @@ export async function createFolderBasedFileSystemContentStorage(
         end: gzipSize - 1
       })
       const buffer = await streamToBuffer(stream)
-      if (buffer.length === 4) return buffer.readUInt32LE(0)
 
-      // Fewer than 4 bytes means the file SHRANK between the stat that produced `gzipSize` and this
-      // read of its last four bytes — a concurrent overwrite with smaller content. Reading on would
-      // throw ERR_BUFFER_OUT_OF_BOUNDS, and the caller's probe cannot recognise the race either,
-      // because the path still EXISTS (it was replaced, not removed).
+      // Re-stat and require the size to be UNCHANGED before trusting those bytes. The read opened
+      // the path after the stat that produced `gzipSize`, so a concurrent overwrite in between makes
+      // the offsets address the wrong file, in both directions:
+      // - SHRANK: fewer than 4 bytes come back. Reading on would throw ERR_BUFFER_OUT_OF_BOUNDS, and
+      //   the caller's probe cannot recognise the race either, because the path still EXISTS (it was
+      //   replaced, not removed).
+      // - GREW: exactly 4 bytes come back, but from the MIDDLE of the new file's compressed body —
+      //   an arbitrary uint32 returned as if it were the trailer. This is the one case that produced
+      //   a number this storage had guessed, which the contract promises never to do.
       //
-      // Re-read against a FRESH stat rather than reporting a non-answer. The two non-answers are both
-      // actively harmful here: `undefined` means "this representation is gone, try the other one",
-      // and when the new version is gzip-primary there is no other one, so a present id was reported
-      // ABSENT (~1.3% of reads under concurrent compressing writes). `null` means "size unknown", and
+      // Re-read against a FRESH stat rather than reporting a non-answer. Both non-answers are
+      // actively harmful: `undefined` means "this representation is gone, try the other one", and
+      // when the new version is gzip-primary there is no other one, so a present id was reported
+      // ABSENT (~1.3% of reads under concurrent compressing writes); `null` means "size unknown", and
       // the consumer this field exists for bounds range requests with `contentSize ?? size`, so it
-      // would silently substitute the COMPRESSED size and serve a truncated range. Re-reading gives
-      // the real answer for the overwrite that actually happened.
-      const current = await statForRead(filePath)
+      // would silently substitute the COMPRESSED size and serve a truncated range.
+      // Verification only: a blip on this extra syscall must not reject a read whose bytes are
+      // already in hand, so a probe failure falls back to trusting them. Its job is to catch a
+      // CONCURRENT OVERWRITE, and an overwrite does not make the file unstattable.
+      let current: { size: number } | undefined
+      try {
+        current = await statForRead(filePath)
+      } catch {
+        return buffer.length === 4 ? buffer.readUInt32LE(0) : null
+      }
       if (current === undefined) return undefined
+      if (current.size === gzipSize) {
+        // Nothing moved: these bytes really are this file's trailer.
+        if (buffer.length === 4) return buffer.readUInt32LE(0)
+        // Unreachable for an unchanged file — the range was computed from this very size — but a
+        // custom adapter could still short-read, and inventing a number here is exactly what must
+        // not happen.
+        return null
+      }
       if (current.size < 8) return null
       const retried = await streamToBuffer(
         components.fs.createReadStream(filePath, { start: current.size - 4, end: current.size - 1 })
       )
-      // Still short: the file is being rewritten repeatedly. Only now is the size genuinely unknown,
-      // and `null` says exactly that rather than inventing a number.
-      return retried.length === 4 ? retried.readUInt32LE(0) : null
+      // Only trust the retry if the file did not move AGAIN underneath it; otherwise these four
+      // bytes come from the middle of yet another version's compressed body. A file being rewritten
+      // repeatedly genuinely has no readable size, and `null` says exactly that rather than
+      // inventing a number.
+      const after = await statForRead(filePath).catch(() => undefined)
+      if (retried.length !== 4 || after === undefined || after.size !== current.size) return null
+      return retried.readUInt32LE(0)
     } catch (err) {
       // `null` is a legitimate answer — content whose size the format cannot express (a >4GB original,
       // where ISIZE wraps) genuinely has no declared size — so it must not double as "we could not
@@ -879,7 +1219,7 @@ export async function createFolderBasedFileSystemContentStorage(
   async function fileInfo(id: string): Promise<FileInfo | undefined> {
     await assertNotQuarantined(id)
     const possibleEncondings = ['gzip', null]
-    const baseFilePath = await getFilePath(id)
+    const baseFilePath = await resolveFilePath(id)
 
     // Both representations share a parent directory, so it only has to be proven intact once.
     let parentProven = false
@@ -990,7 +1330,7 @@ export async function createFolderBasedFileSystemContentStorage(
     // the commit never landed and must survive the staging cleanup below.
     let preservedStagedPath: string | undefined
     try {
-      await pipe(stream, components.fs.createWriteStream(stagedRawPath))
+      await pipeToStaged(stream, stagedRawPath)
       // An abort observed once the source is consumed must still cancel the store: without these
       // checkpoints a cancelled request would keep paying for the compression and even commit the
       // object. Nothing has touched the canonical paths yet — the finally below removes the staged
@@ -1019,18 +1359,40 @@ export async function createFolderBasedFileSystemContentStorage(
         // the irreversible commit below. Nothing has touched the canonical paths yet, so throwing
         // here is handled exactly like the pre-lock throws.
         signal?.throwIfAborted()
+        let committed = false
+        const onCommitted = () => (committed = true)
         try {
           // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
           // reconciled at next construction, never leaving mixed versions for reads to prefer.
           if (compressed) {
-            await journal.commitRepresentation('gzip', id, stagedGzipPath, filePath + '.gzip', filePath, rename, signal)
+            await journal.commitRepresentation(
+              'gzip',
+              id,
+              stagedGzipPath,
+              filePath + '.gzip',
+              filePath,
+              rename,
+              signal,
+              onCommitted
+            )
           } else {
-            await journal.commitRepresentation('raw', id, stagedRawPath, filePath, filePath + '.gzip', rename, signal)
+            await journal.commitRepresentation(
+              'raw',
+              id,
+              stagedRawPath,
+              filePath,
+              filePath + '.gzip',
+              rename,
+              signal,
+              onCommitted
+            )
           }
         } finally {
-          // Run even when the commit throws post-rename (failed counterpart cleanup).
-          cache.forget(filePath)
-          cache.invalidateInflight(filePath)
+          // Gated on the rename having landed — see the identical block in `doStoreStream`.
+          if (committed) {
+            cache.forget(filePath)
+            cache.invalidateInflight(filePath)
+          }
         }
       })
     } catch (err) {
@@ -1098,8 +1460,17 @@ export async function createFolderBasedFileSystemContentStorage(
     storeStreamAndCompress: (id: string, stream: Readable, signal?: AbortSignal): Promise<void> =>
       runStoreWithSignal(stream, signal, () => doStoreStreamAndCompress(id, stream, signal)),
     async delete(ids: string[]): Promise<void> {
-      for (const id of ids) {
-        const filePath = await getFilePath(id)
+      // Bounded-concurrent like every other batch surface. Each id costs ~8 round-trips (repair
+      // probe, cache removal or unlink, two verifications, the journal check) and they were all
+      // serialized: a GC pass over 100k ids took minutes of pure latency on network-backed storage
+      // for work that shares no state — different ids take different path locks.
+      //
+      // Failure semantics are preserved where they matter: `mapWithConcurrency` starts no new ids
+      // after the first failure and reports that first error, so a broken storage still stops the
+      // batch. What changes is only that ids already in flight run to completion rather than being
+      // abandoned — `delete` is idempotent, so retrying the whole list remains the recovery.
+      await mapWithConcurrency(ids, BATCH_CONCURRENCY, async (id) => {
+        const filePath = await resolveFilePath(id)
         // Locked so an in-flight decompression can never resurrect the id by renaming its staged
         // bytes onto the canonical path after these unlinks.
         await withPathLock(filePath, async () => {
@@ -1128,26 +1499,24 @@ export async function createFolderBasedFileSystemContentStorage(
           await journal.assertNoIntent(id, `Deleted ${id} but could not remove its intent journal`)
           cache.invalidateInflight(filePath)
         })
-      }
+      })
     },
     async existMultiple(cids: string[]): Promise<Map<string, boolean>> {
       return new Map(
-        await mapWithConcurrency(
-          cids,
-          BATCH_CONCURRENCY,
-          async (cid): Promise<[string, boolean]> => [cid, await exist(cid)]
-        )
+        await mapWithConcurrency(cids, BATCH_CONCURRENCY, async (cid): Promise<[string, boolean]> => [
+          cid,
+          await exist(cid)
+        ])
       )
     },
     allFileIds: (prefix?: string) => allFileIdsRec(root, root, prefix),
     fileInfo,
     async fileInfoMultiple(cids: string[]): Promise<Map<string, FileInfo | undefined>> {
       return new Map(
-        await mapWithConcurrency(
-          cids,
-          BATCH_CONCURRENCY,
-          async (cid): Promise<[string, FileInfo | undefined]> => [cid, await fileInfo(cid)]
-        )
+        await mapWithConcurrency(cids, BATCH_CONCURRENCY, async (cid): Promise<[string, FileInfo | undefined]> => [
+          cid,
+          await fileInfo(cid)
+        ])
       )
     }
   }

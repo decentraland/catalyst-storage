@@ -121,7 +121,14 @@ describe('s3 behavior', () => {
   beforeAll(async () => {
     const logs = await createLogComponent({})
     components.storage = await createS3BasedFileSystemContentStorage({ logs }, createFakeS3Client(), {
-      Bucket: 'example'
+      Bucket: 'example',
+      // This suite asserts storage BEHAVIOUR, not content-type detection, and the default loader
+      // reaches ESM-only `file-type` through a dynamic import that Jest's module registry does not
+      // own. Once any test file's environment is torn down, that import fails from every file that
+      // follows — reported as `import after the Jest environment has been torn down`, which fails the
+      // run even when every assertion passes. Detection itself is covered by `mime-detection.spec.ts`
+      // and by the MIME suite in the S3 spec.
+      fileTypeLoader: async () => ({ fileTypeFromBuffer: async () => undefined })
     })
   })
 

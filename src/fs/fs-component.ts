@@ -6,7 +6,7 @@ async function existPath(path: string): Promise<boolean> {
   try {
     await fs.promises.access(path, fs.constants.F_OK | fs.constants.R_OK)
     return true
-  } catch (error) {
+  } catch {
     return false
   }
 }

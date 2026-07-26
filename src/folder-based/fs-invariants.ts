@@ -37,7 +37,7 @@ export function createFsInvariants(fs: IFileSystemComponent): FsInvariants {
       try {
         await fs.unlink(target)
         return true
-      } catch (error) {
+      } catch {
         return false
       }
     }

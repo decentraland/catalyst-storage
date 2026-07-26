@@ -6,6 +6,7 @@ import { promisify } from 'util'
 import { markAsNonCancellationError } from '../cancellation'
 import { IFileSystemComponent } from '../fs/types'
 import { FsInvariants } from './fs-invariants'
+import { mapWithConcurrency } from '../concurrency'
 
 const pipe = promisify(pipeline)
 
@@ -38,14 +39,23 @@ export const TEMP_DIR_NAME = '.tmp-writes'
 // legitimate content there, and deleting unrecognized files would turn an upgrade into data loss.
 const STAGED_FILE_NAME = /^[0-9a-f]{16}-[0-9a-f]{32}$/
 
-// Matches the intent-journal files a representation-transition commit writes (`<40-hex
-// sha1(id)>.intent`). An intent records which representation (raw|gzip) is the NEW primary for an
+// Matches the intent-journal files a representation-transition commit writes (`<64-hex
+// sha256(id)>.intent`). An intent records which representation (raw|gzip) is the NEW primary for an
 // id, so a crash between the commit rename and the counterpart cleanup is reconciled at the next
 // construction instead of leaving mixed versions that reads could prefer. The path is a
 // deterministic function of the id: at most one intent can ever exist per id (commits are
 // serialized per path, and construction reconciles before any write), so reconciliation needs no
 // ordering heuristics.
-const INTENT_FILE_NAME = /^[0-9a-f]{40}\.intent$/
+//
+// 40-hex is still matched so an intent written by a PREVIOUS version (which named these files with
+// sha1) is recognized and reconciled after an upgrade. Discarding it instead would leave the mixed
+// state it describes — new primary plus stale counterpart — in place, with reads preferring the
+// stale one. `isIntentPathFor` accepts either name for the same id, so such an intent reconciles
+// normally; only new ones are written under the sha256 name.
+const INTENT_FILE_NAME = /^([0-9a-f]{64}|[0-9a-f]{40})\.intent$/
+
+/** How many orphaned staged files the startup sweep unlinks at once. */
+const SWEEP_CONCURRENCY = 32
 
 const OWNERSHIP_MARKER = '.owned-by-catalyst-storage'
 const OWNERSHIP_MARKER_CONTENT = 'reserved by catalyst-storage for atomic write staging\n'
@@ -84,15 +94,34 @@ export type IntentJournal = {
     primaryPath: string,
     counterpartPath: string,
     rename: (from: string, to: string) => Promise<void>,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    /**
+     * Invoked exactly once, immediately after the commit rename lands — that is, at the precise
+     * point the canonical path stops holding the previous version.
+     *
+     * Callers need this because the commit can fail on EITHER side of that line and the two demand
+     * opposite bookkeeping. Everything before the rename (a pending-intent repair, the abort
+     * checkpoints, the counterpart probe, the journal write) leaves the canonical paths untouched,
+     * so cache state describing them is still accurate; only once the rename has landed does that
+     * state describe a version that no longer exists.
+     */
+    onCommitted?: () => void
   ): Promise<void>
   /**
    * Applies a pending intent for this id if one exists, so a caller never overwrites an unapplied
    * repair instruction. Throws when the repair cannot be completed.
    */
   repairPendingIntent(id: string): Promise<void>
-  /** Verifies no journal is left for this id, throwing with `context` when one survives. */
+  /**
+   * Removes any journal left for this id and verifies it is gone, throwing with `context` otherwise.
+   *
+   * Named for the invariant it establishes, but it is NOT a read-only assertion: it unlinks first.
+   * Callers reach it after a repair has already discharged the journal, so the unlink is normally a
+   * no-op — it exists so a journal can never outlive the id it describes.
+   */
   assertNoIntent(id: string, context: string): Promise<void>
+  /** Recreates the reserved staging directory if it disappeared while this instance was running. */
+  ensureTempDir(): Promise<void>
   /**
    * Whether reads must not serve this id: a post-rename counterpart cleanup failed in THIS process,
    * so the on-disk state is mixed. An O(1) lookup with no syscalls — the read path is untouched
@@ -249,8 +278,44 @@ export async function createIntentJournal(
   // construction reconciles before any write — so reconciliation needs no ordering heuristics.
   // Fresh-id writes — the overwhelmingly common case in content-addressed use — have no counterpart
   // and never pay for an intent.
+  // sha256, not sha1: ids can be caller-supplied, and two ids sharing an intent filename would let a
+  // commit for one clobber or clear the other's live journal — they take DIFFERENT path locks, so
+  // nothing serializes them — leaving the second id's mixed state unrepaired. Chosen-prefix SHA-1
+  // collisions are purchasable; this costs one hash per commit that has a counterpart.
   const intentPathFor = (id: string): string =>
+    path.join(tempDir, `${createHash('sha256').update(id).digest('hex')}.intent`)
+
+  /**
+   * Whether this root still holds journals named by the pre-sha256 scheme.
+   *
+   * Set once, by `reconcile()`, which already lists the staging directory at construction. Every
+   * legacy lookup is gated on it, so a deployment that has never seen an older version — which is
+   * every deployment after its first clean boot — pays nothing: without the gate, `findIntentPath`
+   * cost a second `stat` on every commit and every delete, and `assertNoIntent` a second unlink AND
+   * stat, measured at +43% syscalls on the delete path this library explicitly optimises.
+   */
+  let hasLegacyIntents = false
+
+  /** The name a pre-sha256 version of this library would have used. Read, never written. */
+  const legacyIntentPathFor = (id: string): string =>
     path.join(tempDir, `${createHash('sha1').update(id).digest('hex')}.intent`)
+
+  /** Whether `intentPath` is the journal slot of `id`, under either the current or the legacy name. */
+  const isIntentPathFor = (id: string, intentPath: string): boolean =>
+    intentPath === intentPathFor(id) || (hasLegacyIntents && intentPath === legacyIntentPathFor(id))
+
+  /**
+   * The journal actually on disk for this id, if any — checking the legacy name too, so an intent
+   * left by an older version is still found by a repair, a delete or a retried store rather than
+   * surviving as an orphan that fails the next construction.
+   */
+  async function findIntentPath(id: string): Promise<string | undefined> {
+    const candidates = hasLegacyIntents ? [intentPathFor(id), legacyIntentPathFor(id)] : [intentPathFor(id)]
+    for (const candidate of candidates) {
+      if (await existsForInvariant(candidate)) return candidate
+    }
+    return undefined
+  }
 
   // Ids whose post-rename counterpart cleanup failed in THIS process: the on-disk state is mixed
   // (new primary + stale counterpart) with the intent preserved, and live reads must not serve it —
@@ -290,7 +355,19 @@ export async function createIntentJournal(
   // invariant cannot be accidentally weakened back into a best-effort unlink.
   async function removeIntentOrThrow(intentPath: string, context: string): Promise<void> {
     await noFailUnlink(intentPath)
-    if (await existsForInvariant(intentPath)) {
+    let survived: boolean
+    try {
+      survived = await existsForInvariant(intentPath)
+    } catch (err: any) {
+      // An unprovable removal is as dangerous as a survivor — the journal may still be there — but a
+      // raw EACCES escaping here loses the `context` every call site constructs, which is the only
+      // thing telling an operator WHICH invariant broke. Re-raise as the same failure, with the cause.
+      throw new Error(
+        `${context}: the intent journal '${intentPath}' could not be proven removed. ` +
+          `Original error: ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
+    if (survived) {
       throw new Error(`${context}: the intent journal '${intentPath}' could not be removed.`)
     }
   }
@@ -331,8 +408,9 @@ export async function createIntentJournal(
       !STAGED_FILE_NAME.test(staged ?? '') ||
       // The intent path is a deterministic function of the id: a body whose id does not hash to
       // this filename is corruption or operator error, and applying it would reconcile the WRONG
-      // id. Treat it as malformed.
-      intentPathFor(id) !== intentPath
+      // id. Treat it as malformed. Either hash name is accepted so an intent written before the
+      // sha256 change still reconciles.
+      !isIntentPathFor(id, intentPath)
     ) {
       // A partial/malformed intent means its commit never started (intents are written before
       // renames): discard it; an orphaned staged file, if any, is handled by the sweep.
@@ -362,6 +440,14 @@ export async function createIntentJournal(
           `representation exists.`
       )
     }
+    // Reconciliation resolves in favour of the COMMITTED representation, and deliberately does not
+    // try to validate it first. A power loss can leave the renamed primary zero-length or truncated,
+    // but the counterpart is exposed to exactly the same failure and cannot be validated at all — raw
+    // content has no format to check — so preferring it is never provably safer. An earlier attempt
+    // here rejected a gzip primary under 20 bytes and kept the raw instead; measured, that replaced a
+    // loud `Z_DATA_ERROR` on read with a silently served 0-byte body, and contradicted the documented
+    // rule. Content is content-addressed: a consumer must detect and discard unreadable content, and
+    // a corrupt primary that fails loudly is the outcome that lets it.
     if (await existsForInvariant(counterpartPath)) {
       await noFailUnlink(counterpartPath)
       if (await existsForInvariant(counterpartPath)) {
@@ -379,8 +465,8 @@ export async function createIntentJournal(
 
   async function repairPendingIntent(id: string): Promise<void> {
     if (!atomic) return
-    const intentPath = intentPathFor(id)
-    if (await existsForInvariant(intentPath)) {
+    const intentPath = await findIntentPath(id)
+    if (intentPath) {
       await applyPendingIntent(intentPath)
     }
   }
@@ -392,7 +478,8 @@ export async function createIntentJournal(
     primaryPath: string,
     counterpartPath: string,
     rename: (from: string, to: string) => Promise<void>,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onCommitted?: () => void
   ): Promise<void> {
     // A pending intent means a previous commit for this id failed its cleanup in this process:
     // repair first (throws if impossible), so the intent written below always describes a
@@ -404,7 +491,22 @@ export async function createIntentJournal(
     // above is idempotent state that needs no undoing.
     signal?.throwIfAborted()
     const hadCounterpart = await existsForInvariant(counterpartPath)
-    const intentPath = hadCounterpart ? await writeIntent(op, id, stagedPath) : undefined
+    let intentPath: string | undefined
+    if (hadCounterpart) {
+      try {
+        intentPath = await writeIntent(op, id, stagedPath)
+      } catch (err) {
+        // A REJECTED journal write can still have left a complete, valid journal on disk: the body is
+        // one small buffer, so a filesystem that reports its write error at close (NFS, FUSE, a custom
+        // adapter) fails the pipe after the bytes have landed. Nothing else here catches this, so the
+        // intent survived while the caller's ordinary staging cleanup destroyed the staged file that
+        // proves the rename never happened — and the next construction, finding a journal whose staged
+        // file AND whose primary are both absent, REFUSED TO START, permanently, over content that was
+        // never damaged. Clear it on the same must-succeed terms as a failed rename.
+        await clearIntentOrThrowPreservingProof(intentPathFor(id), stagedPath, id, err)
+        throw err
+      }
+    }
     if (intentPath && signal?.aborted) {
       // Cancelled after the intent was journaled but before the rename: the commit never happened,
       // so the journal must not survive (a later repair would apply it as a completed transition).
@@ -417,8 +519,10 @@ export async function createIntentJournal(
     // above skipped) would proceed to commit. No journal exists past this line unless it was just
     // cleared, so a plain throw is safe.
     signal?.throwIfAborted()
+    let renamed = false
     try {
       await rename(stagedPath, primaryPath)
+      renamed = true
     } catch (err) {
       // The commit did not happen, so the intent must not survive it: a later repair would treat
       // the failed commit as successful and remove the counterpart — e.g. delete a valid gzip
@@ -433,6 +537,10 @@ export async function createIntentJournal(
       }
       throw err
     }
+    // Outside the try: a throwing callback must not be mistaken for a failed rename, which would
+    // discharge the journal over a commit that DID land and leave a permanent mixed state with
+    // nothing left to reconcile it.
+    if (renamed) onCommitted?.()
     if (hadCounterpart) {
       await noFailUnlink(counterpartPath)
       let counterpartGone: boolean
@@ -468,15 +576,44 @@ export async function createIntentJournal(
     repairPendingIntent,
     isQuarantined: (id: string) => unreconciledIds.has(id),
 
+    // The staging directory is created once, at construction. If something removes it while this
+    // instance is live, EVERY store and every gzip range read fails at its staged write — forever,
+    // because nothing recreated it. Shard directories already self-heal exactly this way; the
+    // reserved directory was the one place that did not. Only the directory is recreated: the
+    // ownership marker and its checks belong to construction, which already proved this root is ours.
+    async ensureTempDir(): Promise<void> {
+      if (!atomic) return
+      await fs.mkdir(tempDir, { recursive: true })
+      // The marker is not a check, it is the EVIDENCE the next construction consumes: without it, a
+      // flat-mode root whose staging directory was healed refuses to start as soon as a crash leaves
+      // one staged file behind ("contains files this storage cannot prove it owns"). Healing would
+      // otherwise turn a transient outage into a permanent, operator-only one.
+      if (!useHashPrefix && !(await existsForInvariant(path.join(tempDir, OWNERSHIP_MARKER)))) {
+        await pipe(
+          Readable.from([Buffer.from(OWNERSHIP_MARKER_CONTENT)]),
+          fs.createWriteStream(path.join(tempDir, OWNERSHIP_MARKER))
+        )
+      }
+    },
+
     // Commits a staged file onto its canonical primary path and removes the other representation.
     // The logical object spans two paths (raw and .gzip) but only the rename is atomic, so when a
     // counterpart exists an intent is journaled FIRST: if the process dies (or the unlink fails)
     // between the rename and the cleanup, the next construction reconciles the mixed state in favor
     // of the representation committed here, instead of reads preferring the stale counterpart. Must
     // be called while holding the path lock.
-    async commitRepresentation(op, id, stagedPath, primaryPath, counterpartPath, rename, signal): Promise<void> {
+    async commitRepresentation(
+      op,
+      id,
+      stagedPath,
+      primaryPath,
+      counterpartPath,
+      rename,
+      signal,
+      onCommitted
+    ): Promise<void> {
       try {
-        await doCommitRepresentation(op, id, stagedPath, primaryPath, counterpartPath, rename, signal)
+        await doCommitRepresentation(op, id, stagedPath, primaryPath, counterpartPath, rename, signal, onCommitted)
       } catch (err) {
         // The commit phase's own cancellation checkpoints throw the caller's abort reason and nothing
         // else, so identity is the whole test: pass that through untouched (it IS a cancellation, and
@@ -495,6 +632,12 @@ export async function createIntentJournal(
     async assertNoIntent(id: string, context: string): Promise<void> {
       if (!atomic) return
       await removeIntentOrThrow(intentPathFor(id), context)
+      // Only when this root actually carries pre-sha256 journals: such an intent must not survive a
+      // delete of its id, or the next construction refuses to start over a journal whose id no longer
+      // has either representation. Gated so the ordinary path keeps its single unlink+stat.
+      if (hasLegacyIntents) {
+        await removeIntentOrThrow(legacyIntentPathFor(id), context)
+      }
     },
 
     async ensureReconciled(id: string): Promise<boolean> {
@@ -503,15 +646,20 @@ export async function createIntentJournal(
       return withPathLock(filePath, async () => {
         if (!unreconciledIds.has(id)) return true
         try {
-          const intentPath = intentPathFor(id)
-          if (await existsForInvariant(intentPath)) {
+          const intentPath = await findIntentPath(id)
+          if (intentPath) {
             await applyPendingIntent(intentPath)
           } else {
             // No journal left: the mixed state was repaired elsewhere (retried store, delete).
             unreconciledIds.delete(id)
           }
           return !unreconciledIds.has(id)
-        } catch {
+        } catch (err) {
+          // The caller reports the id as unreadable; without this the CAUSE appeared nowhere at all,
+          // leaving an operator with "could not be repaired" and no way to find out why.
+          logger.warn(`Read-triggered repair of the mixed state for ${id} failed; reads stay refused`, {
+            error: err instanceof Error ? err.message : String(err)
+          })
           return false
         }
       })
@@ -540,7 +688,11 @@ export async function createIntentJournal(
       // ordering to resolve. A repair that cannot be completed FAILS CONSTRUCTION: live reads do not
       // consult intents, so a usable instance over an unreconciled mixed state would keep serving the
       // stale representation for its whole lifetime.
-      for (const name of entries.filter((entry) => INTENT_FILE_NAME.test(entry)).sort()) {
+      const intents = entries.filter((entry) => INTENT_FILE_NAME.test(entry)).sort()
+      // Decided before anything is applied, and never re-armed: after this boot discharges them, no
+      // legacy-named journal can exist again (only `intentPathFor` is ever written).
+      hasLegacyIntents = intents.some((name) => name.length === '.intent'.length + 40)
+      for (const name of intents) {
         try {
           await applyPendingIntent(path.join(tempDir, name))
         } catch (err: any) {
@@ -569,12 +721,29 @@ export async function createIntentJournal(
       } catch {
         return 0
       }
-      let removed = 0
-      for (const entry of entries) {
-        if (!STAGED_FILE_NAME.test(entry) || entry.startsWith(`${bootId}-`)) continue
-        if (await noFailUnlink(path.join(tempDir, entry))) removed++
+      // A staged file NAMED BY a surviving intent is that intent's proof the rename never landed —
+      // never sweepable garbage. Reconciliation runs before this sweep within one process, so the
+      // set is normally empty; it matters when a root is shared (out of contract, but the sweep is
+      // where one instance could otherwise erase another's proof and make its next reconciliation
+      // misread a pre-rename intent as a completed commit, deleting a valid representation).
+      const claimedByAnIntent = new Set<string>()
+      for (const name of entries.filter((entry) => INTENT_FILE_NAME.test(entry))) {
+        try {
+          const { staged } = JSON.parse(await fs.readFile(path.join(tempDir, name), 'utf8'))
+          if (typeof staged === 'string') claimedByAnIntent.add(staged)
+        } catch {
+          // A malformed or unreadable intent claims nothing; reconciliation discards it separately.
+        }
       }
-      return removed
+      const sweepable = entries.filter(
+        (entry) => STAGED_FILE_NAME.test(entry) && !entry.startsWith(`${bootId}-`) && !claimedByAnIntent.has(entry)
+      )
+      // Bounded-concurrent rather than one at a time: after a crash that left thousands of staged
+      // files this ran as thousands of serialized unlinks, and it runs at startup.
+      const outcomes = await mapWithConcurrency(sweepable, SWEEP_CONCURRENCY, (entry) =>
+        noFailUnlink(path.join(tempDir, entry))
+      )
+      return outcomes.filter(Boolean).length
     }
   }
 }
