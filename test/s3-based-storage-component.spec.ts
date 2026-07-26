@@ -1,7 +1,8 @@
 import {
   createAwsS3BasedFileSystemContentStorage,
   createS3BasedFileSystemContentStorage,
-  IContentStorageComponent
+  IContentStorageComponent,
+  S3ContentStorageOptions
 } from '../src'
 import { bufferToStream, streamToBuffer } from '../src'
 import { createFakeS3Client, FakeS3Client } from './fake-s3-client'
@@ -910,12 +911,22 @@ describe('S3 Storage review regressions', () => {
 
   describe('when a custom getKey is supplied', () => {
     describe('and no inverse is given', () => {
+      it('should not compile, so a TypeScript caller learns at build time', () => {
+        // @ts-expect-error getKey and getId are a matched pair in S3ContentStorageOptions. This
+        // assertion FAILS TO COMPILE if the options type ever stops enforcing that, which is the
+        // only way to pin a compile-time guarantee from a test.
+        const invalid: S3ContentStorageOptions = { Bucket: 'example', getKey: (hash: string) => `contents/${hash}` }
+
+        expect(invalid).toBeDefined()
+      })
+
       it('should refuse to construct, because allFileIds would not round-trip', async () => {
+        // Cast because the type already rejects this shape; the runtime guard exists for JavaScript
+        // callers, who have no such protection.
+        const options = { Bucket: 'example', getKey: (hash: string) => `contents/${hash}` } as S3ContentStorageOptions
+
         await expect(
-          createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), {
-            Bucket: 'example',
-            getKey: (hash: string) => `contents/${hash}`
-          })
+          createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), options)
         ).rejects.toThrow(/requires a matching getId/)
       })
     })
@@ -1086,5 +1097,47 @@ describe('S3 Storage identity content encoding', () => {
     const item = await storage.retrieve('id', { start: 0, end: 3 })
 
     expect(item!.size).toBe(4)
+  })
+})
+
+describe('S3 Storage enumeration of a bucket holding foreign keys', () => {
+  let storage: IContentStorageComponent
+  let fake: FakeS3Client
+
+  beforeEach(async () => {
+    // `getId` is applied to every key the bucket returns, including ones this mapping never produced.
+    // A lossy inverse maps those onto ids that look real: here a foreign `zz/abcdef` yields the id
+    // `abcdef`, whose actual key is `ab/abcdef`.
+    fake = createFakeS3Client()
+    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, fake, {
+      Bucket: 'shared',
+      getKey: (hash: string) => `${hash.slice(0, 2)}/${hash}`,
+      getId: (key: string) => key.slice(3)
+    })
+    await storage.storeStream('abcdef', bufferToStream(Buffer.from('real content')))
+    fake.objects.set('zz/abcdef', { body: Buffer.from('another tenant') })
+    fake.objects.set('unrelated-object', { body: Buffer.from('no shard at all') })
+  })
+
+  const collect = async (): Promise<string[]> => {
+    const listed: string[] = []
+    for await (const each of storage.allFileIds()) listed.push(each)
+    return listed
+  }
+
+  it('should yield only the ids whose keys this mapping produced', async () => {
+    expect(await collect()).toEqual(['abcdef'])
+  })
+
+  it('should not report an id twice because a foreign key decoded onto it', async () => {
+    const listed = await collect()
+
+    expect(listed.filter((each) => each === 'abcdef')).toHaveLength(1)
+  })
+
+  it('should leave the real object intact when a caller deletes what it enumerated', async () => {
+    await storage.delete(await collect())
+
+    expect(fake.objects.has('zz/abcdef')).toBe(true)
   })
 })

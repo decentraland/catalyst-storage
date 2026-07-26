@@ -34,6 +34,30 @@ import {
 /** Absorbs a torn-down stream's trailing 'error', which would otherwise be an uncaught exception. */
 const ignoreStreamError = (): void => undefined
 
+/**
+ * How ids map to bucket keys.
+ *
+ * The mapping is either the default identity or a MATCHED PAIR: `getKey` and `getId` must be supplied
+ * together, which the type enforces so a TypeScript caller migrating to this version gets the error
+ * at compile time rather than at construction. The runtime check remains for JavaScript callers.
+ *
+ * The pairing is not bookkeeping. `allFileIds()` enumerates the bucket, which yields KEYS, while
+ * every other surface takes IDS: without the inverse, a GC sweep that enumerated and then deleted
+ * issued a double-prefixed key, and because `DeleteObjects` is idempotent S3 reported success while
+ * deleting nothing, forever.
+ *
+ * @public
+ */
+export type S3ContentStorageOptions = { Bucket: string } & (
+  | { getKey?: undefined; getId?: undefined }
+  | {
+      /** Maps a COMPLETE content id to its bucket key. Never called with a partial id. */
+      getKey: (hash: string) => string
+      /** The exact inverse of `getKey`. Keys that do not round-trip are skipped by `allFileIds()`. */
+      getId: (key: string) => string
+    }
+)
+
 /** S3's hard per-request limit for `DeleteObjects`; the SDK does not split a larger list. */
 const DELETE_OBJECTS_MAX_KEYS = 1000
 
@@ -191,21 +215,7 @@ function createAbortableClient(
 export async function createS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, 'logs'>,
   s3: S3Client,
-  options: {
-    Bucket: string
-    getKey?: (hash: string) => string
-    /**
-     * The inverse of `getKey`, required whenever `getKey` is not the identity.
-     *
-     * `allFileIds()` enumerates the bucket, which yields KEYS; every other surface takes IDS. Without
-     * an inverse the enumeration did not round-trip: with `getKey: h => 'contents/' + h`, a GC sweep
-     * that enumerated and then deleted issued `Key: 'contents/contents/<hash>'`, and because
-     * `DeleteObjects` is idempotent S3 reported success while deleting nothing. Supplying this makes
-     * `allFileIds()` yield ids and its `prefix` filter an id prefix, matching the folder-based
-     * backend's documented contract.
-     */
-    getId?: (key: string) => string
-  }
+  options: S3ContentStorageOptions
 ): Promise<IContentStorageComponent> {
   const logger = components.logs.getLogger('s3-based-content-storage')
   const getKey = options.getKey || ((hash: string) => hash)
@@ -669,14 +679,43 @@ export async function createS3BasedFileSystemContentStorage(
       params.Prefix = prefix
     }
 
+    // Warned about once per enumeration rather than per key: a foreign bucket would otherwise emit a
+    // line per object, and one is enough to act on.
+    let warnedAboutForeignKeys = false
+
     let output: ListObjectsV2CommandOutput
     do {
       output = await s3.send(new ListObjectsV2Command(params))
       if (output.Contents) {
         for (const content of output.Contents) {
-          const id = getId(content.Key!)
-          // Always re-checked against the ID. For a custom mapping this is the ONLY filter, since the
-          // request above was unprefixed; for the identity mapping it is a cheap confirmation.
+          const key = content.Key!
+          const id = getId(key)
+          // ROUND TRIP, not just an inverse call. `getId` is applied to every key the bucket returns,
+          // including ones this mapping never produced — and a lossy inverse maps those onto ids that
+          // look real. With `getKey: h => h.slice(0,4) + '/' + h`, a foreign `zz/abcdef` yields the id
+          // `abcdef`, whose actual key is `ab/abcdef`: enumeration reported that id TWICE, and a GC
+          // sweep that deleted what it enumerated destroyed the real object while leaving the foreign
+          // one untouched. Requiring `getKey(id) === key` is the same invariant the folder-based
+          // backend enforces on its paths, and it makes storing and enumerating provably inverse.
+          //
+          // Filtering rather than yielding is the safe direction: a key that does not round-trip is
+          // already unreachable through `retrieve`/`delete`, which would compute a different key for
+          // that id, so nothing reachable is being hidden.
+          if (getKey(id) !== key) {
+            if (!warnedAboutForeignKeys) {
+              warnedAboutForeignKeys = true
+              logger.warn(
+                `Skipping bucket keys that this storage's getKey/getId mapping does not round-trip; they are not ` +
+                  `ids of content it owns. Enumerating them would report phantom ids, and a caller deleting what ` +
+                  `it enumerated could remove real content stored under a different key.`,
+                { key, roundTripped: getKey(id) }
+              )
+            }
+            continue
+          }
+          // Always re-checked against the ID. For a custom mapping this is the ONLY prefix filter,
+          // since the request above was unprefixed; for the identity mapping it is a cheap
+          // confirmation.
           if (prefix && !id.startsWith(prefix)) continue
           yield id
         }
