@@ -1135,9 +1135,22 @@ describe('S3 Storage enumeration of a bucket holding foreign keys', () => {
     expect(listed.filter((each) => each === 'abcdef')).toHaveLength(1)
   })
 
-  it('should leave the real object intact when a caller deletes what it enumerated', async () => {
-    await storage.delete(await collect())
+  describe('and the bucket holds ONLY a foreign key that decodes onto a plausible id', () => {
+    beforeEach(async () => {
+      // The harm is that enumeration claims content this storage does not hold. Deleting the real
+      // object first leaves only the foreign `zz/abcdef`, which still decodes to the id `abcdef`.
+      await storage.delete(['abcdef'])
+    })
 
-    expect(fake.objects.has('zz/abcdef')).toBe(true)
+    it('should report the id as absent', async () => {
+      expect(await storage.exist('abcdef')).toBe(false)
+    })
+
+    it('should not enumerate an id that exist() says is not there', async () => {
+      // Enumeration and existence must agree. Without the round-trip check they did not: the id was
+      // yielded from the foreign key while `exist()` correctly answered false, so a sync consumer
+      // would skip fetching content the node does not have.
+      expect(await collect()).toEqual([])
+    })
   })
 })
