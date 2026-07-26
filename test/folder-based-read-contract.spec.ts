@@ -4,8 +4,9 @@ import path from 'path'
 import { createHash } from 'crypto'
 import { gzipSync } from 'zlib'
 import { createFolderBasedFileSystemContentStorage, createFsComponent, IContentStorageComponent } from '../src'
-import { bufferToStream } from '../src'
+import { bufferToStream, streamToBuffer } from '../src'
 import { createLogComponent } from '@well-known-components/logger'
+import { PathNotContainedError } from '../src/folder-based/errors'
 
 const fs = createFsComponent()
 
@@ -156,7 +157,7 @@ describe('folder-based storage ids that name a directory rather than a file', ()
       ['dot', '.']
     ])('and the id is %s', (_name, degenerate) => {
       it('should reject exist instead of reporting the directory as present content', async () => {
-        await expect(storage.exist(degenerate)).rejects.toThrow(/does not name a file/)
+        await expect(storage.exist(degenerate)).rejects.toBeInstanceOf(PathNotContainedError)
       })
 
       it('should report retrieve as nothing to serve, like any other non-containable id', async () => {
@@ -164,14 +165,76 @@ describe('folder-based storage ids that name a directory rather than a file', ()
       })
 
       it('should reject a store instead of writing over the directory', async () => {
-        await expect(storage.storeStream(degenerate, bufferToStream(Buffer.from('x')))).rejects.toThrow(
-          /does not name a file/
+        await expect(storage.storeStream(degenerate, bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+          PathNotContainedError
         )
       })
     })
 
     it('should still resolve a normal id', async () => {
       await expect(storage.exist('real-id')).resolves.toBe(true)
+    })
+  })
+})
+
+describe('folder-based storage ids that normalize onto another id', () => {
+  // `path.join` normalizes what it builds, so an id like `a/../victim` lands on the file of a
+  // DIFFERENT logical id. Containment does not catch it — the result is still inside the root, it is
+  // just somebody else's content — so a caller accepting untrusted ids could overwrite, read or
+  // delete another id. With hash prefixes it needs a shard collision, which is only ~2^16 work.
+  describe.each([
+    ['with hash prefixes', false],
+    ['in flat mode', true]
+  ])('%s', (_label, disablePrefixHash) => {
+    let root: string
+    let storage: IContentStorageComponent
+    let victimBytes: Buffer
+
+    beforeEach(async () => {
+      root = mkdtempSync(path.join(os.tmpdir(), 'aliasing-id-'))
+      storage = await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, root, {
+        disablePrefixHash
+      })
+      victimBytes = Buffer.from('VICTIM ORIGINAL')
+      await storage.storeStream('victim', bufferToStream(victimBytes))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    describe.each([
+      ['a parent segment', 'a/../victim'],
+      ['a current-directory segment', './victim'],
+      ['an empty segment', 'a//../victim'],
+      ['a trailing separator', 'victim/'],
+      ['an absolute path', '/victim'],
+      ['a backslash separator', 'a\\..\\victim']
+    ])('and the id uses %s', (_name, aliasing) => {
+      it('should reject a store rather than overwrite the id it normalizes onto', async () => {
+        await expect(storage.storeStream(aliasing, bufferToStream(Buffer.from('ATTACKER')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should leave the other id untouched', async () => {
+        await storage.storeStream(aliasing, bufferToStream(Buffer.from('ATTACKER'))).catch(() => undefined)
+        const item = await storage.retrieve('victim')
+
+        expect(await streamToBuffer(await item!.asStream())).toEqual(victimBytes)
+      })
+
+      it('should reject a delete rather than remove the id it normalizes onto', async () => {
+        await expect(storage.delete([aliasing])).rejects.toBeInstanceOf(PathNotContainedError)
+        expect(await storage.exist('victim')).toBe(true)
+      })
+    })
+
+    it('should still accept a legitimately nested id', async () => {
+      await storage.storeStream('nested/legit/id', bufferToStream(Buffer.from('fine')))
+
+      expect(await storage.exist('nested/legit/id')).toBe(true)
     })
   })
 })

@@ -303,7 +303,41 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  /**
+   * Rejects ids that would resolve onto ANOTHER id's file.
+   *
+   * An id is used verbatim as a path under the containment directory, and `path.join` normalizes what
+   * it builds — so `a/../victim`, `./victim`, `victim/` and `a//victim` all collapse onto the path of
+   * a different logical id. Containment does not catch this: the result is still inside the root, it
+   * is just somebody else's file. A caller that accepts untrusted ids could therefore overwrite, read
+   * or delete another id's content — in flat mode directly, and with hash prefixes by varying a
+   * prefix until the first four SHA-1 hex digits match the victim's shard, which is ~2^16 work.
+   *
+   * Ids containing separators stay supported (they nest into subdirectories and round-trip through
+   * `allFileIds`); only the forms that can alias are refused. Backslash counts as a separator too, so
+   * an id behaves the same way on a platform where it is one.
+   */
+  function assertAddressableId(id: string): void {
+    if (id.length === 0) {
+      throw new PathNotContainedError('The id is empty, so it does not name a file inside the storage folder')
+    }
+    if (path.isAbsolute(id)) {
+      throw new PathNotContainedError(`Cannot use an absolute path as an id: ${JSON.stringify(id)}`)
+    }
+    for (const segment of id.split(/[/\\]/)) {
+      if (segment === '' || segment === '.' || segment === '..') {
+        throw new PathNotContainedError(
+          `The id resolves onto a different id: it must be a relative path with no empty, "." or ".." ` +
+            `segments, got ${JSON.stringify(id)}`
+        )
+      }
+    }
+  }
+
   async function getFilePath(id: string): Promise<string> {
+    // Before anything else: an id that normalizes onto another id's path is not addressable here.
+    assertAddressableId(id)
+
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
     // for the file system to handle millions of files in the same directory.
     // This way, asuming that sha1 hash distribution is ~uniform we are reducing by 16^4 the max amount of files in a directory.
@@ -315,14 +349,6 @@ export async function createFolderBasedFileSystemContentStorage(
 
     // recursively creates the directory structure if needed
     const dirname = path.dirname(finalPath)
-
-    // An id that resolves to the containment directory ITSELF names a directory, not a file — `''`
-    // and `'.'` are the only ids that do it. Allowing them meant `exist()` stat'd the directory and
-    // answered `true`, and `retrieve()` handed back a ContentItem whose stream fails with EISDIR; in
-    // flat mode the directory in question is the storage root, so every such id aliased onto it.
-    if (finalPath === directoryPath) {
-      throw new PathNotContainedError('The id does not name a file inside the storage folder')
-    }
 
     // Containment check. We compare against `directoryPath + path.sep` (not a bare `startsWith`)
     // so a sibling directory that merely shares the prefix — e.g. id "../<root>-evil/x" resolving

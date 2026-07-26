@@ -204,8 +204,11 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function exist(id: string): Promise<boolean> {
     try {
-      const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
-      return !!obj.ETag
+      await s3.send(new HeadObjectCommand({ Bucket, Key: getKey(id) }))
+      // A HeadObject that succeeds IS the existence answer. Requiring an ETag on top of it is
+      // stricter than the contract and reports a present object as absent on any S3-compatible
+      // implementation that omits the header.
+      return true
     } catch (error: any) {
       if (isNotFound(error)) {
         warnIfForbidden('checking whether content exists', id, error)

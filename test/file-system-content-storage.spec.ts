@@ -14,6 +14,7 @@ import {
 import { bufferToStream, streamToBuffer } from '../src'
 import * as compressionModule from '../src/extras/compression'
 import { createLogComponent } from '@well-known-components/logger'
+import { PathNotContainedError } from '../src/folder-based/errors'
 
 describe('fileSystemContentStorage', () => {
   const fs = createFsComponent()
@@ -4733,10 +4734,13 @@ describe('fileSystemContentStorage', () => {
       const escapingId = path.join('..', path.basename(root) + 'X', 'escaped')
 
       try {
-        await expect(storage.storeStream(escapingId, bufferToStream(Buffer.from('x')))).rejects.toThrow(
-          /outside of the root/
+        // Asserted by TYPE, not message: such an id is now refused by the addressability check (it
+        // carries `..` segments, which alias other ids) before the containment check it used to
+        // reach. What matters — the rejection and that nothing lands outside the root — is unchanged.
+        await expect(storage.storeStream(escapingId, bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+          PathNotContainedError
         )
-        await expect(storage.exist(escapingId)).rejects.toThrow(/outside of the root/)
+        await expect(storage.exist(escapingId)).rejects.toBeInstanceOf(PathNotContainedError)
         expect(await fs.existPath(siblingDir)).toBeFalsy()
       } finally {
         await storage.stop?.()
@@ -4754,9 +4758,9 @@ describe('fileSystemContentStorage', () => {
       )
 
       try {
-        await expect(storage.storeStream('../../../tmp/escaped', bufferToStream(Buffer.from('x')))).rejects.toThrow(
-          /outside of the root/
-        )
+        await expect(
+          storage.storeStream('../../../tmp/escaped', bufferToStream(Buffer.from('x')))
+        ).rejects.toBeInstanceOf(PathNotContainedError)
       } finally {
         await storage.stop?.()
         rmSync(root, { recursive: true, force: true })

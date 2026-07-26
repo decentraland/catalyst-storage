@@ -10,8 +10,15 @@ export const MIME_DETECTION_BYTES = 4100
 
 export const DEFAULT_MIME_TYPE = 'application/octet-stream'
 
-/** Loads the module that supplies `fileTypeFromBuffer`. Injectable so callers can supply their own. */
-export type FileTypeLoader = () => Promise<{ fileTypeFromBuffer: (buffer: Uint8Array) => Promise<{ mime?: string }> }>
+/**
+ * Loads the module that supplies `fileTypeFromBuffer`. Injectable so callers can supply their own.
+ *
+ * The detector resolves to `undefined` when it recognizes nothing, which is the ordinary answer for
+ * content with no signature — modelled here so an implementation of this type has to account for it.
+ */
+export type FileTypeLoader = () => Promise<{
+  fileTypeFromBuffer: (buffer: Uint8Array) => Promise<{ mime?: string } | undefined>
+}>
 
 /**
  * Reads the first `byteCount` bytes of the stream for inspection (fewer only when the source ends
