@@ -1,6 +1,6 @@
 import { Readable } from 'stream'
 import { ILoggerComponent } from '@well-known-components/interfaces'
-import { detectMimeTypeFromBuffer, FileTypeLoader, peekHead } from '../src/mime-detection'
+import { detectMimeTypeFromBuffer, FileTypeLoader, loadFileType, peekHead } from '../src/mime-detection'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 
 function createSpyLogger(): ILoggerComponent.ILogger & { warn: jest.Mock } {
@@ -204,6 +204,27 @@ describe('detectMimeTypeFromBuffer', () => {
       expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('MIME type detection failed'), {
         error: 'corrupt header'
       })
+    })
+  })
+
+  describe('when the bundled loader is called more than once', () => {
+    let first: Promise<unknown>
+    let second: Promise<unknown>
+
+    beforeEach(() => {
+      // Memoized per process: loading `file-type` enters the ESM loader, and doing that per store was the
+      // cost this memo removed. The same promise coming back is what proves it is not re-entered.
+      first = loadFileType()
+      second = loadFileType()
+    })
+
+    it('should hand back the same in-flight module promise', () => {
+      // Identity is the whole assertion, and it is deliberately NOT awaited. Resolving it enters the real ESM
+      // loader, which is what this memo exists to do once per process — and awaiting it from a test was flaky
+      // (1 run in 6): an import still in flight when Jest tears the environment down fails, the same hazard
+      // that makes the S3 component await its loader at construction. `loadFileType` attaches its own `catch`
+      // to clear the memo, so nothing is left unhandled here.
+      expect(second).toBe(first)
     })
   })
 })

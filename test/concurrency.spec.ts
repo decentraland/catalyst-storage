@@ -156,4 +156,48 @@ describe('batch surfaces', () => {
       expect(peakInFlight).toBeGreaterThan(1)
     })
   })
+
+  describe('when the limit is Infinity', () => {
+    let peak: number
+
+    beforeEach(async () => {
+      // A deliberate "no limit", unlike NaN: every item may run at once.
+      let inFlight = 0
+      peak = 0
+      await mapWithConcurrency(
+        Array.from({ length: 12 }, (_, index) => index),
+        Infinity,
+        async () => {
+          inFlight++
+          peak = Math.max(peak, inFlight)
+          await new Promise((resolve) => setTimeout(resolve, 1))
+          inFlight--
+        }
+      )
+    })
+
+    it('should run every item concurrently', () => {
+      expect(peak).toBe(12)
+    })
+  })
+
+  describe('when several items fail', () => {
+    let rejection: Error | undefined
+
+    beforeEach(async () => {
+      // The FIRST failure is kept: later ones are usually the same fault seen again, and it is the one that
+      // explains why the batch stopped.
+      rejection = undefined
+      await mapWithConcurrency([1, 2, 3, 4], 4, async (item) => {
+        await new Promise((resolve) => setTimeout(resolve, item))
+        throw new Error(`failure ${item}`)
+      }).catch((error: Error) => {
+        rejection = error
+      })
+    })
+
+    it('should reject with the first failure rather than a later one', () => {
+      expect(rejection?.message).toBe('failure 1')
+    })
+  })
 })

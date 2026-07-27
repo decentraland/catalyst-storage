@@ -1731,9 +1731,16 @@ export async function createFolderBasedFileSystemContentStorage(
           // DESCENDED INTO IMMEDIATELY, rather than collected for later. This branch exists because the
           // directory is too large to hold, and holding one name per SUBDIRECTORY has the same shape as
           // holding one per entry: a flat-mode root of `d000001/x`, `d000002/x`, … retains a string per
-          // top-level directory. Recursing here keeps nothing, at the cost of holding this directory's own
-          // handle open across the recursion — bounded by nesting depth, not by directory size. The buffered
-          // branch above still collects, because its cap already bounds it.
+          // top-level directory (measured 1.6MB at 50k). Recursing here keeps nothing.
+          //
+          // The price is this directory's own handle staying open across the recursion, and what bounds that
+          // is NOT nesting depth: only a directory that overflowed the cap reaches this branch, so the
+          // handles held are one per ANCESTOR WITH MORE THAN MAX_BUFFERED_DIRECTORY_ENTRIES ENTRIES — the
+          // buffered branch below releases its listing before descending and holds none. Measured: a
+          // 400-level chain of small directories holds ZERO extra descriptors, while six nested levels of
+          // 4,101 entries each hold six. Exhausting a descriptor limit that way needs hundreds of nested
+          // directories each holding thousands of entries, which is more files than the tree could contain;
+          // id length caps the depth at a few hundred in any case.
           yield* allFileIdsRec(entryPath, USE_HASH_PREFIX && folder === root ? entryPath : idBase, prefix)
           continue
         }

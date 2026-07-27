@@ -1253,3 +1253,80 @@ describe('S3 Storage injected content-type detector', () => {
     })
   })
 })
+
+describe('when the startup ListBucket probe fails for a reason unrelated to permissions', () => {
+  let warnings: { message: string; context?: unknown }[]
+  let storage: IContentStorageComponent
+
+  beforeEach(async () => {
+    // A throttle or a network blip says nothing about permissions, so construction must not refuse — the
+    // component's own reads and writes surface the same fault if it persists.
+    warnings = []
+    const fake = createFakeS3Client()
+    fake.on('ListObjectsV2Command', () => {
+      throw Object.assign(new Error('slow down'), { name: 'SlowDown', $metadata: { httpStatusCode: 503 } })
+    })
+    const logs = {
+      getLogger: () => ({
+        log: () => undefined,
+        debug: () => undefined,
+        error: () => undefined,
+        info: () => undefined,
+        warn: (message: string, context?: unknown) => warnings.push({ message, context })
+      })
+    } as never
+    storage = await createStorage({ logs }, fake, { Bucket: 'example' })
+  })
+
+  it('should still construct', () => {
+    expect(storage).toBeDefined()
+  })
+
+  it('should say the probe failed for an unrelated reason', () => {
+    expect(warnings.some((each) => each.message.includes('unrelated to permissions'))).toBe(true)
+  })
+})
+
+describe('when repeated 403s are reported as absence', () => {
+  let warned: string[]
+  let debugged: string[]
+  let storage: IContentStorageComponent
+
+  beforeEach(async () => {
+    // For the principal this option exists for, a 403 IS the ordinary miss, so warning on every one buries
+    // the warnings that matter. The first is loud, the rest go to debug until the interval passes.
+    warned = []
+    debugged = []
+    const fake = createFakeS3Client()
+    const forbidden = () => {
+      throw Object.assign(new Error('AccessDenied'), {
+        name: 'AccessDenied',
+        $metadata: { httpStatusCode: 403 }
+      })
+    }
+    fake.on('HeadObjectCommand', forbidden)
+    const logs = {
+      getLogger: () => ({
+        log: () => undefined,
+        info: () => undefined,
+        error: () => undefined,
+        warn: (message: string) => warned.push(message),
+        debug: (message: string) => debugged.push(message)
+      })
+    } as never
+    storage = await createStorage({ logs }, fake, { Bucket: 'example', report403AsAbsent: true })
+    warned.length = 0
+    debugged.length = 0
+    expect(await storage.exist('first')).toBe(false)
+    expect(await storage.exist('second')).toBe(false)
+    expect(await storage.exist('third')).toBe(false)
+  })
+
+  it('should warn once', () => {
+    expect(warned.filter((each) => each.includes('403 Forbidden')).length).toBe(1)
+  })
+
+  it('should send the rest to debug', () => {
+    expect(debugged.filter((each) => each.includes('403 Forbidden')).length).toBe(2)
+  })
+})

@@ -943,6 +943,159 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
+  describe('when an ancestor cannot be read while an absence is being classified', () => {
+    // The classifier walks up statting ancestors, and either probe can fail for a reason that proves nothing
+    // — EACCES, EIO. Both fail CLOSED, because the alternative is reporting content absent on no evidence.
+    let storage: IContentStorageComponent
+    let storageRoot: string
+    let unreadable: string
+
+    /** A filesystem that answers normally except for one path, which fails as if permissions were damaged. */
+    const failingStatFor = (target: () => string): IFileSystemComponent => {
+      const base = createFsComponent()
+      return {
+        ...base,
+        stat: (async (probed: any, ...rest: any[]) => {
+          if (String(probed) === target()) {
+            throw Object.assign(new Error(`EACCES: permission denied, stat '${probed}'`), { code: 'EACCES' })
+          }
+          return (base.stat as any)(probed, ...rest)
+        }) as IFileSystemComponent['stat']
+      }
+    }
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      if (storageRoot) rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    describe('and it is the deepest observed ancestor, above the id own parent', () => {
+      beforeEach(async () => {
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'unreadable-ancestor-'))
+        unreadable = ''
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingStatFor(() => unreadable), logs: await createLogComponent({}) },
+          storageRoot,
+          { disablePrefixHash: true }
+        )
+        // Observes `<root>/a`, so a read of `a/b/c` looks there rather than at its own parent `<root>/a/b`.
+        await storage.storeStream('a/b', bufferToStream(Buffer.from('x')))
+        unreadable = path.join(storageRoot, 'a')
+      })
+
+      it('should reject rather than report the id absent', async () => {
+        await expect(storage.exist('a/b/c')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and it is a path the walk reaches ABOVE a broken observed directory', () => {
+      beforeEach(async () => {
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'unreadable-walk-'))
+        unreadable = ''
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingStatFor(() => unreadable), logs: await createLogComponent({}) },
+          storageRoot,
+          { disablePrefixHash: true }
+        )
+        await storage.storeStream('a2/b', bufferToStream(Buffer.from('x')))
+        rmSync(path.join(storageRoot, 'a2'), { recursive: true, force: true })
+        // The walk starts at the broken `<root>/a2` and steps up to the root, which now cannot be read.
+        unreadable = storageRoot
+      })
+
+      it('should reject rather than report the id absent', async () => {
+        await expect(storage.exist('a2/b')).rejects.toBeDefined()
+      })
+    })
+  })
+
+  describe('when a shard holds a file whose name spells no addressable id', () => {
+    let storage: IContentStorageComponent
+    let storageRoot: string
+
+    beforeEach(async () => {
+      // `x.gzip.gzip` would be the compressed representation of `x.gzip`, and no id may end in that suffix,
+      // so the derived id is one `resolveFilePath` refuses — the hash-mode half of that rejection.
+      storageRoot = mkdtempSync(path.join(os.tmpdir(), 'shard-reserved-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        storageRoot
+      )
+      await storage.storeStream('real', bufferToStream(Buffer.from('x')))
+      const shard = createHash('sha1').update('real').digest('hex').substring(0, 4)
+      await nodeFs.writeFile(path.join(storageRoot, shard, 'x.gzip.gzip'), 'foreign')
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    it('should not enumerate it', async () => {
+      const listed: string[] = []
+      for await (const id of storage.allFileIds()) listed.push(id)
+
+      expect(listed).toEqual(['real'])
+    })
+  })
+
+  describe('when an id has an over-long segment that is not its last', () => {
+    let storage: IContentStorageComponent
+
+    beforeEach(() => {
+      // The budget differs by position: a FINAL segment must also leave room for `.gzip`, since that is the
+      // id's compressed representation, while an intermediate one gets all of NAME_MAX. The rejection says
+      // which rule it applied.
+      storage = createInMemoryStorage()
+    })
+
+    it('should reject naming the plain NAME_MAX budget', async () => {
+      const overLong = `${'x'.repeat(300)}/tail`
+
+      await expect(storage.storeStream(overLong, bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /past the 255 this storage can address/
+      )
+    })
+
+    it('should reject a final segment against the smaller budget instead', async () => {
+      const overLongTail = `head/${'x'.repeat(300)}`
+
+      await expect(storage.storeStream(overLongTail, bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /less \.gzip for the compressed representation/
+      )
+    })
+  })
+
+  describe('when the storage root is given with a trailing separator', () => {
+    let storage: IContentStorageComponent
+    let storageRoot: string
+
+    beforeEach(async () => {
+      // Stripped at construction, because a root that keeps one breaks the containment comparison for every
+      // id: `'/data/x/id'.startsWith('/data/x//')` is false.
+      storageRoot = mkdtempSync(path.join(os.tmpdir(), 'trailing-sep-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        storageRoot + path.sep
+      )
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    it('should store and read back through the normalized root', async () => {
+      await storage.storeStream('an-id', bufferToStream(Buffer.from('content')))
+
+      expect(await storage.exist('an-id')).toBe(true)
+    })
+
+    it('should still refuse an id that escapes the root', async () => {
+      await expect(storage.exist('../evil')).rejects.toBeInstanceOf(PathNotContainedError)
+    })
+  })
+
   describe('when enumeration recovers an id from a file path', () => {
     // Slicing the path is only the inverse of storing when the file is where this storage would have put it.
     // A foreign file in the wrong shard yielded an id whose own shard is elsewhere, so `exist()` answered
