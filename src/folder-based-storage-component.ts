@@ -393,6 +393,13 @@ export async function createFolderBasedFileSystemContentStorage(
       // operation, downgrading a fault to a miss — is narrower than the races the read path already
       // tolerates.
       if (deferAbsenceClassification) return undefined
+      // ENAMETOOLONG needs no parent at all: the NAME cannot exist, whatever the directory above it looks
+      // like. Probing the parent for it re-derived the answer from the wrong evidence — for a deep id the
+      // parent path is over-long too, so the probe failed with ENAMETOOLONG, fell through the "could not be
+      // read" branch below and re-threw. `exist`, `fileInfo` and `retrieve` then rejected with a bare errno
+      // for an id that is provably absent, `existMultiple` lost the answers for every OTHER id in the batch,
+      // and `delete` of the same id resolved — the exact disagreement the allowance above was added to end.
+      if (err?.code === 'ENAMETOOLONG') return undefined
       // A missing-file error here has two very different meanings, and only one of them is a miss.
       // The parent directory decides which — and it must be proven to be a DIRECTORY, not merely
       // present: an access check passes for a regular file left at the shard path, while every stat
@@ -421,6 +428,21 @@ export async function createFolderBasedFileSystemContentStorage(
       // it. Invalidating the cache entry lets a write recreate the tree once whatever occupies the
       // path is gone (a foreign file is never removed here: destroying something this storage cannot
       // prove it owns is exactly what the reserved-namespace checks refuse to do).
+      //
+      // REPORTING THIS AS ABSENT WAS TRIED AND REVERTED. The motivation was real — a nested id whose
+      // parent path holds another id's content (`storeStream('a')` then a read of `a/b`) is genuinely
+      // unstorable, and rejecting its reads while `delete` resolved was a disagreement worth ending. But
+      // "the obstruction is inside the id namespace, so it must be another id's content" is FALSE in the
+      // default hash-prefix mode: the shard is `sha1(the FULL id)`, so `a/b`'s parent path is
+      // `<root>/<sha1('a/b')>/a` while `a`'s content lives at `<root>/<sha1('a')>/a` — different shards
+      // except on a 1-in-65536 collision. So in hash mode the rule almost only ever converted genuine
+      // corruption into silent absence, which is the "a broken store looks like an empty one, and stops
+      // being retried" answer this contract exists to refuse. It also skipped the `knownDirectories`
+      // check below, so a directory THIS INSTANCE created and that was then destroyed and replaced by a
+      // file read as absent too, and it only ever fired for the immediate parent, so the disagreement it
+      // set out to fix survived at depth >= 2 while the answers for two ids under one obstruction
+      // diverged. The store side is where this belongs, and that is where it now is: `ensureDirectoryFor`
+      // refuses such an id up front, so it can never be stored and a loud read is the honest answer.
       if (parent) {
         forgetDirectory(dirname)
         logger.warn(`Refusing to report ${filePath} as absent: its parent path exists but is not a directory`)
@@ -450,6 +472,33 @@ export async function createFolderBasedFileSystemContentStorage(
       throw err
     }
   }
+
+  /*
+   * KNOWN LIMITATION, deliberately not guarded here: on a filesystem that FOLDS CASE (APFS, NTFS, any
+   * SMB/CIFS mount) two ids differing only in case name one file, so storing `FOO` after `foo` overwrites
+   * it — `exist` answers true for both while `allFileIds()` yields one, so a GC diffing enumeration against
+   * `exist` is served the wrong bytes. Hash prefixes hide it unless the two spellings collide in one 4-hex
+   * shard; flat mode has no shards, so it is reachable there directly.
+   *
+   * A per-store guard that read the target directory and rejected a folded sibling was tried and REVERTED,
+   * because it was worse than the hole it covered:
+   * - it compared only the RAW basename, so two `storeStreamAndCompress` calls (which leave only
+   *   `<id>.gzip` on disk) still corrupted silently — and whether a pair was refused or corrupted then
+   *   depended on a compression decision the caller cannot see;
+   * - it compared only the basename, so nested ids (`Pdir/child` vs `PDIR/child`) walked straight past it;
+   * - the fold it compared with strips trailing dots and spaces, which APFS PRESERVES, so it refused
+   *   `Xa.` alongside `Xa` — two provably distinct files — and made an ordinary id unstorable if a dotted
+   *   one was stored first;
+   * - it cost a `readdir` per store: measured 39 ms/store at 50k entries in flat mode against ~0.25 ms,
+   *   O(n²) to fill a directory.
+   *
+   * Closing this properly needs the two foldings probed INDEPENDENTLY (case folding and trailing-tail
+   * stripping are orthogonal — NTFS does both, APFS only the first), both representations of an id
+   * compared, every path segment checked rather than just the last, and no per-store directory read. That
+   * is a design, not a guard, and it cannot be exercised on this project's CI (Linux/ext4, where any such
+   * probe answers "does not fold" and the whole path is dead code). Until then the id namespace is
+   * documented as case-sensitive: run production on a case-sensitive filesystem, which ext4 and XFS are.
+   */
 
   const tempDirLower = tempDir.toLowerCase()
 
@@ -614,8 +663,64 @@ export async function createFolderBasedFileSystemContentStorage(
     const dirname = path.dirname(filePath)
 
     if (!knownDirectories.has(dirname)) {
-      if (!(await components.fs.existPath(dirname))) {
-        await components.fs.mkdir(dirname, { recursive: true })
+      // `stat`, not `existPath`. F_OK|R_OK passes for a REGULAR FILE sitting at this path, so `mkdir` was
+      // skipped and the failure surfaced several awaits later as a bare `ENOTDIR` from the commit rename.
+      // That state needs no corruption to reach: nested ids are legal, so storing `a` and then `a/b` asks
+      // this to create a directory exactly where another id's content file already is. A filesystem cannot
+      // hold a file and a directory at one path, so `a/b` is genuinely unstorable here — and saying so with
+      // the typed error every other unstorable-name rule uses means a service mapping it to 400 stops
+      // answering 500, and stops retrying an id that can never succeed.
+      const occupant = await statOccupant(dirname)
+      // A REGULAR FILE here is a property of the NAME, so it is a bad request: nested ids are legal, so
+      // storing `a` and then `a/b` asks this to create a directory exactly where another id's content already
+      // is, and a filesystem cannot hold both at one path. `PathNotContainedError` is the class every other
+      // unstorable-name rule uses, so a service mapping it to 400 stops answering 500 and stops retrying an
+      // id that can never succeed. (`existPath` could not see this at all: F_OK|R_OK passes for a file, so
+      // `mkdir` was skipped and the failure surfaced several awaits later as a bare `ENOTDIR` from the commit
+      // rename.)
+      if (occupant === 'file') {
+        throw new PathNotContainedError(
+          `The id cannot be stored: its parent path is already occupied by another id's content, and a ` +
+            `filesystem cannot hold both a file and a directory at ${JSON.stringify(dirname)}. Ids where one ` +
+            `is a path prefix of another can only coexist when hash prefixes put them in different shards.`
+        )
+      }
+      // A FIFO, socket or device node is NOT a name problem — no id can put one there. It is something
+      // foreign in the storage's own tree, i.e. a storage fault, and calling it a bad request would tell the
+      // caller to fix an id that is perfectly valid.
+      if (occupant === 'other') {
+        throw new Error(
+          `Cannot store into ${JSON.stringify(dirname)}: the path exists but is neither a directory nor a ` +
+            `regular file, so this storage cannot create the directory the id needs. Remove whatever occupies it.`
+        )
+      }
+      if (occupant === 'absent') {
+        try {
+          await components.fs.mkdir(dirname, { recursive: true })
+        } catch (err: any) {
+          // ENOTDIR means an ANCESTOR is a regular file — the same prefix collision as above, just further up,
+          // and equally a property of the name.
+          if (err?.code === 'ENOTDIR') {
+            throw new PathNotContainedError(
+              `The id cannot be stored: an ancestor of ${JSON.stringify(dirname)} is a file, so the directory ` +
+                `the id needs cannot be created. Ids where one is a path prefix of another can only coexist ` +
+                `when hash prefixes put them in different shards.`
+            )
+          }
+          // ENAMETOOLONG is NOT a property of the name alone: the id already passed the total-length bound in
+          // `assertStorableContentId`, so what pushed the assembled path past `PATH_MAX` is the ROOT — the
+          // deployment's choice, which no caller controls. Reporting it as `PathNotContainedError` had a
+          // service answer 400 "bad content id", permanently and with nothing pointing at the real cause, for
+          // an id that stores fine under a shorter root. A storage fault is the honest class, and it names the
+          // remedy an operator actually has.
+          if (err?.code === 'ENAMETOOLONG') {
+            throw new Error(
+              `Cannot store ${JSON.stringify(dirname)}: the assembled path exceeds the platform's PATH_MAX. ` +
+                `The id itself is within this storage's limits, so the storage root is too long — shorten it.`
+            )
+          }
+          throw err
+        }
       }
       rememberDirectory(dirname)
     }
@@ -752,10 +857,71 @@ export async function createFolderBasedFileSystemContentStorage(
     }
   }
 
+  /**
+   * What currently sits at `target`, for a caller that must know before it creates something there.
+   *
+   * Four-valued on purpose. `existsForInvariant` collapses everything that is not a regular file into
+   * `false` — correct for its own callers, which ask whether the FILE they own is present — while both
+   * callers here need to tell a directory apart from a file: renaming onto a directory is an unfixable
+   * EISDIR, and `mkdir`-ing where a file sits is an unfixable ENOTDIR, whereas nothing at all is the
+   * ordinary case for both. `existPath` cannot answer it either, since F_OK|R_OK passes for a file.
+   * The absent codes match `existsForInvariant`'s: no name of that shape can exist.
+   */
+  /**
+   * Refuses a store whose commit would rename onto something that is not a regular file.
+   *
+   * `ensureDirectoryFor` covers the case where an id's PARENT path is occupied (`a` stored, then `a/b`). This
+   * is the mirror image: `a/b` stored first creates the directory `a`, so a later store of `a` has a perfectly
+   * good parent and only fails at the commit — with a bare `EISDIR` from the rename, several awaits after the
+   * id was accepted, which is the untyped-late-failure shape the id rules exist to remove. Checked here, before
+   * anything is staged, so a rejected store leaves no residue.
+   *
+   * Both commit targets are checked for a compressed store, because it commits to whichever representation it
+   * decides on: the gzip when compression helped, the raw when it did not. A directory at the raw path would
+   * otherwise leave an id that stores and serves whole reads but can never serve a byte RANGE, since the range
+   * path has to publish its decompressed copy exactly there.
+   *
+   * A directory is a NAME problem — another id's nested content legitimately occupies the path — so it is a
+   * typed rejection. Anything else (a fifo, socket or device node) is foreign to this storage and no id can
+   * create it, so it is a fault. This is not a substitute for the commit's own failure handling: the state can
+   * appear between this check and the rename, and the commit still reports that honestly.
+   */
+  async function assertCommitTargetsWritable(id: string, filePath: string, includeGzipPath: boolean): Promise<void> {
+    const targets = includeGzipPath ? [filePath, gzipPathOf(filePath)] : [filePath]
+    for (const target of targets) {
+      const occupant = await statOccupant(target)
+      if (occupant === 'directory') {
+        throw new PathNotContainedError(
+          `The id cannot be stored: ${JSON.stringify(target)} is a directory, which means another id nested ` +
+            `under this one already occupies the path its content must be written to. Ids where one is a path ` +
+            `prefix of another can only coexist when hash prefixes put them in different shards: ` +
+            `${JSON.stringify(id)}`
+        )
+      }
+      if (occupant === 'other') {
+        throw new Error(
+          `Cannot store ${JSON.stringify(id)}: ${JSON.stringify(target)} exists but is neither a regular file ` +
+            `nor a directory, so this storage cannot commit its content there. Remove whatever occupies it.`
+        )
+      }
+    }
+  }
+
+  async function statOccupant(target: string): Promise<'file' | 'directory' | 'other' | 'absent'> {
+    try {
+      const stat = await components.fs.stat(target)
+      return stat.isFile() ? 'file' : stat.isDirectory() ? 'directory' : 'other'
+    } catch (err: any) {
+      if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR' || err?.code === 'ENAMETOOLONG') return 'absent'
+      throw err
+    }
+  }
+
   async function materializeRangeCacheFromGzip(
     id: string,
     uncompressedPath: string,
-    token: InvalidationToken
+    token: InvalidationToken,
+    acquireSlot: () => Promise<void>
   ): Promise<void> {
     // `false`: only the stream is used here, so the trailer read that resolves the logical size
     // would be pure overhead on the decompression path. The canonical path is already resolved by the
@@ -764,6 +930,10 @@ export async function createFolderBasedFileSystemContentStorage(
     if (!gzipItem) {
       return
     }
+    // Only NOW is an inflation slot worth holding: there is a gzip to inflate. Taken before this probe,
+    // a range read of an absent id spent the budget — twice, once per attempt of the caller's retry loop
+    // — parked behind real inflations for work that never touches a cache file.
+    await acquireSlot()
 
     const gzipPath = gzipPathOf(uncompressedPath)
     const sourceVanished = () => gzipSourceVanishedForRead(gzipPath)
@@ -780,6 +950,28 @@ export async function createFolderBasedFileSystemContentStorage(
         // inflating.
         const committed = await withPathLock(uncompressedPath, async () => {
           if (token.invalidated) return false
+          // WHAT OCCUPIES THE TARGET IS RE-CHECKED HERE, under the lock, immediately before the rename.
+          // The inflation was started because this path was ABSENT, and that premise can have expired: the
+          // token covers a writer that committed while a token existed to mark, but not one that committed
+          // before this inflation registered — between the caller's stat and its call into the cache. The
+          // rename is unconditional, so such a writer's primary content was silently replaced by the
+          // inflation of the gzip it superseded, and a restart's repair then discarded the counterpart and
+          // left those stale bytes as the id's only representation. Bailing hands the caller's retry loop
+          // the new primary instead, which is what it should have served all along.
+          const occupant = await statOccupant(uncompressedPath)
+          if (occupant === 'file') return false
+          // A DIRECTORY here is the one occupant no retry clears. Nested ids are legal, so `storeStream('a/b')`
+          // creates a directory at `a`'s raw path while `a` itself can still be stored gzip-only — and reads
+          // report a directory as absent (see `statForRead`), which is precisely what routes a RANGE request
+          // into this inflation. The rename then failed with a bare EISDIR on every call, forever, for an id
+          // whose whole-file reads succeed. Named as the storage fault it is instead, so it is diagnosable.
+          if (occupant === 'directory' || occupant === 'other') {
+            throw new Error(
+              `Cannot serve a byte range of ${id}: its uncompressed path is occupied by a directory, so the ` +
+                `decompressed copy a range read needs cannot be published there. Whole-file reads are ` +
+                `unaffected. Remove or migrate the directory at that path to restore range reads.`
+            )
+          }
           await rename(writePath, uncompressedPath)
           // Registered with the size the inflation itself counted, not a fresh `stat`: a stat that
           // failed AFTER the rename had landed skipped `record` entirely, leaving a decompressed copy
@@ -869,6 +1061,8 @@ export async function createFolderBasedFileSystemContentStorage(
     // reported success. See `assertStorableStream`.
     assertStorableStream(stream)
     await ensureDirectoryFor(filePath)
+    // The mirror of `ensureDirectoryFor`'s parent check: this store's own commit target must be writable.
+    await assertCommitTargetsWritable(id, filePath, false)
     // Stage the write in the reserved temp dir under a random name, then atomically rename it into
     // place. A direct write to the final path leaves a truncated/zero-byte file if the process dies
     // mid-write (OOM-kill, eviction, crash); since `exist()` only checks for the path, that partial
@@ -935,8 +1129,14 @@ export async function createFolderBasedFileSystemContentStorage(
     })
   }
 
-  // Concurrent-read contract: reads are deliberately NOT serialized against writes (locking the hot
-  // read path would be far too costly). IN ATOMIC MODE every read observes some COMPLETE committed
+  // Concurrent-read contract: reads do NOT hold a write's lock for the duration of that write, and never
+  // wait on the long parts of one (a body pipe, a compression, an inflation — all of which run outside the
+  // lock). A read DOES wait for a commit or eviction CRITICAL SECTION already in flight on its own path:
+  // `pinnedUntilOpen` awaits `cache.settle`, without which a reader could stat a cache file whose `unlink`
+  // was already committed to and hand back a lazy item over it — failing a read of content that was present,
+  // which the read contract turns into a 5xx. Those sections are short and bounded (measured: a read issued
+  // during a 2 s upload of the same id completed in 0.6 ms), so this is a bounded wait on the settled state
+  // rather than serialization against writes. IN ATOMIC MODE every read observes some COMPLETE committed
   // version of the id — commits are atomic renames and a version's raw/gzip transition happens under
   // the path lock — but a read that overlaps a commit may still serve the previous version (e.g. its
   // gzip, which retrieve prefers, in the instant before the committing section unlinks it). Reads
@@ -993,6 +1193,12 @@ export async function createFolderBasedFileSystemContentStorage(
     const releaseExisting = cache.pin(filePath, CACHE_PIN_GRACE_MS)
     let item: ContentItem | undefined
     try {
+      // Pinning alone does not make the stat below trustworthy. An eviction pass checks pins when it
+      // SELECTS a victim, so a pin taken after that point does not stop the `unlink` it has already
+      // committed to — and `produce` would then stat a file that is about to vanish and hand back a lazy
+      // item over it, surfacing ENOENT for content that was present. Waiting for the path to settle costs
+      // a resolved promise when nothing holds it, and the pin taken above is visible to every later pass.
+      await cache.settle(filePath)
       item = await produce()
     } catch (err) {
       releaseExisting()
@@ -1091,8 +1297,8 @@ export async function createFolderBasedFileSystemContentStorage(
       for (let attempt = 0; attempt < 2 && !contentItem && requestedRange; attempt++) {
         // Deduplicated across concurrent callers of the same path, and handed the invalidation token
         // that says whether the gzip this inflation started from is still the current version.
-        await cache.deduplicateInflation(baseFilePath, (token) =>
-          materializeRangeCacheFromGzip(id, baseFilePath, token)
+        await cache.deduplicateInflation(baseFilePath, (token, acquireSlot) =>
+          materializeRangeCacheFromGzip(id, baseFilePath, token, acquireSlot)
         )
 
         // Pinned AFTER the inflation, not around it. The pin exists to cover one window — from the entry
@@ -1109,6 +1315,20 @@ export async function createFolderBasedFileSystemContentStorage(
           // Serve range from the cached uncompressed file (undefined when the gzip didn't exist or
           // the decompression was discarded; the loop then retries once)
           retrieveWithEncoding(id, null, requestedRange, true, false, baseFilePath)
+        )
+      }
+
+      // A range request that ran out of attempts because SHUTDOWN discarded its inflation is not a miss. The
+      // id's gzip is present — `stop()` deliberately refuses to publish a derived file it would then have to
+      // reclaim behind `evictAll`, which is a different statement from "there is nothing to serve". Answering
+      // `undefined` handed the caller a 404 for content sitting on disk, which `exist()` simultaneously
+      // reported present; rejecting says "cannot be read right now", the 5xx the read contract reserves for
+      // exactly this, and leaves the request retryable against a running instance.
+      if (!contentItem && requestedRange && !cache.isOpen()) {
+        throw new Error(
+          `Cannot serve a byte range of ${id} while the storage is shutting down: the decompressed copy a ` +
+            `range read needs is not published during shutdown. The content itself is intact; retry the ` +
+            `request against a running instance.`
         )
       }
 
@@ -1268,6 +1488,14 @@ export async function createFolderBasedFileSystemContentStorage(
     const idForEntry = (name: string): string | undefined => {
       const entryPath = folder + path.sep + name
       const isGzip = name.endsWith(GZIP_EXTENSION)
+      // A name that IS the suffix and nothing else leaves an empty remainder, which is not an addressable
+      // id — and yielding it made `allFileIds()` report `''`, whose `exist`/`delete` then reject with
+      // `PathNotContainedError`, so a GC sweep that enumerates and deletes failed its whole batch on every
+      // retry, forever. Enumeration must only ever yield ids the point lookups accept. Nothing this storage
+      // writes can produce the name (`resolveFilePath` rejects the empty id and `gzipPathOf` always appends
+      // to a non-empty one), so it takes a foreign file — the same class of input the surrounding code
+      // chooses to skip rather than fail on.
+      if (isGzip && name.length === GZIP_EXTENSION.length) return undefined
       const id = idOf(isGzip ? entryPath.slice(0, -GZIP_EXTENSION.length) : entryPath)
       return prefix && !id.startsWith(prefix) ? undefined : id
     }
@@ -1492,6 +1720,8 @@ export async function createFolderBasedFileSystemContentStorage(
     const filePath = await resolveFilePath(id)
     assertStorableStream(stream)
     await ensureDirectoryFor(filePath)
+    // BOTH representations, because the commit picks one of them depending on whether compression helped.
+    await assertCommitTargetsWritable(id, filePath, true)
     // Fully staged: both the raw bytes and their gzip are produced in the operation-owned staging
     // area — the compression reads the PRIVATE staged raw, so no concurrent store/delete can
     // supersede or fail it — and the id transitions in ONE locked commit to either the gzip-only
@@ -1620,6 +1850,11 @@ export async function createFolderBasedFileSystemContentStorage(
 
   return {
     async start(_startOptions: any) {
+      // Reopened, because `stop()` closes the cache to keep a late inflation from committing behind
+      // `evictAll` — and this method is documented as re-callable. Without this a stop/start cycle left
+      // every later inflation pre-invalidated, so range reads of gzip-only content answered `undefined`
+      // forever while `exist()` reported the id present.
+      cache.open()
       // Idempotent: clear any existing timer first so a repeated start() doesn't leak intervals.
       if (evictionTimer) {
         clearInterval(evictionTimer)
@@ -1646,6 +1881,13 @@ export async function createFolderBasedFileSystemContentStorage(
         clearInterval(evictionTimer)
         evictionTimer = undefined
       }
+      // Closed BEFORE the snapshot below, because the snapshot is not the whole set: `inflight()` reports
+      // only decompressions that have already REGISTERED, and a range read still in its pre-inflation
+      // stats registers afterwards — committing its file behind `evictAll` and leaving a derived copy that
+      // nothing reclaims, since the next boot deliberately never adopts one. After `close()` such a read
+      // starts pre-invalidated and discards its output, so the snapshot really is everything that can
+      // still commit.
+      cache.close()
       // Wait for the startup temp-file sweep, an in-flight eviction tick and any inflight
       // decompressions before cleaning up
       await Promise.allSettled([tempFileSweep, evictionTick, ...cache.inflight()])
@@ -1671,6 +1913,27 @@ export async function createFolderBasedFileSystemContentStorage(
       //
       // `forEach`, not `map`: nothing reads a result here, and the results array `map` allocates is
       // 8MB of `undefined` for a million-id sweep.
+      //
+      // EVERY id is validated before ANY removal starts. With the removals bounded-concurrent, a malformed
+      // id anywhere in the list used to let up to `BATCH_CONCURRENCY` ids run to completion first, so a
+      // rejected batch had deleted a nondeterministic prefix of the ids behind the bad one — while the
+      // in-memory backend, being sequential, had deleted none of them. A caller cannot act on "some
+      // unspecified subset was removed"; it can act on "nothing was".
+      //
+      // Validated with `resolveFilePath`, the SAME function the removal pass uses, rather than with the
+      // shared id rules alone. Those rules are not the whole rejection surface: an id landing inside the
+      // reserved staging directory is refused only by `resolveFilePath`, so in flat mode
+      // `delete(['victim', '.tmp-writes/x'])` passed pre-validation, removed `victim`, and only then
+      // rejected — the exact partial application this pass exists to rule out. Using one function for both
+      // makes the guarantee hold by construction instead of by keeping two lists of rules in step.
+      //
+      // The resolved paths are DISCARDED rather than kept for the pass below, so the ids are resolved twice.
+      // That is deliberate: resolution is pure CPU (no syscall), while retaining a path per id would hold
+      // hundreds of megabytes for the million-id sweeps this surface is documented to accept — the same
+      // reason the pass below uses `forEach` rather than `map`.
+      for (const id of ids) {
+        await resolveFilePath(id)
+      }
       await forEachWithConcurrency(ids, BATCH_CONCURRENCY, async (id) => {
         const filePath = await resolveFilePath(id)
         // Locked so an in-flight decompression can never resurrect the id by renaming its staged

@@ -45,13 +45,16 @@ export function createInMemoryStorage(): IContentStorageComponent {
     },
     storeStream: storeBuffered,
     async delete(ids: string[]): Promise<void> {
-      // Validated and deleted id by id, NOT validated-all-then-deleted-all. The folder-based backend
-      // resolves and removes each id in turn, so `delete(['victim', '../evil'])` removes `victim` and
-      // then rejects; validating up front here left `victim` in place for the same call, so a service
-      // exercised against this backend in tests saw the opposite outcome in production. `delete` is
-      // idempotent, so retrying the whole list is the recovery in both.
+      // EVERY id is validated before ANY is removed, which the folder-based backend now does too. It used
+      // to be interleaved here — validate one, delete one — to mirror that backend "resolving and removing
+      // each id in turn", but it stopped doing so when its removals became bounded-concurrent: up to 64
+      // ids were in flight before the first rejection was observed, so a bad id first in the list still
+      // left some of the ids behind it deleted, nondeterministically, while this backend deleted none of
+      // them. Validating up front makes the outcome the same on both and states something a caller can
+      // rely on: a batch rejected for a malformed id changed nothing, so the fix is to correct the id
+      // rather than to reason about how far the batch got.
+      ids.forEach((id) => assertAddressableContentId(id))
       for (const id of ids) {
-        assertAddressableContentId(id)
         storage.delete(id)
       }
     },

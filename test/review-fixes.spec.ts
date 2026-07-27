@@ -650,9 +650,12 @@ describe('when the in-memory backend hands content to a consumer', () => {
 })
 
 describe('when the in-memory backend deletes a list containing an unaddressable id', () => {
-  // The folder-based backend resolves and removes id by id, so it deletes what it can and then rejects.
-  // Validating the whole list up front made the same call leave every id in place, so a service
-  // exercised against this backend in tests saw the opposite outcome in production.
+  // Both backends validate the WHOLE list before removing anything, so a batch rejected for a malformed id
+  // changed nothing and the caller's recovery is to correct the id rather than to reason about how far the
+  // batch got. This backend used to validate and delete id by id, to mirror the folder-based one "resolving
+  // and removing each id in turn" — but that stopped being true once its removals became bounded-concurrent,
+  // at which point a bad id first in the list left a nondeterministic prefix of the ids behind it deleted
+  // there and none of them deleted here.
   let storage: IContentStorageComponent
 
   beforeEach(async () => {
@@ -664,10 +667,16 @@ describe('when the in-memory backend deletes a list containing an unaddressable 
     await expect(storage.delete(['victim', '../evil'])).rejects.toBeInstanceOf(PathNotContainedError)
   })
 
-  it('should have deleted the ids preceding the invalid one', async () => {
+  it('should leave an id preceding the invalid one in place', async () => {
     await storage.delete(['victim', '../evil']).catch(() => undefined)
 
-    expect(await storage.exist('victim')).toBe(false)
+    expect(await storage.exist('victim')).toBe(true)
+  })
+
+  it('should leave an id following the invalid one in place', async () => {
+    await storage.delete(['../evil', 'victim']).catch(() => undefined)
+
+    expect(await storage.exist('victim')).toBe(true)
   })
 })
 

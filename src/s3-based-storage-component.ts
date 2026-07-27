@@ -90,14 +90,39 @@ export type S3ContentStorageOptions = {
    * roughly 50 GiB, which is only reported as `Exceeded 10000 parts` AFTER 50 GiB has crossed the wire.
    *
    * Raise it for a deployment that stores objects near or past that ceiling (64 MiB parts lift it to about
-   * 640 GiB) at the cost of proportionally more memory per concurrent upload, since lib-storage buffers a
-   * part at a time. Scene assets are nowhere near it, hence the unchanged default.
+   * 640 GiB) at the cost of proportionally more memory per concurrent upload. Budget that memory as
+   * `partSize × UPLOAD_QUEUE_SIZE` — lib-storage uploads that many parts CONCURRENTLY, each holding a full
+   * part, so 64 MiB parts cost about 256 MiB per in-flight store, not 64 MiB. This said "buffers a part at
+   * a time", which understated it fourfold and would have had an operator size a container from the wrong
+   * number and be OOM-killed mid-upload, after the bytes had already crossed the wire. Scene assets are
+   * nowhere near the ceiling, hence the unchanged default.
    */
   partSize?: number
 }
 
 /** S3's hard per-request limit for `DeleteObjects`; the SDK does not split a larger list. */
 const DELETE_OBJECTS_MAX_KEYS = 1000
+
+/**
+ * How many parts lib-storage uploads concurrently, and so the multiplier on `partSize` for peak memory.
+ *
+ * Its own default, pinned here rather than inherited so it cannot change under an SDK bump without the
+ * memory documented for `partSize` changing with it.
+ */
+const UPLOAD_QUEUE_SIZE = 4
+
+/**
+ * How long the best-effort multipart cleanup may take before a cancelled or failed store stops waiting.
+ *
+ * The cleanup is deliberately issued on the REAL client, so the signal that caused the teardown cannot
+ * cancel it too — and that left it with nothing bounding it at all: the owned-client factory builds a
+ * plain `S3Client`, and the Node handler defaults both `requestTimeout` and `socketTimeout` to 0, so a
+ * request to a wedged endpoint never returns. Since the store's rejection is gated on this call, the
+ * caller's cancellation was not observable for as long as S3 stayed silent. Ten seconds is far longer
+ * than an `AbortMultipartUpload` ever legitimately takes, and giving up only loses the part cleanup —
+ * which is already best-effort and covered by a lifecycle rule.
+ */
+const MULTIPART_CLEANUP_TIMEOUT_MS = 10_000
 
 /** S3's own bounds for a multipart part, which `partSize` is checked against at construction. */
 const S3_MIN_PART_SIZE = 5 * 1024 * 1024
@@ -492,15 +517,40 @@ export async function createS3BasedFileSystemContentStorage(
     return context
   }
 
-  /** A 403 read as not-found is worth an operator's attention: it may be a real permission problem. */
+  /**
+   * A 403 read as not-found is worth an operator's attention: it may be a real permission problem.
+   *
+   * THROTTLED, not silenced after the first. For the principal this option exists for — one without
+   * `s3:ListBucket`, for which S3 answers a missing key with 403 — a 403 on a read is the ORDINARY MISS, so
+   * warning on every one meant a single availability check over a thousand unknown hashes emitted a thousand
+   * four-sentence warnings, burying the warnings that do need reading and scaling log volume with 404
+   * traffic. But warning exactly ONCE is wrong in the other direction: that one warning is almost certainly
+   * spent on a benign miss seconds after startup, and a genuine failure hours later — rotated credentials,
+   * clock skew, a revoked policy — would then be visible only at debug level while reads kept answering
+   * "absent", which is the "a broken node looks like an empty node" outcome the surrounding code is built to
+   * prevent. Re-warning on an interval keeps a persistent problem persistently visible at a bounded cost.
+   *
+   * Per STORAGE, not per process: two storages in one process each warn on their own schedule, which is
+   * right, because they may have different buckets and different principals.
+   */
+  const FORBIDDEN_WARNING_INTERVAL_MS = 5 * 60 * 1000
+  let lastForbiddenWarningAt: number | undefined
   function warnIfForbidden(operation: string, id: string, error: any): void {
     if (error?.$metadata?.httpStatusCode !== 403) return
+    const context = logContextFor(id, error)
+    const now = Date.now()
+    if (lastForbiddenWarningAt !== undefined && now - lastForbiddenWarningAt < FORBIDDEN_WARNING_INTERVAL_MS) {
+      logger.debug(`S3 returned 403 Forbidden while ${operation}; reporting the content as not found`, context)
+      return
+    }
+    lastForbiddenWarningAt = now
     logger.warn(
       `S3 returned 403 Forbidden while ${operation}; reporting the content as not found because report403AsAbsent ` +
         `is enabled. If the object is simply missing, grant the principal s3:ListBucket so missing keys return 404 ` +
         `and this option can be removed; otherwise check the bucket name, the credentials and the object/bucket ` +
-        `permissions — this node is reporting content as absent that it may simply be unable to read.`,
-      logContextFor(id, error)
+        `permissions — this node is reporting content as absent that it may simply be unable to read. ` +
+        `Further 403s are logged at debug level for the next ${FORBIDDEN_WARNING_INTERVAL_MS / 60000} minutes.`,
+      context
     )
   }
 
@@ -608,7 +658,13 @@ export async function createS3BasedFileSystemContentStorage(
           // replace the error the caller needs to see.
           if (multipartUploadId) {
             try {
-              await s3.send(new AbortMultipartUploadCommand({ Bucket, Key: id, UploadId: multipartUploadId }))
+              // TIMED OUT, not merely un-cancellable. Issuing this on the real client is what keeps the
+              // caller's signal from killing the cleanup, but the store's own rejection is awaiting it, so
+              // an endpoint that never answers made cancellation unobservable for as long as it stayed
+              // silent. Its own signal bounds the wait without borrowing the caller's.
+              await s3.send(new AbortMultipartUploadCommand({ Bucket, Key: id, UploadId: multipartUploadId }), {
+                abortSignal: AbortSignal.timeout(MULTIPART_CLEANUP_TIMEOUT_MS)
+              })
             } catch (cleanupError: any) {
               // `NoSuchUpload` (or a 404) means there is nothing left to abort — lib-storage already
               // aborted it on every path that runs BEFORE `CompleteMultipartUpload`, which is the
@@ -682,6 +738,10 @@ export async function createS3BasedFileSystemContentStorage(
       // earlier revision of this patch enforced the segment-length rule here for cross-backend parity; that
       // is the wrong trade, because S3 keys have no per-segment limit and a >255-byte segment is a key this
       // bucket may already be serving.
+      // The SAME rule as the other backends, including the competing-`'readable'`-consumer refusal. This
+      // backend drains the body by explicit `read()`, which such a listener does not block — but not being
+      // blocked is not the same as being safe: the listener races this upload for the body, and it can win.
+      // See `assertStorableStream` for the measured corruption that made an exemption here untenable.
       assertStorableStream(stream)
       // Inspect only the head for MIME detection, then stream the body straight to S3 so large
       // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
@@ -703,6 +763,12 @@ export async function createS3BasedFileSystemContentStorage(
         // explicit `undefined` that could shadow it. See `partSize` for why the default caps a store at
         // roughly 50 GiB.
         ...(options.partSize !== undefined ? { partSize: options.partSize } : {}),
+        // Pinned EXPLICITLY at lib-storage's own default rather than left to it. It is the multiplier on
+        // `partSize` for peak memory — that many parts are in flight at once, each holding a full part —
+        // and `partSize`'s documentation is written against this number. Leaving it implicit meant an SDK
+        // bump could change the memory a configured `partSize` actually costs without anything here saying
+        // so, which is how the documented model came to understate the real footprint several-fold.
+        queueSize: UPLOAD_QUEUE_SIZE,
         params: {
           Bucket,
           Key: id,

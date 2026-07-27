@@ -1,7 +1,7 @@
 import { pipeline, Readable, Transform } from 'stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'zlib'
 import { ContentItem } from './types'
-import { destroyQuietly, ignoreStreamError } from './stream-teardown'
+import { destroyAllQuietly, destroyQuietly, ignoreStreamError } from './stream-teardown'
 
 /**
  * Content-coding tokens that mean "these bytes are not encoded" (RFC 9110 §8.4.1). Normalized to
@@ -95,12 +95,22 @@ export function contentCodingOf(encoding: string | null): string | null {
  * A MAP rather than a switch that constructs, so whether a coding is decodable can be answered without
  * building a zlib stream — which is what lets `asStream` settle the question before it opens the source.
  */
-const DECODER_FACTORIES: Record<string, () => Transform> = {
-  gzip: createGunzip,
-  'x-gzip': createGunzip,
-  deflate: createInflate,
-  br: createBrotliDecompress
-}
+/*
+ * A `Map`, not an object literal: a plain object's lookups reach `Object.prototype`, and because the coding
+ * is lowercased first, `constructor` and `__proto__` are exactly the two codings that hit it. For
+ * `constructor` the inherited value is the `Object` function — truthy, so the "unsupported encoding" refusal
+ * below was SKIPPED, the source was opened, and `pipeline` then threw `ERR_INVALID_ARG_TYPE` from outside
+ * any try/catch, leaving that source undestroyed: one leaked descriptor or socket per read attempt of an
+ * object whose `Content-Encoding` happened to say `constructor`. Backends read that value from stored
+ * metadata (S3's is arbitrary and writable by anything with access to the bucket), so it is attacker- or
+ * operator-supplied, and this must refuse it the same way it refuses any other coding it cannot undo.
+ */
+const DECODER_FACTORIES = new Map<string, () => Transform>([
+  ['gzip', createGunzip],
+  ['x-gzip', createGunzip],
+  ['deflate', createInflate],
+  ['br', createBrotliDecompress]
+])
 
 /**
  * The factory that will undo `encoding`, or a throw naming `asRawStream()`.
@@ -127,7 +137,7 @@ function decoderFactoryFor(codings: string[], encoding: string | null): () => Tr
         `This storage undoes at most one. Use asRawStream() to read the stored bytes as they are.`
     )
   }
-  const factory = DECODER_FACTORIES[codings[0]]
+  const factory = DECODER_FACTORIES.get(codings[0])
   if (!factory) {
     throw new Error(
       `Cannot decode content stored with an unsupported encoding: ${JSON.stringify(codings[0])}. ` +
@@ -199,7 +209,16 @@ export class SimpleContentItem implements ContentItem {
       // consumer sees the source's error and abandoning the returned stream destroys the source.
       // The callback is required to keep pipeline from throwing on its own; the error reaches the
       // consumer through the returned stream.
-      pipeline(stream, decoder, () => undefined)
+      //
+      // Guarded because `pipeline` validates its arguments SYNCHRONOUSLY: anything the factory hands back
+      // that is not a stream makes it throw `ERR_INVALID_ARG_TYPE` right here, past the point where the
+      // source is open, and an unguarded throw left that source undestroyed for the life of the process.
+      try {
+        pipeline(stream, decoder, () => undefined)
+      } catch (err) {
+        destroyAllQuietly(stream, decoder)
+        throw err
+      }
       return decoder
     }
 
@@ -290,6 +309,35 @@ export function assertStorableStream(stream: Readable): void {
   // caller in that position should hand over a fresh source (re-open the file, or buffer the body and use
   // `bufferToStream`) rather than a rewound one.
   if (stream.readableDidRead) throw prematureClose()
+  // A COMPETING 'readable' CONSUMER, which none of the flags above can see: a listener that has not pulled
+  // anything yet leaves `readableDidRead` false, so the source looks pristine. It is not, and it is refused on
+  // EVERY backend, because the two failure modes it produces are both worse than the rejection.
+  //
+  // A backend that consumes by FLOWING (folder-based via `pipeline`, in-memory via `streamToBuffer`) never
+  // gets any bytes: the listener takes precedence over `pipe` — the note above says so for the already-read
+  // case — and equally over `resume()`, which Node documents as having no effect while one is attached. So
+  // nothing flows: no 'data', no 'end', no 'close', and the store HANGS FOREVER, with no timeout in this
+  // package to end it.
+  //
+  // A backend that consumes by EXPLICIT READ (S3, via the head peek's async iterator) is not blocked by the
+  // listener — and that is exactly what makes it dangerous rather than safe. The listener is still a
+  // consumer, so the two RACE, and every byte it wins is a byte the upload never sees. This was briefly
+  // exempted here on the reasoning that S3 "stored such sources correctly"; it does so only while the
+  // listener is idle. With a listener that actually reads, S3 committed 0 of 2000 bytes for a 20-chunk
+  // source, and 200 of 2000 for a reader that attached one tick late — and `storeStream` RESOLVED both
+  // times, so a content-addressed id permanently holds bytes that are not its content. Silent corruption
+  // is the failure this whole guard exists to prevent, so the exemption is gone and the rule is uniform.
+  //
+  // `listenerCount` is feature-detected because this is a `@public` helper and every other check here reads
+  // a PROPERTY: a duck-typed stream stand-in (common in consumers' own tests) would otherwise get a
+  // `TypeError` from inside `storeStream` instead of being stored.
+  if (typeof stream.listenerCount === 'function' && stream.listenerCount('readable') > 0) {
+    throw new Error(
+      `Cannot store a stream that already has a 'readable' listener: another consumer is attached, and the ` +
+        `two would race for the same bytes — a backend that reads explicitly would store only what it won, ` +
+        `and one that pipes would never flow at all. Hand over a fresh source instead.`
+    )
+  }
   // A source in a NON-UTF8 encoding mode yields strings, and every backend turns those back into bytes as
   // utf8 (the folder-based one by piping into an `fs.WriteStream`, whose default encoding that is; S3 and the
   // in-memory backend via `Buffer.from`). For `latin1`/`hex`/`base64` that round trip is lossy, so the bytes
@@ -374,5 +422,16 @@ export function streamToBuffer(stream: Readable, maxBytes?: number): Promise<Buf
       if (settled) return
       reject(prematureClose())
     })
+    // EXPLICITLY RESUMED, because attaching a 'data' listener is not always enough to start the flow:
+    // `Readable` auto-resumes on that listener only while `flowing !== false`, and an explicit `pause()`
+    // — or a 'readable' listener attached by the caller — sets it to exactly `false`. Such a source then
+    // emitted no 'data', no 'end' and no 'close', so this promise never settled and `storeStream` on the
+    // in-memory backend hung FOREVER, with no timeout anywhere in the package: a service that paused an
+    // incoming request body while it did async work held that request open for the life of the process.
+    // `assertStorableStream` cannot catch it either — nothing has been read, so the source is genuinely
+    // storable, it simply has to be told to flow. The other two backends already did this implicitly,
+    // `pipeline` by resuming the source and S3 by driving the async iterator, so this also closes a
+    // three-way divergence where the same source stored fine on two backends and hung on the third.
+    stream.resume()
   })
 }
