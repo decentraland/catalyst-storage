@@ -1,3 +1,4 @@
+import { spawnSync } from 'child_process'
 import { createHash } from 'crypto'
 import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
 import os from 'os'
@@ -1036,6 +1037,78 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       for await (const id of storage.allFileIds()) listed.push(id)
 
       expect(listed).toEqual(['real'])
+    })
+  })
+
+  describe('when something that is neither a file nor a directory occupies a path', () => {
+    // A fifo, socket or device node is FOREIGN to this storage: no id can create one, so it is a storage
+    // fault rather than a bad request — the distinction the typed error draws everywhere else.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+    let madeFifo: boolean
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'foreign-node-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'pipe')]).status === 0
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should refuse to store an id whose PARENT path is one, as a fault not a bad request', async () => {
+      if (!madeFifo) return
+      await expect(storage.storeStream('pipe/child', bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /neither a directory nor a regular file/
+      )
+    })
+
+    it('should refuse to store an id whose own COMMIT TARGET is one', async () => {
+      if (!madeFifo) return
+      await expect(storage.storeStream('pipe', bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /neither a regular file\s*\n?\s*nor a directory|neither a regular file nor a directory/
+      )
+    })
+
+    it('should not report it as content on a read', async () => {
+      if (!madeFifo) return
+      expect(await storage.exist('pipe')).toBe(false)
+    })
+  })
+
+  describe('when a compressed representation is too small to hold a trailer', () => {
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      // The gzip format keeps the original size in the last four bytes, so a file under eight bytes cannot
+      // carry one — the logical size is genuinely unknown rather than guessable.
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'tiny-gzip-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      await nodeFs.writeFile(path.join(flatRoot, 'tiny.gzip'), Buffer.from([0x1f, 0x8b, 0x08, 0x00]))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should report the content size as unknown rather than inventing one', async () => {
+      expect((await storage.fileInfo('tiny'))?.contentSize).toBeNull()
+    })
+
+    it('should still report the stored size', async () => {
+      expect((await storage.fileInfo('tiny'))?.size).toBe(4)
     })
   })
 

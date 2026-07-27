@@ -1,6 +1,6 @@
 import { Readable } from 'stream'
 import { ILoggerComponent } from '@well-known-components/interfaces'
-import { detectMimeTypeFromBuffer, FileTypeLoader, loadFileType, peekHead } from '../src/mime-detection'
+import { detectMimeTypeFromBuffer, FileTypeLoader, peekHead } from '../src/mime-detection'
 import { bufferToStream, streamToBuffer } from '../src/content-item'
 
 function createSpyLogger(): ILoggerComponent.ILogger & { warn: jest.Mock } {
@@ -207,24 +207,37 @@ describe('detectMimeTypeFromBuffer', () => {
     })
   })
 
-  describe('when the bundled loader is called more than once', () => {
-    let first: Promise<unknown>
-    let second: Promise<unknown>
+  // NOT TESTED HERE: `loadFileType`'s memo, nor `detectMimeTypeFromBuffer` with its DEFAULT loader. Both mean
+  // entering the real ESM `file-type` import from a test, and this environment cannot hold that safely: with
+  // the import awaited the test failed 1 run in 6, and without it the import lands AFTER Jest tears the
+  // environment down — `You are trying to import a file after the Jest environment has been torn down`, which
+  // fails the whole run's exit code under `--runInBand` even though every test passes. Two uncovered branches
+  // are a far better trade than either. The memo is covered where it matters, by the S3 component awaiting the
+  // loader once at construction.
 
-    beforeEach(() => {
-      // Memoized per process: loading `file-type` enters the ESM loader, and doing that per store was the
-      // cost this memo removed. The same promise coming back is what proves it is not re-entered.
-      first = loadFileType()
-      second = loadFileType()
+  describe('when the detector rejects with something that is not an Error', () => {
+    let logged: { message: string; context?: Record<string, unknown> }[]
+    let detected: string
+
+    beforeEach(async () => {
+      // The fallback has to produce a readable log line whatever was thrown, or the operator sees `undefined`
+      // for the reason every object suddenly became application/octet-stream.
+      logged = []
+      const spy = createSpyLogger()
+      spy.warn.mockImplementation((message: string, context?: Record<string, unknown>) =>
+        logged.push({ message, context })
+      )
+      detected = await detectMimeTypeFromBuffer(Buffer.from('whatever'), spy, (() => {
+        throw 'the loader exploded'
+      }) as unknown as FileTypeLoader)
     })
 
-    it('should hand back the same in-flight module promise', () => {
-      // Identity is the whole assertion, and it is deliberately NOT awaited. Resolving it enters the real ESM
-      // loader, which is what this memo exists to do once per process — and awaiting it from a test was flaky
-      // (1 run in 6): an import still in flight when Jest tears the environment down fails, the same hazard
-      // that makes the S3 component await its loader at construction. `loadFileType` attaches its own `catch`
-      // to clear the memo, so nothing is left unhandled here.
-      expect(second).toBe(first)
+    it('should still store, as the default type', () => {
+      expect(detected).toBe('application/octet-stream')
+    })
+
+    it('should stringify the rejection in the warning', () => {
+      expect(logged[0].context).toEqual({ error: 'the loader exploded' })
     })
   })
 })
