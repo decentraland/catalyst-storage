@@ -702,6 +702,73 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
+  describe('and the STORAGE ROOT itself is destroyed before any operation records a shard', () => {
+    // The root is created by construction, and that `mkdir` is an observation — but it was never recorded,
+    // so at the one boundary nothing else registers there was no observed ancestor to attribute damage to.
+    // A root removed or replaced underneath a live instance therefore classified every read under an
+    // uncreated shard as an ordinary miss: `exist()` answered `false` for a storage root that was GONE,
+    // which is the "a broken store looks like an empty node" outcome this read contract exists to refuse.
+    //
+    // Each case constructs and then destroys WITHOUT performing an operation first, because an operation
+    // records the shard and would supply the observed ancestor by a different route.
+    let parent: string
+    let rootPath: string
+    let orphaned: IContentStorageComponent
+
+    const build = async (useHashPrefix: boolean): Promise<IContentStorageComponent> => {
+      parent = mkdtempSync(path.join(os.tmpdir(), 'root-gone-'))
+      rootPath = path.join(parent, 'storage-root')
+      return createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        rootPath,
+        { disablePrefixHash: !useHashPrefix }
+      )
+    }
+
+    afterEach(async () => {
+      await orphaned?.stop?.().catch(() => undefined)
+      if (parent) rmSync(parent, { recursive: true, force: true })
+    })
+
+    describe('and hash prefixes are enabled', () => {
+      beforeEach(async () => {
+        orphaned = await build(true)
+        rmSync(rootPath, { recursive: true, force: true })
+      })
+
+      it('should reject rather than report the id as absent', async () => {
+        await expect(orphaned.exist('some-id')).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+    })
+
+    describe('and the root is replaced by a regular file', () => {
+      beforeEach(async () => {
+        orphaned = await build(true)
+        rmSync(rootPath, { recursive: true, force: true })
+        await nodeFs.writeFile(rootPath, 'not a directory')
+      })
+
+      it('should reject rather than report the id as absent', async () => {
+        await expect(orphaned.exist('some-id')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and hash prefixes are disabled, so the root IS the namespace directory', () => {
+      beforeEach(async () => {
+        orphaned = await build(false)
+        rmSync(rootPath, { recursive: true, force: true })
+      })
+
+      it('should reject rather than report the id as absent', async () => {
+        await expect(orphaned.exist('some-id')).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+
+      it('should reject retrieve for the same reason', async () => {
+        await expect(orphaned.retrieve('some-id')).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+    })
+  })
+
   describe('and an ancestor of an id path is another id content file', () => {
     let obstructed: IContentStorageComponent
     let flatRoot: string

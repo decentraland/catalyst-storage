@@ -455,6 +455,70 @@ describe('when allFileIds walks a directory', () => {
     ...Array.from({ length: Math.max(0, count - names.length) }, (_, i) => `pad-${String(i).padStart(6, '0')}`)
   ]
 
+  /**
+   * `walk`, but with entries that are real DIRECTORIES as well as files.
+   *
+   * The listing has to report `isDirectory()` truthfully for the case where a directory is named like a
+   * compressed representation, which is what `walk`'s uniformly-file listing cannot express. Files and
+   * directories are created for real, so a confirming `stat` sees the same tree the listing describes;
+   * `p-` names are synthetic bulk, like `walk`'s `pad-`, because no skip is ever decided from them.
+   */
+  const walkWithDirectories = async (
+    fileNames: string[],
+    directoryNames: string[],
+    /**
+     * Names the LISTING reports as files while the disk holds directories.
+     *
+     * Not an artificial state: the two reads are separate syscalls, so a `<id>.gzip` that was a regular file
+     * when the first pass recorded it can be a directory by the time the second pass confirms it. That is the
+     * only way to reach the confirming `stat` with a directory, since the snapshot never records one.
+     */
+    directoriesListedAsFiles: string[] = []
+  ): Promise<{ listed: string[]; statted: string[] }> => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'enum-dirs-'))
+    const base = createFsComponent()
+    const statted: string[] = []
+    const observed: IFileSystemComponent = {
+      ...base,
+      stat: (async (target: any, ...rest: any[]) => {
+        statted.push(String(target))
+        return (base.stat as any)(target, ...rest)
+      }) as IFileSystemComponent['stat'],
+      opendir: (async (dir: any, opts: any) => {
+        if (dir !== root) return base.opendir(dir, opts)
+        return {
+          async *[Symbol.asyncIterator]() {
+            // `directoriesListedAsFiles` comes FIRST, and that ordering is load-bearing: the snapshot stops
+            // recording once it hits its cap, so a name yielded after the bulk filler would never be recorded
+            // and the confirming `stat` those cases exist to exercise would never run at all.
+            for (const name of [...directoriesListedAsFiles, ...fileNames]) {
+              yield { name, isDirectory: () => false } as any
+            }
+            for (const name of directoryNames) yield { name, isDirectory: () => true } as any
+          }
+        }
+      }) as IFileSystemComponent['opendir']
+    }
+
+    const storage = await createFolderBasedFileSystemContentStorage(
+      { fs: observed, logs: await createLogComponent({}) },
+      root,
+      { disablePrefixHash: true }
+    )
+    for (const name of fileNames.filter((each) => !each.startsWith('p-'))) {
+      await nodeFsPromises.writeFile(path.join(root, name), 'x')
+    }
+    for (const name of [...directoryNames, ...directoriesListedAsFiles]) {
+      await nodeFsPromises.mkdir(path.join(root, name), { recursive: true })
+    }
+    statted.length = 0
+    const listed: string[] = []
+    for await (const each of storage.allFileIds()) listed.push(each)
+    await storage.stop?.()
+    rmSync(root, { recursive: true, force: true })
+    return { listed, statted }
+  }
+
   describe('and it is small enough to hold in memory', () => {
     it('should read it only once', async () => {
       expect((await walk(['a', 'b', 'c'])).reads).toBe(1)
@@ -520,29 +584,38 @@ describe('when allFileIds walks a directory', () => {
 
   describe('and it holds more COMPRESSED entries than the gzip-name set can hold', () => {
     // The set of compressed names was unbounded, so the two-read path retained one string per compressed
-    // entry — the memory the fallback exists to avoid. Measured before the cap, in flat mode: 19.5MB
-    // retained for 50k compressed entries, 44MB for 150k, growing linearly. Capping it means a raw entry
-    // MISSING from the set no longer proves the sibling is absent, so the walk has to ask the filesystem;
-    // these pin that the answers did not change in either direction.
+    // entry — the memory the fallback exists to avoid. Capping it means the snapshot is one-sided past the
+    // cap: membership still suppresses a raw entry, absence no longer proves anything. These pin which way
+    // that is allowed to fail.
     /** More compressed entries than the cap, so the set provably overflows. */
     const overflowingGzips = (count: number): string[] =>
       Array.from({ length: count }, (_, i) => `pad-${String(i).padStart(6, '0')}.gzip`)
 
-    it('should still hide a raw whose compressed sibling exists but was evicted from the set', async () => {
-      // `zz` sorts last, so its `.gzip` is the one the capped set drops — and it is a real file on disk,
-      // so the confirming stat finds it. Yielding `zz` here would report the decompression CACHE as a
-      // second id, which is what the dedup exists to prevent.
+    it('should never omit an id whose compressed sibling fell outside the set', async () => {
+      // `zz` sorts last, so its `.gzip` is the one the capped set drops. The id must still come out: an id
+      // present throughout an enumeration that is yielded ZERO times under-reports what the node holds, and
+      // a GC or sync consumer acts on that as if it were the whole picture.
       const names = [...overflowingGzips(MAX_BUFFERED_DIRECTORY_ENTRIES + 10), 'zz', 'zz.gzip']
 
       const { listed } = await walk(names)
 
-      expect(listed.filter((id) => id === 'zz')).toEqual(['zz'])
+      expect(listed.filter((id) => id === 'zz').length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('should yield such an id twice rather than risk dropping it', async () => {
+      // The ACCEPTED cost, asserted rather than left implicit so a future change cannot quietly turn it into
+      // the other failure: with the gzip outside the snapshot, both entries yield the id. This walk's own
+      // rule is that a duplicate is an idempotent repeat while an omission under-reports the node, so the
+      // duplicate is the direction to fail in. Bounded by the raw/gzip PAIRS that fall outside the snapshot
+      // — decompression-cache copies — not by the directory size.
+      const names = [...overflowingGzips(MAX_BUFFERED_DIRECTORY_ENTRIES + 10), 'zz', 'zz.gzip']
+
+      const { listed } = await walk(names)
+
+      expect(listed.filter((id) => id === 'zz')).toEqual(['zz', 'zz'])
     })
 
     it('should still yield a raw that has no compressed sibling at all', async () => {
-      // The direction that must never regress: absence from a CAPPED set is not evidence of absence on
-      // disk, so treating it as one would drop a legitimate raw-only id from the enumeration entirely —
-      // an id yielded ZERO times, which under-reports the node's content to a GC or sync sweep.
       const names = [...overflowingGzips(MAX_BUFFERED_DIRECTORY_ENTRIES + 10), 'raw-only']
 
       const { listed } = await walk(names)
@@ -550,24 +623,81 @@ describe('when allFileIds walks a directory', () => {
       expect(listed).toContain('raw-only')
     })
 
-    it('should yield every id exactly once', async () => {
-      const names = [...overflowingGzips(MAX_BUFFERED_DIRECTORY_ENTRIES + 10), 'zz', 'zz.gzip', 'raw-only']
+    it('should still dedup an id whose compressed sibling IS in the set', async () => {
+      // The cap does not weaken the answer for everything it does hold: `aa` sorts first, so its `.gzip` is
+      // recorded, and the raw is then confirmed as that gzip's decompression cache and suppressed.
+      const names = ['aa', 'aa.gzip', ...overflowingGzips(MAX_BUFFERED_DIRECTORY_ENTRIES + 10)]
 
       const { listed } = await walk(names)
 
-      expect(new Set(listed).size).toBe(listed.length)
+      expect(listed.filter((id) => id === 'aa')).toEqual(['aa'])
+    })
+
+    it('should not stat a single raw entry, however many compressed entries overflowed', async () => {
+      // Probing the unrecorded names was tried and REVERTED: it cost one syscall per RAW id in any directory
+      // whose gzip count crossed the cap — including a flat root with a handful of compressed ids and
+      // hundreds of thousands of raw-only ones, which is exactly the per-entry cost this two-pass walk exists
+      // to avoid. Measured at 20,000 stats for 20,000 raw ids before the revert, against 0 here.
+      const names = [
+        ...overflowingGzips(MAX_BUFFERED_DIRECTORY_ENTRIES + 1),
+        ...Array.from({ length: 500 }, (_, i) => `raw-${String(i).padStart(6, '0')}`)
+      ]
+
+      const { statted } = await walk(names)
+
+      expect(statted.filter((target) => target.includes('raw-'))).toEqual([])
+    })
+  })
+
+  describe('and a DIRECTORY is named like a compressed representation', () => {
+    it('should still yield the raw id, which the directory is not the compressed form of', async () => {
+      // `storeStream('a.gzip/b')` creates the directory `a.gzip` legitimately — only an id ENDING in `.gzip`
+      // is reserved — so `a.gzip` is another id's nesting, not `a`'s compressed representation. Crediting a
+      // successful stat as "the sibling exists" suppressed the valid raw id `a` outright: it came out ZERO
+      // times from the two-read path while the buffered path, which records only non-directory entries,
+      // yielded it once. The two paths must agree.
+      const names = [...Array.from({ length: MAX_BUFFERED_DIRECTORY_ENTRIES + 10 }, (_, i) => `p-${i}.gzip`), 'a']
+
+      const { listed } = await walkWithDirectories(names, ['a.gzip'])
+
+      expect(listed).toContain('a')
+    })
+
+    it('should reach the same answer as the buffered path for the same shape', async () => {
+      const small = await walkWithDirectories(['a'], ['a.gzip'])
+      const large = await walkWithDirectories(
+        [...Array.from({ length: MAX_BUFFERED_DIRECTORY_ENTRIES + 10 }, (_, i) => `p-${i}.gzip`), 'a'],
+        ['a.gzip']
+      )
+
+      expect(small.listed.filter((id) => id === 'a')).toEqual(large.listed.filter((id) => id === 'a'))
+    })
+
+    it('should not suppress the raw entry when the sibling became a directory between the two reads', async () => {
+      // The ONLY route to the confirming `stat` with a directory, since the snapshot never records one: the
+      // first pass saw `a.gzip` as a regular file and recorded it, and by the second pass that name holds a
+      // directory. This is what `isFile()` in the probe decides, and it is worth pinning only because it is
+      // otherwise an unexercised branch.
+      //
+      // The COUNT is the assertion, not `toContain`, because containment cannot tell the two behaviours
+      // apart: the stale `a.gzip` entry is itself read as a compressed representation and yields the id `a`
+      // on its own, so `a` is enumerated either way and nothing is omitted. What the check changes is
+      // whether the real raw file `a` is ALSO yielded — suppressing it would credit a directory as `a`'s
+      // compressed form, which it is not. Two is therefore the correct count here, and it is the
+      // duplicate-over-omission direction this walk documents everywhere else.
+      const names = [...Array.from({ length: MAX_BUFFERED_DIRECTORY_ENTRIES + 10 }, (_, i) => `p-${i}.gzip`), 'a']
+
+      const { listed } = await walkWithDirectories(names, [], ['a.gzip'])
+
+      expect(listed.filter((id) => id === 'a')).toEqual(['a', 'a'])
     })
   })
 
   describe('and it holds only raw entries, more than can be buffered', () => {
     it('should not stat a single one of them', async () => {
-      // The cap costs a `stat` per raw entry only once the gzip set has OVERFLOWED. This is the shape that
-      // must stay free: a flat-mode root of raw-only content has no compressed names at all, so the set
-      // cannot overflow and the walk keeps deciding every entry from the listing. Paying a syscall per id
-      // here would be one per id on the largest roots this surface accepts.
       const { statted } = await walk(padTo(MAX_BUFFERED_DIRECTORY_ENTRIES + 1))
 
-      expect(statted.filter((target) => target.includes('pad-'))).toEqual([])
+      expect(statted.filter((target) => target.includes('pad-')).length).toBe(0)
     })
   })
 })

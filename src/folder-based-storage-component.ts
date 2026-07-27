@@ -20,8 +20,7 @@ const pipe = promisify(pipeline)
  * How many entries of one directory `allFileIds()` will hold in memory — both the buffered listing that
  * lets it decide the directory from a SINGLE read, and, independently, the set of compressed names.
  *
- * Above this it falls back to reading the directory twice — once for the compressed names, once to
- * yield — and confirms a raw file's sibling with a `stat` for the names the capped set could not hold.
+ * Above this it falls back to reading the directory twice — once for the compressed names, once to yield.
  *
  * The two shapes this storage runs in sit on opposite sides of the line, which is the point:
  * - With hash prefixes (the default) a shard holds total/65,536 entries, so a root of 268 million ids
@@ -41,8 +40,11 @@ const pipe = promisify(pipeline)
  * exactly the deployment the fallback exists for. Measured in flat mode over a root of compressed
  * entries, retention at the first id (post-GC, so retained rather than merely allocated): 5.3MB at 50k,
  * 15.9MB at 150k and 31.2MB at 300k — linear at ~104 bytes per entry, so ~104MB for a million. With the
- * cap it is 1.0MB at all three. Capping it costs one `stat` per RAW entry, and only once the set has
- * overflowed; see `allFileIdsRec` for why that trade is cheap in both regimes.
+ * cap it is 1.0MB at all three.
+ *
+ * Capping costs NO syscalls: past the cap the snapshot is used one-sidedly, so a raw entry it does not hold
+ * is yielded rather than probed. What that can cost is a DUPLICATE id, never an omission — see the yield
+ * loop in `allFileIdsRec`, which explains why that is the direction this walk fails in.
  *
  * @internal
  */
@@ -362,6 +364,14 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   await components.fs.mkdir(root, { recursive: true })
+  // SEEDED as an observed directory, because this `mkdir` is the observation: the root provably existed as a
+  // directory at construction. Without it the read path had no observed ancestor to attribute damage to at
+  // the root boundary, so a root REMOVED or REPLACED underneath a live instance — before any operation
+  // happened to record a shard — classified every read under an uncreated shard as an ordinary miss.
+  // Measured in both shard modes and for both removal and replacement: `exist()` answered `false` for a
+  // storage root that was gone, which is the "a broken store looks like an empty node" outcome this read
+  // contract exists to refuse, reached at the one boundary nothing else records.
+  rememberDirectory(root)
 
   // Prepares (and refuses to start over an unsafe) staging area, so it must run after the root
   // exists and after all configuration has been validated.
@@ -1609,23 +1619,23 @@ export async function createFolderBasedFileSystemContentStorage(
    * against the filename let it match the `.gzip` extension of a compressed representation.
    */
   /**
-   * Whether an id's compressed representation is on disk, used to decide a skip rather than assume one.
+   * Whether an id's compressed representation is STILL on disk, used to confirm a skip rather than
+   * assume one. Absent only when provably so: any other fault means it may well be there, and the
+   * caller's safe response to that is to treat it as present (see `allFileIdsRec`).
    *
-   * THREE-VALUED, because its two callers in `allFileIdsRec` need opposite answers for a fault. One is
-   * CONFIRMING a name the listing already reported, and for it "cannot tell" should mean "still there" —
-   * the gzip is in that listing and will be yielded by its own entry. The other is asking about a name the
-   * capped snapshot never held, where there is no such evidence, and treating "cannot tell" as present
-   * would skip a raw file whose gzip may be genuinely gone — an id enumerated ZERO times, the one
-   * direction this walk must never take. A boolean cannot serve both, and collapsing them silently
-   * imported the confirming caller's assumption into a caller that has not earned it.
+   * `isFile()`, not merely "the stat succeeded". A DIRECTORY at `<id>.gzip` is not the compressed
+   * representation of `<id>` — it is another id's nesting, which `storeStream('a.gzip/b')` creates
+   * legitimately, since only an id ENDING in `.gzip` is reserved. Crediting it suppressed a raw file that
+   * is a valid id of its own: `a` was yielded ZERO times while the small-directory path, which records only
+   * non-directory entries in its snapshot, yielded it once. The two paths have to answer alike, and an id
+   * present throughout an enumeration must never be omitted.
    */
-  async function gzipCounterpartState(gzipPath: string): Promise<'present' | 'absent' | 'unknown'> {
+  async function gzipCounterpartStillExists(gzipPath: string): Promise<boolean> {
     try {
-      await components.fs.stat(gzipPath)
-      return 'present'
+      return (await components.fs.stat(gzipPath)).isFile()
     } catch (err) {
       const code = (err as { code?: string } | null)?.code
-      return code === 'ENOENT' || code === 'ENOTDIR' ? 'absent' : 'unknown'
+      return code !== 'ENOENT' && code !== 'ENOTDIR'
     }
   }
 
@@ -1675,20 +1685,20 @@ export async function createFolderBasedFileSystemContentStorage(
     // raw file to ask it.
     //
     // CAPPED, for the reason spelled out on MAX_BUFFERED_DIRECTORY_ENTRIES: unbounded, this set was the
-    // memory the large-directory path was supposed to have stopped retaining. `gzipNamesComplete` records
-    // whether it holds the whole answer, because a raw entry MISSING from a partial set proves nothing
-    // and has to be checked against the filesystem instead.
+    // memory the large-directory path was supposed to have stopped retaining. Beyond the cap it is a
+    // one-sided answer and is used as one — membership suppresses a raw entry (after a confirming stat),
+    // while absence never does; see the yield loop below for why that direction is the safe one.
     const gzipNames = new Set<string>()
-    let gzipNamesComplete = true
     // The directory itself, retained ONLY while it is small enough to be worth retaining — see
     // MAX_BUFFERED_DIRECTORY_ENTRIES. Dropped the moment it is not.
     let buffered: { name: string; isDirectory: boolean }[] | undefined = []
 
     for await (const entry of await components.fs.opendir(folder, { bufferSize: 4000 })) {
       const isDirectory = entry.isDirectory()
-      if (!isDirectory && entry.name.endsWith(GZIP_EXTENSION)) {
-        if (gzipNames.size < MAX_BUFFERED_DIRECTORY_ENTRIES) gzipNames.add(entry.name)
-        else gzipNamesComplete = false
+      // Non-directory entries only: a DIRECTORY named `<id>.gzip` is another id's nesting, not a compressed
+      // representation, and recording it would suppress a raw file that is a valid id of its own.
+      if (!isDirectory && entry.name.endsWith(GZIP_EXTENSION) && gzipNames.size < MAX_BUFFERED_DIRECTORY_ENTRIES) {
+        gzipNames.add(entry.name)
       }
       if (buffered) {
         if (buffered.length >= MAX_BUFFERED_DIRECTORY_ENTRIES) {
@@ -1739,7 +1749,9 @@ export async function createFolderBasedFileSystemContentStorage(
       //
       // `gzipNames` is COMPLETE here by construction, so the snapshot really does hold the whole answer:
       // both caps are the same number and the gzip entries are a subset of the buffered ones, so the set
-      // cannot have overflowed while the listing survived — the two flip on the very same entry.
+      // cannot have overflowed while the listing survived — the two flip on the very same entry. It also
+      // holds only non-directory entries, which is what keeps a DIRECTORY named `<id>.gzip` (another id's
+      // nesting) from suppressing the raw id `<id>`; the two-read path below has to reach the same answer.
       for (const entry of buffered) {
         if (entry.isDirectory) {
           if (isInsideReservedTempDir(folder + path.sep + entry.name)) continue
@@ -1786,21 +1798,25 @@ export async function createFolderBasedFileSystemContentStorage(
         // confirming `stat` is treated as "still there" for the same reason — the gzip is then in this
         // listing and gets yielded by its own entry.
         //
-        // WHEN THE SNAPSHOT IS INCOMPLETE the same `stat` answers the whole question rather than
-        // confirming a hit: absence from a capped set is not evidence of absence on disk (see
-        // `gzipNames`). Only a raw entry pays it, and only in a directory holding more than
-        // MAX_BUFFERED_DIRECTORY_ENTRIES compressed files — which is compressed-dominated by definition,
-        // so its raw entries are the decompressed cache copies, bounded by `decompressCacheMaxSize`. The
-        // raw-only flat root, where every entry would otherwise pay, never overflows the set at all and
-        // so never reaches this.
-        if (!entry.name.endsWith(GZIP_EXTENSION)) {
-          const gzipName = entry.name + GZIP_EXTENSION
-          const recorded = gzipNames.has(gzipName)
-          if (recorded || !gzipNamesComplete) {
-            const state = await gzipCounterpartState(folder + path.sep + gzipName)
-            // 'unknown' skips only for a name the listing DID report; see `gzipCounterpartState`.
-            if (state === 'present' || (state === 'unknown' && recorded)) continue
-          }
+        // A RAW NAME THE SNAPSHOT DOES NOT HOLD IS YIELDED, never probed. Absence from a capped snapshot is
+        // not evidence of absence on disk, so the only two options for such an entry are to yield it — at
+        // worst a duplicate, when its gzip fell outside the cap and the gzip entry yields the id too — or to
+        // suppress it on no evidence, which omits an id that is present. This walk's stated rule picks the
+        // first: "enumerating an id twice costs an idempotent repeat; failing to enumerate one that is
+        // present under-reports the node's content". Duplicates here are bounded by the raw/gzip PAIRS whose
+        // gzip fell outside the snapshot — decompression-cache copies, bounded in turn by
+        // `decompressCacheMaxSize` — not by the directory size.
+        //
+        // Probing instead was tried and REVERTED. It cost one `stat` per raw entry for every directory whose
+        // gzip count crossed the cap, and the claim that justified it — that such a directory is
+        // "compressed-dominated, so its raw entries are just cache copies" — is false: a flat root with
+        // MAX_BUFFERED_DIRECTORY_ENTRIES + 1 compressed ids and hundreds of thousands of raw-only ids
+        // overflows the snapshot too, and measured one syscall per raw id (20,000 stats for 20,000 raw ids,
+        // against 0 for the same directory with no gzips). That is exactly the per-entry cost this two-pass
+        // walk exists to avoid. It also read a DIRECTORY at `<id>.gzip` as a compressed representation and
+        // suppressed a valid raw id outright — see `gzipCounterpartStillExists`.
+        if (!entry.name.endsWith(GZIP_EXTENSION) && gzipNames.has(entry.name + GZIP_EXTENSION)) {
+          if (await gzipCounterpartStillExists(folder + path.sep + entry.name + GZIP_EXTENSION)) continue
         }
         const id = idForEntry(entry.name)
         if (id !== undefined) yield id
