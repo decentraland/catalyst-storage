@@ -32,11 +32,26 @@ export type DecompressCache = {
    * would pass the "not in flight" check, write the same cache file concurrently (corrupting it) and
    * double-count its size against the cache total.
    *
-   * The token is registered BEFORE `inflate` runs: any store/delete committing after that point
-   * marks it, so stale output is discarded, while one committing before it means the gzip the
-   * inflation opens is already the newest version.
+   * The token is registered BEFORE anything is awaited — in particular before the wait for an
+   * inflation SLOT. It used to be registered after that wait, on the reasoning that a queued caller
+   * holds no invalidation state and so costs nothing; what it actually cost was correctness. A read
+   * parked on a full queue had no token, so `invalidateInflight` had nothing to mark, and a store
+   * committing while it waited could not reach it: the read woke up with a FRESH, un-invalidated
+   * token, inflated the gzip it still found on disk, and renamed that stale output over the primary
+   * the store had just committed — a silently lost write that survived a restart, because the repair
+   * then discarded the counterpart the store had failed to remove and left the OLD bytes as the only
+   * representation. `delete()` was protected from the same shape only by accident (it unlinks the
+   * gzip first, so a late inflation finds no source); a store that keeps the gzip had no such cover.
+   *
+   * `inflate` is handed `acquireSlot` rather than being run with a slot already held, so the budget
+   * is spent only once there is something to inflate. Acquiring up front made a range read of an
+   * ABSENT id queue — twice, via `retrieve`'s two attempts — behind real inflations for work that
+   * touches no cache file at all. Idempotent, and the slot is released for it either way.
    */
-  deduplicateInflation(filePath: string, inflate: (token: InvalidationToken) => Promise<void>): Promise<void>
+  deduplicateInflation(
+    filePath: string,
+    inflate: (token: InvalidationToken, acquireSlot: () => Promise<void>) => Promise<void>
+  ): Promise<void>
   /** Marks an in-flight decompression for this path stale. Called by writers inside their locked commit. */
   invalidateInflight(filePath: string): void
   /** Every in-flight decompression, so shutdown can await them. */
@@ -56,6 +71,39 @@ export type DecompressCache = {
    * returned release is a no-op.
    */
   pin(filePath: string, graceMs: number): () => void
+  /**
+   * Resolves once no commit or eviction is in flight for `filePath`.
+   *
+   * The companion to `pin` for a reader that is about to STAT the path. A pin taken after an eviction
+   * pass has already passed its own pin check does not stop that pass, so a reader could pin, stat a
+   * file whose `unlink` was in flight, hand back a lazy item and only then have the file vanish —
+   * failing a read of content that was present, which the read contract turns into a 5xx. Awaiting
+   * here after pinning means the reader's stat sees the settled state, and the pin it now holds is
+   * visible to every LATER pass. Costs a resolved promise when the path is idle, which is the norm.
+   */
+  settle(filePath: string): Promise<void>
+  /**
+   * Stops admitting new decompressions, so `stop()` can bound what it has to wait for.
+   *
+   * `inflight()` only reports decompressions that have already registered, so a range read still in
+   * its pre-inflation stats was invisible to shutdown: it registered afterwards, committed its file
+   * once `evictAll` had already run, and left a derived copy that nothing would ever reclaim — the
+   * next boot deliberately never adopts one. After this, an inflation starts pre-invalidated and
+   * discards its output instead of committing it.
+   */
+  close(): void
+  /**
+   * Resumes admitting decompressions after a `close()`.
+   *
+   * Called from `start()`, which is documented as re-callable — so a `stop()` then `start()` cycle must not
+   * leave the cache permanently closed. It did: every later inflation was born pre-invalidated and discarded
+   * its output, so a range read of gzip-only content answered `undefined` forever while `exist()` said the
+   * id was there, after paying for two full inflations per request. A false 404 for present content is the
+   * answer the read contract exists to refuse.
+   */
+  open(): void
+  /** Whether decompressions are still being admitted, so a read can tell a shutdown apart from a miss. */
+  isOpen(): boolean
   /**
    * Drops the tracking entry WITHOUT unlinking the file. Used when the canonical path stops being a
    * derived cache and becomes primary content (a store landed there): a stale entry would let
@@ -217,6 +265,9 @@ export function createDecompressCache(
     }
   }
 
+  // Set by `close()` at the start of shutdown. Only ever admits inflations pre-invalidated after this,
+  // so nothing new can commit a file behind `evictAll`.
+  let closed = false
   let activeInflations = 0
   const inflationQueue: Array<() => void> = []
   const maxConcurrentInflations = options.maxConcurrentInflations ?? DEFAULT_MAX_CONCURRENT_INFLATIONS_FALLBACK
@@ -270,6 +321,18 @@ export function createDecompressCache(
   // Unlinks an evicted cache file under the path lock, re-checking the entry is still current: a
   // store may have promoted the path to primary content (forgetting the entry) between the eviction
   // scan and this delete — unlinking then would destroy the only copy of the new content.
+  /**
+   * Why an eviction attempt did not remove a file, which decides whether retrying is worthwhile.
+   *
+   * `pinned` and `stale` are NOT failures — nothing is wrong with the storage, this entry simply is not a
+   * valid victim right now — while `survived` means the unlink ran and the file is still there, which is the
+   * damaged-mount signal the pass backs off on. Collapsing the first two into "the attempt failed" made a
+   * pin-blocked pass set `stalledOnEvictionFailure`, which is precisely the flag that gates OFF the
+   * pin-release eviction trigger — so the one stall whose designated remedy is a pin release was the one
+   * stall a pin release could not clear, and the budget went unenforced until the next timer tick.
+   */
+  type EvictionOutcome = 'evicted' | 'pinned' | 'stale' | 'survived'
+
   async function evictEntry(
     filePath: string,
     entry: { size: number; lastAccess: number; generation: number },
@@ -284,18 +347,32 @@ export function createDecompressCache(
      *
      * Omitted by `evictAll`, which is shutdown and must not be deferred by concurrent activity.
      */
-    expectedLastAccess?: number
-  ): Promise<boolean> {
+    expectedLastAccess?: number,
+    /**
+     * Evicts even while a read holds a pin. Set ONLY by `evictAll`: shutdown reclaims every derived file,
+     * and a pin outliving the process would strand it on disk for good. A pass must never set it — the pin
+     * is the whole reason a reader can trust the file it is about to open.
+     */
+    ignorePins = false
+  ): Promise<EvictionOutcome> {
     return await withPathLock(filePath, async () => {
-      if (entries.get(filePath) !== entry) return false
-      if (expectedLastAccess !== undefined && entry.lastAccess !== expectedLastAccess) return false
+      if (entries.get(filePath) !== entry) return 'stale'
+      if (expectedLastAccess !== undefined && entry.lastAccess !== expectedLastAccess) return 'stale'
+      // PINS RE-CHECKED HERE, not only where the pass selected this entry. Selection happens outside the
+      // lock and is followed by an await for it, so a read that pinned inside that window was invisible to
+      // the pass and its file was unlinked underneath it: `retrieve` had already handed back a lazy item,
+      // whose `asStream()` then failed with ENOENT for content that was present at `retrieve()` time — the
+      // 5xx this pin exists to prevent. `lastAccess` could not stand in for this check, because `pin` does
+      // not touch it. Paired with `settle`, which keeps a reader's stat from racing the unlink below: after
+      // this point a pin is either visible here, or the reader has not stat'd yet and will see the file gone.
+      if (!ignorePins && pins.get(filePath)?.has(entry.generation)) return 'pinned'
       await noFailUnlink(filePath)
       // Keep the tracking when the file survives the unlink, so the next eviction tick retries it
       // instead of leaving an untracked (unaccounted, never-retried) cache file on disk.
-      if (await existsForInvariant(filePath)) return false
+      if (await existsForInvariant(filePath)) return 'survived'
       totalCacheSize -= entry.size
       entries.delete(filePath)
-      return true
+      return 'evicted'
     })
   }
 
@@ -315,15 +392,18 @@ export function createDecompressCache(
   async function evictEntrySafely(
     filePath: string,
     entry: { size: number; lastAccess: number; generation: number },
-    expectedLastAccess?: number
-  ): Promise<boolean> {
+    expectedLastAccess?: number,
+    ignorePins = false
+  ): Promise<EvictionOutcome> {
     try {
-      return await evictEntry(filePath, entry, expectedLastAccess)
+      return await evictEntry(filePath, entry, expectedLastAccess, ignorePins)
     } catch (error) {
       logger.warn(`Could not evict the cached decompressed file at ${filePath}; it stays tracked for a later retry`, {
         error: error instanceof Error ? error.message : String(error)
       })
-      return false
+      // A throw is the damaged-mount signal, so it belongs with `survived` rather than with the two
+      // not-a-victim-right-now outcomes.
+      return 'survived'
     }
   }
 
@@ -370,8 +450,15 @@ export function createDecompressCache(
   async function runEviction() {
     for (;;) {
       const now = Date.now()
-      // Whether any entry was handed to `evictEntrySafely` this pass. See `stalledOnEvictionFailure`.
-      let attemptedAnEviction = false
+      // Whether any entry this pass came back as a genuine eviction FAILURE — the unlink ran and the file
+      // is still there. See `stalledOnEvictionFailure`.
+      //
+      // Deliberately not "was any entry attempted": an entry that came back `pinned` or `stale` is the same
+      // "nothing evictable right now" situation as one the selection loops skipped outright, and the pass
+      // simply learned it a moment later, under the lock. Counting those as failures armed the damaged-mount
+      // back-off, which gates off the pin-release trigger that exists to re-run the pass the instant a pin
+      // goes away.
+      let sawEvictionFailure = false
       // How many entries this pass actually REMOVED.
       //
       // Counted, not inferred from the total. `freedSomething = totalCacheSize < before` compared against a
@@ -392,8 +479,9 @@ export function createDecompressCache(
         // `break`: a pinned entry must not stop the older ones behind it from being reclaimed. The next pass
         // takes it once the pin is gone; `evictAll` on shutdown ignores pins by design.
         if (pins.get(filePath)?.has(entry.generation)) continue
-        attemptedAnEviction = true
-        if (await evictEntrySafely(filePath, entry, entry.lastAccess)) evictedThisPass++
+        const outcome = await evictEntrySafely(filePath, entry, entry.lastAccess)
+        if (outcome === 'evicted') evictedThisPass++
+        else if (outcome === 'survived') sawEvictionFailure = true
       }
 
       // Size eviction (LRU)
@@ -422,8 +510,9 @@ export function createDecompressCache(
           // ENOENT — content that was never missing, surfaced to the caller as a 5xx by the read contract.
           // `continue`, not `break`: a pinned entry must not shield the older ones behind it from eviction.
           if (pins.get(filePath)?.has(entry.generation)) continue
-          attemptedAnEviction = true
-          if (await evictEntrySafely(filePath, entry, entry.lastAccess)) evictedThisPass++
+          const outcome = await evictEntrySafely(filePath, entry, entry.lastAccess)
+          if (outcome === 'evicted') evictedThisPass++
+          else if (outcome === 'survived') sawEvictionFailure = true
         }
       }
 
@@ -438,7 +527,7 @@ export function createDecompressCache(
         evictionStalled = true
         stalledAtAdmission = admissionsSeen
         stalledAt = Date.now()
-        stalledOnEvictionFailure = attemptedAnEviction
+        stalledOnEvictionFailure = sawEvictionFailure
         return
       }
       evictionStalled = false
@@ -492,24 +581,59 @@ export function createDecompressCache(
       const token = inflightTokens.get(filePath)
       if (token) token.invalidated = true
     },
-    deduplicateInflation(filePath: string, inflate: (token: InvalidationToken) => Promise<void>): Promise<void> {
+    // Queues an empty section behind whatever holds this path, which is exactly "wait for the settled
+    // state" — commits and evictions are the only things that take the lock, and each holds it only for
+    // its own short critical section. Nothing is done under the lock here, so this cannot deadlock a
+    // caller that is not already holding it (no read path is).
+    settle(filePath: string): Promise<void> {
+      return withPathLock(filePath, async () => undefined)
+    },
+    close(): void {
+      closed = true
+    },
+    open(): void {
+      closed = false
+    },
+    isOpen(): boolean {
+      return !closed
+    },
+    deduplicateInflation(
+      filePath: string,
+      inflate: (token: InvalidationToken, acquireSlot: () => Promise<void>) => Promise<void>
+    ): Promise<void> {
       let pending = inflightDecompressions.get(filePath)
       const isOwner = !pending
       if (!pending) {
+        // Registered SYNCHRONOUSLY, before the slot wait and before anything else is awaited, so a writer
+        // committing while this inflation is still queued can reach it. See the contract on this method for
+        // the lost write that the old ordering produced. Pre-invalidated once the cache is closed: a read
+        // that registers during shutdown must discard its output rather than leave an unreclaimable file.
+        const token: InvalidationToken = { invalidated: closed }
+        inflightTokens.set(filePath, token)
         pending = (async () => {
-          // Queued BEFORE the token is registered and before any inflating starts, so a waiting caller
-          // holds no invalidation state and costs nothing but the promise it is parked on. Joiners of an
-          // already-in-flight inflation never queue — they share this one.
-          await acquireInflationSlot()
-          const token: InvalidationToken = { invalidated: false }
-          inflightTokens.set(filePath, token)
+          // The slot is spent only once `inflate` has confirmed there is a gzip to inflate, and released
+          // here whether it was ever taken or not. Joiners of an already-in-flight inflation never queue —
+          // they share this one.
+          // Memoized as a PROMISE, not guarded by a boolean that is only set after the await: two concurrent
+          // calls both saw `slotHeld === false`, so the second queued for a slot that could never be released
+          // — the release happens after `inflate` settles, and `inflate` was blocked on that very call.
+          // Sharing the promise makes repeated calls genuinely idempotent whether they are sequential or not.
+          let slotAcquisition: Promise<void> | undefined
+          const acquireSlot = (): Promise<void> => {
+            if (!slotAcquisition) slotAcquisition = acquireInflationSlot()
+            return slotAcquisition
+          }
           try {
-            await inflate(token)
+            await inflate(token, acquireSlot)
           } finally {
             if (inflightTokens.get(filePath) === token) {
               inflightTokens.delete(filePath)
             }
-            releaseInflationSlot()
+            // Released only if a slot was actually taken, and awaited first so a release can never overtake
+            // an acquisition that is still queued (which would hand the slot back before it was held).
+            if (slotAcquisition) {
+              await slotAcquisition.then(releaseInflationSlot, () => undefined)
+            }
           }
         })()
         inflightDecompressions.set(filePath, pending)
@@ -583,7 +707,9 @@ export function createDecompressCache(
       // Isolated per entry for the same reason as the periodic pass: one unreadable file must not
       // reject stop() and strand every other cached file on disk.
       for (const [filePath, entry] of entries) {
-        await evictEntrySafely(filePath, entry)
+        // Pins ignored: a pin can outlive the process (its grace timer is `unref`ed), and a derived file
+        // left behind at shutdown is one the next boot deliberately never adopts, so it would leak for good.
+        await evictEntrySafely(filePath, entry, undefined, true)
       }
     }
   }

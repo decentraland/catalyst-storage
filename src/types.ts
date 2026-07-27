@@ -77,8 +77,16 @@ export type FileInfo = {
  * Distinct from `RangeError`, which means the requested bounds are invalid: here the request is
  * well-formed and the content is present, but this backend has no way to apply logical bounds to it
  * (S3 ranges address the stored bytes, and S3 keeps no uncompressed-size metadata for encoded
- * objects). Typed so callers can answer 416 rather than the 5xx the read contract prescribes for
- * every other `retrieve()` rejection.
+ * objects).
+ *
+ * BOTH map to 416, not just this one. `RangeError` reaches the caller from every backend — the
+ * folder-based and S3 `retrieve()` implementations re-raise it ahead of their failure logging, and the
+ * in-memory one simply lets `clampRange` propagate it — because bounds the caller got wrong are the
+ * caller's problem, and `clampRange` throws it for a `start` past the end of the object, which is
+ * precisely HTTP "Range Not Satisfiable". The read contract's "5xx for any other rejection" is about
+ * STORAGE faults and was written as though `RangeError` could not escape; a service that took it
+ * literally answered 500, and paged an operator, for a malformed `Range` header. The rule is:
+ * `RangeError` and `RangeNotSupportedError` are 416, `undefined` is 404, anything else is 5xx.
  *
  * @public
  */

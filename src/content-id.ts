@@ -15,6 +15,24 @@ export const GZIP_EXTENSION = '.gzip'
 const MAX_SEGMENT_BYTES = 255
 
 /**
+ * The longest an id may be IN TOTAL, in bytes, across all of its segments and separators.
+ *
+ * `NAME_MAX` bounds one segment; `PATH_MAX` bounds the assembled path, and nothing enforced it. An id of
+ * thirty 240-byte segments passes the per-segment rule and resolves to a 7 KB path, so the folder-based
+ * backend failed it at `mkdir` with a bare `ENAMETOOLONG` — the untyped-error-and-backend-disagreement
+ * outcome the per-segment rule was added to remove, reached by the dimension it does not measure. The
+ * in-memory backend, having no path, stored it happily and reported `exist` true.
+ *
+ * 1024 bytes, not `PATH_MAX` itself: the budget an id may spend has to leave room for the root directory
+ * and the shard segment, whose lengths are the deployment's choice rather than the id's, and `PATH_MAX` is
+ * 4096 on Linux but 1024 on macOS/BSD. Far above any real content id (a CID is ~59 bytes) while low enough
+ * that root + shard + id clears the smaller ceiling for any sane root. The residue — a legitimate id under
+ * this bound that a very long root pushes past `PATH_MAX` anyway — is what the folder-based backend's own
+ * commit translates, since only it knows its root.
+ */
+const MAX_ID_BYTES = 1024
+
+/**
  * Trailing characters some filesystems STRIP from a filename rather than preserve.
  *
  * Win32 path semantics (so NTFS, and any SMB/CIFS mount) discard trailing dots and spaces, which makes
@@ -27,6 +45,20 @@ const MAX_SEGMENT_BYTES = 255
  * for a collision that cannot happen.
  */
 const FILESYSTEM_STRIPPED_TAIL = /[. ]+$/
+
+/**
+ * A filename reduced to the form a case-folding filesystem actually compares.
+ *
+ * Two names with the same folded form are ONE directory entry on APFS, NTFS or an SMB/CIFS mount. Shared
+ * so every rule that has to respect that folding uses the same definition: the reserved-suffix check
+ * below, and the folder-based backend's id-vs-id alias check, which without it let `Foo` and `FOO` resolve
+ * to the same file and silently overwrite each other's content.
+ *
+ * @internal
+ */
+export function foldFilesystemName(name: string): string {
+  return name.toLowerCase().replace(FILESYSTEM_STRIPPED_TAIL, '')
+}
 
 /**
  * The separators the RUNNING platform treats as path separators.
@@ -115,10 +147,22 @@ export function assertValidContentId(id: string): void {
  */
 export function assertStorableContentId(id: string): void {
   // Checked against the folded spelling, but only for a name being created — see above.
-  if (id.toLowerCase().replace(FILESYSTEM_STRIPPED_TAIL, '').endsWith(GZIP_EXTENSION)) {
+  if (foldFilesystemName(id).endsWith(GZIP_EXTENSION)) {
     throw new PathNotContainedError(
       `The id ends in ${GZIP_EXTENSION} once trailing dots and spaces are removed, which some filesystems ` +
         `strip — so it names the compressed representation of another id: ${JSON.stringify(id)}`
+    )
+  }
+
+  // The WHOLE id, because `PATH_MAX` applies to the assembled path and the per-segment rule below
+  // cannot see it: many short segments are individually fine and collectively unstorable. Checked
+  // first so the message names the real problem rather than an innocent segment.
+  const totalBytes = Buffer.byteLength(id, 'utf8')
+  if (totalBytes > MAX_ID_BYTES) {
+    throw new PathNotContainedError(
+      `The id is ${totalBytes} bytes, past the ${MAX_ID_BYTES} this storage can address (the assembled ` +
+        `path must stay within PATH_MAX, which is 1024 bytes on some platforms): ` +
+        `${JSON.stringify(id.slice(0, 32) + '…')}`
     )
   }
 

@@ -195,14 +195,22 @@ export async function createIntentJournal(
   // A legacy flat-mode content id could live exactly AT the reserved path as a file; mkdir would
   // then fail with a low-level filesystem error. Detect it first and give the same actionable
   // guidance as the other reservation conflicts.
-  if (await fs.existPath(tempDir)) {
-    const tempDirStat = await fs.stat(tempDir)
-    if (!tempDirStat.isDirectory()) {
-      throw new Error(
-        `Refusing to start: the reserved temp path '${tempDirName}' under the storage root exists as a file — ` +
-          `likely a pre-existing content id. Migrate it out or configure a different tempDirectoryName.`
-      )
-    }
+  // Probed with `stat` alone rather than gated on `existPath` first. `existPath` tests F_OK|R_OK, so a
+  // present-but-UNREADABLE entry at the reserved path (mode or ACL damage, exactly the state a legacy
+  // content id can be left in) read as absent — and `mkdir` then failed with a bare `EEXIST` instead of the
+  // actionable message below, which is the one thing this check exists to produce. `existsForInvariant` is
+  // not the right probe either: a DIRECTORY here is the normal, expected state.
+  let tempDirStat: { isDirectory(): boolean } | undefined
+  try {
+    tempDirStat = await fs.stat(tempDir)
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw err
+  }
+  if (tempDirStat && !tempDirStat.isDirectory()) {
+    throw new Error(
+      `Refusing to start: the reserved temp path '${tempDirName}' under the storage root exists as a file — ` +
+        `likely a pre-existing content id. Migrate it out or configure a different tempDirectoryName.`
+    )
   }
   // Created up front so storeStream can stage into it without a per-write mkdir.
   await fs.mkdir(tempDir, { recursive: true })
@@ -231,7 +239,11 @@ export async function createIntentJournal(
           `'${OWNERSHIP_MARKER}' marker (with its original content) if they are staging leftovers from a previous run.`
       )
     }
-    if (await fs.existPath(markerPath)) {
+    // `existsForInvariant`, not `existPath`: an unreadable marker read as absent took the `else` branch,
+    // where `readdir` sees the marker itself and refuses to start with a remedy telling the operator to
+    // restore a marker that is already there — a dead end. This way the unreadable marker reaches the
+    // `readFile` below, whose failure names the real problem.
+    if (await existsForInvariant(markerPath)) {
       const markerBody = await fs.readFile(markerPath, 'utf8')
       if (markerBody !== OWNERSHIP_MARKER_CONTENT) {
         refuseToStart(
