@@ -942,6 +942,127 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
+  describe('and an observed directory is replaced by a file in HASH-PREFIX mode', () => {
+    // A depth test is enough in flat mode and wrong here: an id's shard is `sha1(the whole id)`, so a file at
+    // `<root>/<shard>/a` is content for the id `a` only when that shard is `sha1('a')`. With `a/b` stored, the
+    // observed directory sits in `sha1('a/b')`'s shard, and a file put there is reachable as NO id at all —
+    // `exist('a')` looks in a different shard — so it is foreign state where a directory used to be, which is
+    // damage rather than a legitimately claimed prefix.
+    const shardOfId = (id: string): string => createHash('sha1').update(id).digest('hex').substring(0, 4)
+    let storage: IContentStorageComponent
+    let hashRoot: string
+
+    beforeEach(async () => {
+      hashRoot = mkdtempSync(path.join(os.tmpdir(), 'hash-noncanonical-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        hashRoot
+      )
+      await storage.storeStream('a/b', bufferToStream(Buffer.from('x')))
+      const observed = path.join(hashRoot, shardOfId('a/b'), 'a')
+      rmSync(observed, { recursive: true, force: true })
+      await nodeFs.writeFile(observed, 'foreign, and not any id this storage serves')
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(hashRoot, { recursive: true, force: true })
+    })
+
+    it('should reject exist rather than report the id absent', async () => {
+      await expect(storage.exist('a/b')).rejects.toBeDefined()
+    })
+
+    it('should reject fileInfo for the same reason', async () => {
+      await expect(storage.fileInfo('a/b')).rejects.toBeDefined()
+    })
+
+    it('should reject retrieve for the same reason', async () => {
+      await expect(storage.retrieve('a/b')).rejects.toBeDefined()
+    })
+
+    it('should not serve that file as the id its name spells, since it is in the wrong shard', async () => {
+      // The reason absence would be wrong: nothing resolves to that path, so calling it "content" credits an
+      // id this storage cannot actually serve.
+      expect(await storage.exist('a')).toBe(false)
+    })
+  })
+
+  describe('and the file replacing it IS the canonical path for its id', () => {
+    // The other side, which must stay absence. It needs `p` and `p/child` to land in one shard, so the id is
+    // searched for rather than hard-coded — deterministic, since it only depends on sha1.
+    const shardOfId = (id: string): string => createHash('sha1').update(id).digest('hex').substring(0, 4)
+    let storage: IContentStorageComponent
+    let hashRoot: string
+    let collidingId: string
+
+    beforeEach(async () => {
+      collidingId = ''
+      for (let i = 0; i < 400_000 && !collidingId; i++) {
+        const candidate = `k${i}`
+        if (shardOfId(candidate) === shardOfId(`${candidate}/child`)) collidingId = candidate
+      }
+      expect(collidingId).not.toBe('')
+
+      hashRoot = mkdtempSync(path.join(os.tmpdir(), 'hash-canonical-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        hashRoot
+      )
+      // Observes the directory, has it destroyed, then legitimately stores the id that owns that exact path.
+      await storage.storeStream(`${collidingId}/child`, bufferToStream(Buffer.from('x')))
+      rmSync(path.join(hashRoot, shardOfId(collidingId), collidingId), { recursive: true, force: true })
+      await storage.storeStream(collidingId, bufferToStream(Buffer.from('legitimate content')))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(hashRoot, { recursive: true, force: true })
+    })
+
+    it('should report the nested id as absent, because the prefix is real content', async () => {
+      expect(await storage.exist(`${collidingId}/child`)).toBe(false)
+    })
+
+    it('should serve the id that owns the path', async () => {
+      expect(await storage.exist(collidingId)).toBe(true)
+    })
+  })
+
+  describe('and the file replacing it is the canonical COMPRESSED path for its id', () => {
+    // `<id>.gzip` is this storage's own name for the compressed representation, so it counts as content too —
+    // stripping the suffix before resolving is what makes that work, since no id may end in it.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'gzip-canonical-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      // `g.gzip/inner` is a legal id — only an id ENDING in `.gzip` is reserved — so this observes the
+      // directory `<root>/g.gzip`, which is also where `g`'s compressed representation belongs.
+      await storage.storeStream('g.gzip/inner', bufferToStream(Buffer.from('x')))
+      rmSync(path.join(flatRoot, 'g.gzip'), { recursive: true, force: true })
+      await storage.storeStreamAndCompress('g', bufferToStream(Buffer.alloc(3000, 'A')))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should report the nested id as absent, because the compressed representation owns the path', async () => {
+      expect(await storage.exist('g.gzip/inner')).toBe(false)
+    })
+
+    it('should serve the compressed id itself', async () => {
+      expect(await storage.exist('g')).toBe(true)
+    })
+  })
+
   describe('and the directory was observed some way other than by storing its own id', () => {
     // The contract is "a directory this instance created or observed", and three ways of learning one existed
     // did not record it: a recursive `mkdir` recorded only the leaf it was asked for, a lookup that found a

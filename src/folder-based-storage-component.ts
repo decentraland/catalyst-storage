@@ -305,14 +305,41 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   /**
-   * Depth of `target` below the root, in path segments, which is how a path that may hold CONTENT is told
-   * from one that may not: ids resolve under the shard with hash prefixes and under the root in flat mode, so
-   * a file at depth 1 is content in flat mode and foreign where a shard belongs in hash mode.
+   * Whether `target` is a path this storage would itself use for content: the canonical raw path of some id,
+   * or that id's `.gzip` path.
+   *
+   * Asked of a regular FILE that broke an id's ancestor chain, to decide whether the path was legitimately
+   * claimed as content — in which case ids nested under it are unstorable and absence is provable — or is
+   * foreign state sitting where a directory used to be, which is damage.
+   *
+   * A DEPTH TEST is not enough, and only looked sufficient because flat mode is the easy case there. With hash
+   * prefixes an id's shard is `sha1(the whole id)`, so a file at `<root>/<shard>/a` is content for the id `a`
+   * only when that shard is `sha1('a')` — otherwise nothing resolves to it and `exist('a')` looks in a
+   * different shard entirely. Measured: with `a/b` stored and its observed `<root>/3ec6/a` replaced by a file,
+   * the read reported the id absent while that file was reachable as no id at all. So the question is asked
+   * the only way that answers it — by rebuilding the path from the id the file's own name spells and checking
+   * it round-trips. This also rejects a staged file under the reserved directory, since `resolveFilePath`
+   * refuses those ids.
    */
-  const MIN_CONTENT_DEPTH = USE_HASH_PREFIX ? 2 : 1
-  function depthBelowRoot(target: string): number {
-    if (target === root) return 0
-    return target.slice(root.length + 1).split(path.sep).length
+  async function isCanonicalContentPath(target: string): Promise<boolean> {
+    if (!target.startsWith(root + path.sep)) return false
+    const segments = target.slice(root.length + 1).split(path.sep)
+    // With hash prefixes the leading segment is the shard, which is not part of the id.
+    const idSegments = USE_HASH_PREFIX ? segments.slice(1) : segments
+    if (idSegments.length === 0) return false
+    const spelled = idSegments.join(path.sep)
+    // A `.gzip` file is the compressed representation of the id WITHOUT that suffix; the suffix itself is
+    // never part of an id, so it has to come off before the id is resolved.
+    const compressed = spelled.endsWith(GZIP_EXTENSION)
+    const id = compressed ? spelled.slice(0, -GZIP_EXTENSION.length) : spelled
+    if (id.length === 0) return false
+    try {
+      const canonical = await resolveFilePath(id)
+      return target === (compressed ? gzipPathOf(canonical) : canonical)
+    } catch {
+      // Not an addressable id, so nothing this storage would put there.
+      return false
+    }
   }
 
   /**
@@ -399,8 +426,9 @@ export async function createFolderBasedFileSystemContentStorage(
    * therefore cost ONE probe whatever the id's depth. Only a genuinely broken one pays the walk above it,
    * which looks for the single thing that turns a fault back into absence — a CONTENT path holding a regular
    * file. Nothing can exist beneath a file, so the id is unstorable (`ensureDirectoryFor` refuses it, `delete`
-   * resolves for it) and absence is what makes those three agree. Depth is what makes a path a content path: a
-   * file where a SHARD belongs, or at the root, is foreign to the layout rather than an id.
+   * resolves for it) and absence is what makes those three agree. What counts as a content path is decided by
+   * `isCanonicalContentPath`, not by depth: a file only supersedes if this storage would itself have put
+   * content there.
    */
   async function faultBehindAbsence(
     filePath: string,
@@ -427,7 +455,7 @@ export async function createFolderBasedFileSystemContentStorage(
     let candidate = observed
     for (;;) {
       forgetDirectory(candidate)
-      if (occupant === 'file' && depthBelowRoot(candidate) >= MIN_CONTENT_DEPTH) {
+      if (occupant === 'file' && (await isCanonicalContentPath(candidate))) {
         // Absence is the answer, but the transition destroyed whatever was under it, so say so once.
         if (wasObserved(candidate)) {
           logger.warn(`${JSON.stringify(candidate)} was observed as a directory and now holds content`)
