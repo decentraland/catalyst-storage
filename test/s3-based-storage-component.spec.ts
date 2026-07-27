@@ -348,34 +348,40 @@ describe('S3 Storage MIME type detection', () => {
 
 describe('S3 Storage enumeration', () => {
   describe('when a page reports itself truncated but carries no continuation token', () => {
-    let listed: string[]
+    let storage: IContentStorageComponent
     let requests: number
 
     beforeEach(async () => {
-      // Re-requesting with an undefined token returns the FIRST page again, so without the guard this
-      // yields the same keys forever and hangs whatever is consuming the iterator.
       requests = 0
       const fake = createFakeS3Client()
       fake.on('ListObjectsV2Command', () => {
         requests++
         return { Contents: [{ Key: 'only-key' }], IsTruncated: true, NextContinuationToken: undefined }
       })
-      const storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
+      storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
         Bucket: 'example'
       })
       // Construction probes s3:ListBucket once to decide whether a 403 can mean "absent"; this
       // assertion is about what ENUMERATION issues, so it counts from here.
       requests = 0
-      listed = []
-      for await (const each of storage.allFileIds()) listed.push(each)
     })
 
-    it('should stop after the page it could not continue from', () => {
-      expect(requests).toBe(1)
-    })
-
-    it('should still yield the keys that page contained', () => {
+    it('should reject rather than completing a partial listing', async () => {
+      const listed: string[] = []
+      await expect(async () => {
+        for await (const each of storage.allFileIds()) listed.push(each)
+      }).rejects.toThrow('truncated listing without a continuation token')
       expect(listed).toEqual(['only-key'])
+    })
+
+    it('should stop after the page it could not continue from', async () => {
+      await expect(async () => {
+        for await (const _each of storage.allFileIds()) {
+          // drain the iterator so the pagination failure surfaces
+        }
+      }).rejects.toThrow('This enumeration is incomplete')
+
+      expect(requests).toBe(1)
     })
   })
 })

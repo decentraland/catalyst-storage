@@ -925,6 +925,16 @@ export async function createS3BasedFileSystemContentStorage(
         }
       }
       const nextToken = output.NextContinuationToken
+      if (output.IsTruncated === true && (typeof nextToken !== 'string' || nextToken.length === 0)) {
+        // THROWS rather than returning. The endpoint explicitly said there are more keys, but did not give a
+        // usable cursor to reach them. Ending the iterator normally would hand the caller a silently short
+        // listing, so a GC or sync sweep could act on a partial bucket view as if it were complete.
+        throw new Error(
+          `Cannot enumerate ${Bucket}: the endpoint reported a truncated listing without a continuation ` +
+            `token, so paging cannot advance. This enumeration is incomplete and must not be treated as ` +
+            `the full bucket contents.`
+        )
+      }
       if (nextToken !== undefined && nextToken === previousToken) {
         // THROWS rather than returning. Ending the iterator normally would hand the caller a silently short
         // listing, which is precisely the failure the relaxed stop condition below exists to avoid — a GC or
