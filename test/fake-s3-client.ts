@@ -11,7 +11,7 @@ export type FakeS3Client = S3Client & {
    * Set it explicitly to model an object whose ETag changed (a new version, or an SSE-KMS bucket where the
    * ETag is not a digest of the body), which is what `IfMatch` is checked against.
    */
-  objects: Map<string, { body: Buffer; contentType?: string; etag?: string }>
+  objects: Map<string, { body: Buffer; contentType?: string; etag?: string; contentEncoding?: string }>
   /** Overrides the handler for one command (by class name), e.g. to make HeadObject fail. */
   on: (commandName: string, handler: CommandHandler) => void
   /** Makes the given command hang until `release()` is called, to model an in-flight request. */
@@ -55,7 +55,7 @@ async function bodyToBuffer(body: unknown): Promise<Buffer> {
  * genuine `Upload.abort()` path rather than a hand-rolled stand-in for it.
  */
 export function createFakeS3Client(): FakeS3Client {
-  const objects = new Map<string, { body: Buffer; contentType?: string; etag?: string }>()
+  const objects = new Map<string, { body: Buffer; contentType?: string; etag?: string; contentEncoding?: string }>()
   const etagOf = (key: string, stored: { etag?: string }): string => stored.etag ?? `"${key}"`
   const parts = new Map<string, Map<number, Buffer>>()
   const overrides = new Map<string, CommandHandler>()
@@ -65,7 +65,13 @@ export function createFakeS3Client(): FakeS3Client {
     HeadObjectCommand: ({ Key }) => {
       const found = objects.get(Key)
       if (!found) throw notFound()
-      return { ETag: etagOf(Key, found), ContentLength: found.body.length, ContentType: found.contentType }
+      return {
+        ETag: etagOf(Key, found),
+        ContentLength: found.body.length,
+        ContentType: found.contentType,
+        // Set only when a test asked for it, so an ordinary object still has no Content-Encoding at all.
+        ContentEncoding: found.contentEncoding
+      }
     },
     GetObjectCommand: ({ Key, Range, IfMatch }) => {
       const found = objects.get(Key)

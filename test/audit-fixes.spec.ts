@@ -16,7 +16,8 @@ import {
   FileTypeLoader,
   IContentStorageComponent,
   IFileSystemComponent,
-  PathNotContainedError
+  PathNotContainedError,
+  RangeNotSupportedError
 } from '../src'
 import { createFakeS3Client } from './fake-s3-client'
 
@@ -1173,6 +1174,163 @@ describe('when the S3 backend is configured with a partSize', () => {
 // multipart cancellation coverage (`s3-based-storage-component.spec.ts`, "When the abort lands
 // mid-multipart" and "S3 Storage multipart cleanup") proves the path with unmangled names, and both
 // additions are strictly additive: they can only make the match succeed where it previously failed.
+
+describe('when an S3 object carries a transfer coding in its Content-Encoding', () => {
+  // `aws-chunked` describes the TRANSFER of the bytes, not the content, and is already undone by the time a
+  // body reaches us — which is why `contentCodingOf` ignores it when deciding whether `asStream()` decodes,
+  // and why such an object is rangeable. But the exposed metadata kept reporting it, so a caller received a
+  // `Content-Encoding` to forward for bytes that are not encoded at all. Both surfaces now run the raw header
+  // through the same predicate that decides decoding.
+  let storage: IContentStorageComponent
+  let s3: ReturnType<typeof createFakeS3Client>
+
+  beforeEach(async () => {
+    s3 = createFakeS3Client()
+    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, s3, {
+      Bucket: 'a-bucket',
+      fileTypeLoader: undetectingLoader
+    })
+  })
+
+  afterEach(() => {
+    s3.destroy()
+  })
+
+  describe('and the coding is bare aws-chunked, so the bytes are plain', () => {
+    beforeEach(() => {
+      s3.objects.set('chunked', { body: Buffer.from('the real content'), contentEncoding: 'aws-chunked' })
+    })
+
+    it('should report a null encoding from fileInfo', async () => {
+      expect((await storage.fileInfo('chunked'))!.encoding).toBeNull()
+    })
+
+    it('should report a known contentSize from fileInfo', async () => {
+      expect((await storage.fileInfo('chunked'))!.contentSize).toBe(16)
+    })
+
+    it('should report a null encoding from retrieve', async () => {
+      expect((await storage.retrieve('chunked'))!.encoding).toBeNull()
+    })
+
+    it('should report a known contentSize from retrieve', async () => {
+      expect((await storage.retrieve('chunked'))!.contentSize).toBe(16)
+    })
+
+    it('should serve the plain bytes unchanged', async () => {
+      const item = await storage.retrieve('chunked')
+
+      expect((await streamToBuffer(await item!.asStream())).toString()).toBe('the real content')
+    })
+
+    it('should still be rangeable, since nothing is actually encoded', async () => {
+      const item = await storage.retrieve('chunked', { start: 0, end: 3 })
+
+      expect((await streamToBuffer(await item!.asStream())).toString()).toBe('the ')
+    })
+  })
+
+  describe('and the coding is gzip alongside aws-chunked', () => {
+    beforeEach(() => {
+      s3.objects.set('both', { body: gzipSync(Buffer.from('the real content')), contentEncoding: 'gzip, aws-chunked' })
+    })
+
+    it('should report only the coding still applied, so a forwarded header is correct', async () => {
+      expect((await storage.fileInfo('both'))!.encoding).toBe('gzip')
+    })
+
+    it('should agree between fileInfo and retrieve', async () => {
+      expect((await storage.retrieve('both'))!.encoding).toBe((await storage.fileInfo('both'))!.encoding)
+    })
+
+    it('should report an unknown contentSize, because S3 keeps no uncompressed size', async () => {
+      expect((await storage.fileInfo('both'))!.contentSize).toBeNull()
+    })
+
+    it('should still decode through asStream', async () => {
+      const item = await storage.retrieve('both')
+
+      expect((await streamToBuffer(await item!.asStream())).toString()).toBe('the real content')
+    })
+
+    it('should refuse a range, because the range would address the compressed bytes', async () => {
+      await expect(storage.retrieve('both', { start: 0, end: 3 })).rejects.toBeInstanceOf(RangeNotSupportedError)
+    })
+  })
+
+  describe('and the coding is identity', () => {
+    beforeEach(() => {
+      s3.objects.set('plain', { body: Buffer.from('the real content'), contentEncoding: 'identity' })
+    })
+
+    it('should report a null encoding from fileInfo', async () => {
+      expect((await storage.fileInfo('plain'))!.encoding).toBeNull()
+    })
+
+    it('should report a null encoding from retrieve', async () => {
+      expect((await storage.retrieve('plain'))!.encoding).toBeNull()
+    })
+  })
+})
+
+describe('when a caller mutates the range object before awaiting retrieve', () => {
+  // The snapshot used to be taken after the metadata read, so a caller that did not await immediately could
+  // change the bounds while that request was in flight — between `validateRange` accepting them and the
+  // clamp using them.
+  let root: string
+  let folderStorage: IContentStorageComponent
+  let s3Storage: IContentStorageComponent
+  let s3: ReturnType<typeof createFakeS3Client>
+  let range: { start: number; end: number }
+
+  beforeEach(async () => {
+    root = mkdtempSync(path.join(os.tmpdir(), 'range-presnapshot-'))
+    folderStorage = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      root,
+      { disablePrefixHash: true }
+    )
+    s3 = createFakeS3Client()
+    s3Storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, s3, {
+      Bucket: 'a-bucket',
+      fileTypeLoader: undetectingLoader
+    })
+    await folderStorage.storeStream('an-id', bufferToStream(Buffer.from('0123456789')))
+    await s3Storage.storeStream('an-id', bufferToStream(Buffer.from('0123456789')))
+    range = { start: 0, end: 4 }
+  })
+
+  afterEach(async () => {
+    await folderStorage.stop?.()
+    await s3Storage.stop?.()
+    s3.destroy()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('should serve the bounds it was called with on the folder-based backend', async () => {
+    const pending = folderStorage.retrieve('an-id', range)
+    range.start = 9
+    const item = await pending
+
+    expect((await streamToBuffer(await item!.asStream())).toString()).toBe('01234')
+  })
+
+  it('should serve the bounds it was called with on the S3 backend', async () => {
+    const pending = s3Storage.retrieve('an-id', range)
+    range.start = 9
+    const item = await pending
+
+    expect((await streamToBuffer(await item!.asStream())).toString()).toBe('01234')
+  })
+
+  it('should advertise a size matching what it serves on the S3 backend', async () => {
+    const pending = s3Storage.retrieve('an-id', range)
+    range.end = 0
+    const item = await pending
+
+    expect((await streamToBuffer(await item!.asStream())).length).toBe(item!.size)
+  })
+})
 
 describe('when a gzip placed under a shard has more than one member', () => {
   // `asStream()` decodes every member because zlib does, while the trailer read only ever sees the LAST

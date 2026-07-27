@@ -38,7 +38,7 @@ Everything importable from this package is listed in `src/index.ts`, and `packag
 |---|---|
 | factories | `createFolderBasedFileSystemContentStorage`, `createS3BasedFileSystemContentStorage`, `createAwsS3BasedFileSystemContentStorage`, `createInMemoryStorage`, `createFsComponent` |
 | types | `IContentStorageComponent`, `ContentItem`, `FileInfo`, `AppComponents`, `IFileSystemComponent`, `FolderStorageOptions`, `S3ContentStorageOptions`, `FileTypeLoader` |
-| helpers | `bufferToStream`, `streamToBuffer`, `SimpleContentItem` |
+| helpers | `bufferToStream`, `streamToBuffer`, `SimpleContentItem`, `assertStorableStream` |
 | errors | `PathNotContainedError`, `RangeNotSupportedError`, `UncommittedIntentSurvivedError` |
 
 The errors are exported as runtime values precisely so `instanceof` is stable, and the list is decided
@@ -55,6 +55,13 @@ nobody can use.
 - `DecompressionLimitExceededError` is **not** exported: every path that raises it is caught by
   `retrieve()`, which answers `undefined`. A cap breach is therefore observed as "nothing to serve",
   not as a typed error.
+
+`assertStorableStream` is the one validator that is public, because the rule it enforces is one a caller can
+otherwise only discover by failing: a body that has been read from — to hash it, sniff it, or measure it —
+cannot supply the content any more, and every backend refuses it. A caller that must inspect a body before
+storing can check the source it is about to hand over instead of learning from a rejected store. The id
+validators stay internal: they encode invariants that only make sense applied at a specific point, and the
+backends apply them on the caller's behalf.
 
 Previously every module was re-exported wholesale, which made a lot of internals public by accident —
 the MIME detector and its ESM loader memo, the id validators, the bounded-map helper, the stream
@@ -100,7 +107,16 @@ and exporting them again is cheap if there is a real use for it.
 
   **A missing or misnamed bucket fails construction.** `HeadObject` against one answers 404 `NotFound`, byte-identical to a missing key, so every id reported absent and nothing was logged. The same startup probe detects it (`NoSuchBucket`/404) and **refuses to start**, because a silently empty node is worse than one that will not boot.
 
-- **`identity` means not encoded, everywhere.** `fileInfo()` and `retrieve()` normalize the raw `Content-Encoding` through the same predicate that decides whether `asStream()` decodes, so an object tagged `Content-Encoding: identity` reports `encoding: null` and a known `contentSize`, and is rangeable. Previously the metadata surfaces tested raw truthiness and reported `contentSize: null` — "size unknown" — for content whose size was plainly known, disagreeing with the item `retrieve()` returned for the same id. The same applies to `aws-chunked`, which S3 writes itself on flexible-checksum uploads and which encodes nothing.
+- **The reported `encoding` is only what is still applied to the bytes.** `fileInfo()` and `retrieve()` run the raw `Content-Encoding` through the same predicate that decides whether `asStream()` decodes, so the two can never disagree about one id. Codings that describe nothing still applied are dropped, and `null` is reported when none remains:
+
+  | stored `Content-Encoding` | reported `encoding` | `contentSize` | rangeable |
+  |---|---|---|---|
+  | *(absent)* / `identity` | `null` | known | yes |
+  | `aws-chunked` | `null` | known | yes |
+  | `gzip, aws-chunked` | `gzip` | `null` | no (416) |
+  | `gzip` | `gzip` | `null` | no (416) |
+
+  `identity` and an empty header mean "not encoded", so reporting them verbatim forces every caller to special-case a value carrying no information. `aws-chunked` — which S3 writes itself on flexible-checksum uploads — describes the *transfer* of the bytes and is already undone by the time a body reaches us, so a bare `aws-chunked` object streams plain bytes and has a known size; reporting it anyway handed callers a `Content-Encoding` to forward for content that is not encoded at all. Surviving codings keep their original spelling and order, so what is reported stays a valid header value. Previously the metadata surfaces tested raw truthiness and reported `contentSize: null` — "size unknown" — for content whose size was plainly known.
 - **The content-type detector is resolved at construction, and can be supplied.** `file-type` is ESM-only, so the default reaches it through a dynamic import; that import is awaited while the component is being built rather than left in flight, so a resolution problem is reported before any traffic arrives instead of degrading the first stores that race it. Pass `fileTypeLoader` to use your own detector, or to avoid the dynamic import entirely.
 - **A single store is capped at roughly 50 GiB unless you set `partSize`.** Bodies reach `@aws-sdk/lib-storage` wrapped by the MIME head-peek, and that wrapper exposes no length, so lib-storage cannot right-size parts the way it does for a `Buffer` or an `fs.ReadStream`: it falls back to its 5 MiB minimum, and with S3's 10,000-part limit that is the ceiling — reported as `Exceeded 10000 parts` only *after* 50 GiB has crossed the wire. Pass `partSize` (bytes) to raise it: 64 MiB lifts the ceiling to about 640 GiB, at the cost of proportionally more memory per concurrent upload, since lib-storage buffers a part at a time. It is validated at construction against S3's own 5 MiB–5 GiB bounds and must be an integer, because every way of getting it wrong otherwise fails late — below the minimum every store rejects with a bare `EntityTooSmall`, `0` and `NaN` are silently ignored by lib-storage, and a non-integer passes its own guard and then breaks any upload that needs a second part. Available on both S3 factories.
 - **Reads are pinned to the version their metadata came from.** `retrieve()` reads metadata with `HeadObject` and the bytes with a `GetObject` issued when the consumer opens the stream, so the two can come from different versions of a key. The `GetObject` carries `IfMatch` with the ETag the `HeadObject` returned, so a re-store in between fails the read with a `PreconditionFailed` (412) instead of serving one version's bytes under another's advertised `size` — which a caller forwarding `size` as `Content-Length` turns into a truncated response with a mismatched header. Treat it like any other failing stream: a retryable miss — the retry re-heads the object and gets a consistent pair. The header is omitted entirely when the head returns no ETag. Note that ETag equality is **not** guaranteed by byte-identical content: on a bucket where the ETag is not a digest of the body (SSE-KMS, SSE-C) or when two writers use different multipart part boundaries, re-storing the same bytes still changes it, so an in-flight read can surface a 412 for content that never actually differed.

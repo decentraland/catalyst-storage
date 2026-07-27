@@ -718,6 +718,12 @@ export async function createS3BasedFileSystemContentStorage(
 
   async function retrieve(id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
     if (range) validateRange(range)
+    // SNAPSHOT before the first await, not merely before the lazy item is built. `retrieve()` is async, so a
+    // caller that does not await it immediately — `const p = retrieve(id, r); r.start = 9; await p` — could
+    // still mutate the object while the HeadObject was in flight, and the bounds this then validated and
+    // clamped would not be the ones `validateRange` above accepted. Copying here makes the values used for
+    // the encoding check, the clamp, the advertised size and the Range header all come from one observation.
+    const requestedRange = range ? { start: range.start, end: range.end } : undefined
     try {
       const obj = await s3.send(new HeadObjectCommand({ Bucket, Key: id }))
 
@@ -738,8 +744,6 @@ export async function createS3BasedFileSystemContentStorage(
       // Tested against the NORMALIZED coding: `identity` (and an empty header) mean the bytes are not
       // encoded at all, so such an object is perfectly rangeable — rejecting it would have made any
       // object an operator tagged `Content-Encoding: identity` permanently un-rangeable.
-      const requestedRange = range ? { start: range.start, end: range.end } : undefined
-
       if (requestedRange && contentCodingOf(encoding) !== null) {
         throw new RangeNotSupportedError(
           `Cannot serve a range of ${id}: it is stored with Content-Encoding '${encoding}', and S3 ranges ` +
@@ -748,9 +752,8 @@ export async function createS3BasedFileSystemContentStorage(
         )
       }
 
-      // SNAPSHOT the caller-owned range before returning a lazy item. `asStream()` may run much later,
-      // after the caller has mutated their object; both the advertised size and S3 Range header must
-      // describe the bounds that were validated and clamped during `retrieve()`.
+      // Derived from the snapshot taken before the first await, so `asStream()` — which may run much later,
+      // after the caller has mutated their object — sends the bounds this call validated and clamped.
       const clampedEnd = requestedRange && size !== null ? clampRange(requestedRange, size) : undefined
       const itemSize = requestedRange ? (clampedEnd !== undefined ? clampedEnd - requestedRange.start + 1 : null) : size
       const rangeHeader = requestedRange

@@ -11,25 +11,47 @@ import { destroyQuietly, ignoreStreamError } from './stream-teardown'
 const IDENTITY_ENCODINGS = new Set(['', 'identity'])
 
 /**
- * The value a `ContentItem` reports as its `encoding`, given a raw `Content-Encoding`.
- *
- * Only the identity tokens collapse to `null`: they mean "not encoded", so reporting them verbatim
- * forces every caller to special-case a value that carries no information. Any other coding is passed
- * through unchanged, because a caller forwarding the header needs the original. Exported so backends
- * normalize identically and their `fileInfo`/`retrieve` surfaces cannot disagree about one id.
- *
- * @public
- */
-export function normalizeContentEncoding(encoding: string | null | undefined): string | null {
-  return typeof encoding === 'string' && IDENTITY_ENCODINGS.has(encoding.toLowerCase()) ? null : (encoding ?? null)
-}
-
-/**
  * Codings that describe the TRANSFER of the bytes rather than the content itself, and so are already
  * undone by the time a body reaches us. `aws-chunked` is written by S3 on flexible-checksum uploads,
  * frequently alongside a real coding (`gzip, aws-chunked`).
  */
 const TRANSPARENT_CODINGS = new Set(['aws-chunked', 'chunked'])
+
+/** Whether a single, trimmed coding token describes nothing that is still applied to these bytes. */
+function isVacuousCoding(coding: string): boolean {
+  const lower = coding.toLowerCase()
+  return lower.length === 0 || TRANSPARENT_CODINGS.has(lower) || IDENTITY_ENCODINGS.has(lower)
+}
+
+/**
+ * The value a `ContentItem` reports as its `encoding`, given a raw `Content-Encoding`.
+ *
+ * Drops every coding that is not still applied to the bytes being served, and reports `null` when none
+ * remains. That is the SAME predicate `contentCodingOf` uses to decide whether `asStream()` decodes, which
+ * is the whole point: the two answers have to agree, or a caller is told the content is encoded in a way
+ * this storage has already decided needs no decoding.
+ *
+ * - `identity` (and an empty header) mean "not encoded", so reporting them verbatim forces every caller to
+ *   special-case a value that carries no information.
+ * - TRANSFER codings go too. A bare `aws-chunked` object streams plain bytes and has a known `contentSize`,
+ *   yet reporting `aws-chunked` here handed callers a `Content-Encoding` to forward for content that is not
+ *   encoded at all — a client receiving it either fails to decode or is misled about what it holds. And
+ *   `gzip, aws-chunked` — the ordinary shape for a checksummed S3 upload — becomes `gzip`, which is exactly
+ *   what a caller forwarding the header should send for the bytes `asRawStream()` yields.
+ *
+ * Surviving codings keep their original spelling and order, so the result stays a valid header value
+ * rather than a normalized-away one.
+ *
+ * @public
+ */
+export function normalizeContentEncoding(encoding: string | null | undefined): string | null {
+  if (typeof encoding !== 'string') return encoding ?? null
+  const applied = encoding
+    .split(',')
+    .map((each) => each.trim())
+    .filter((each) => !isVacuousCoding(each))
+  return applied.length === 0 ? null : applied.join(', ')
+}
 
 /**
  * The content coding that still has to be undone, or `null` when the bytes are already plain.
@@ -44,7 +66,7 @@ export function contentCodingOf(encoding: string | null): string | null {
   const codings = encoding
     .split(',')
     .map((each) => each.trim().toLowerCase())
-    .filter((each) => each.length > 0 && !TRANSPARENT_CODINGS.has(each) && !IDENTITY_ENCODINGS.has(each))
+    .filter((each) => !isVacuousCoding(each))
   // Only the outermost coding can be undone here; a genuine multi-coding body would need to be
   // unwrapped in reverse, which no backend in this library produces.
   return codings.length === 0 ? null : codings[codings.length - 1]

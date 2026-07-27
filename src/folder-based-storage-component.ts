@@ -942,6 +942,12 @@ export async function createFolderBasedFileSystemContentStorage(
   // "not here" from "cannot be read right now" instead of turning an unreadable disk into a 404.
   const retrieve = async (id: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> => {
     if (range) validateRange(range)
+    // SNAPSHOT before the first await. `retrieveWithEncoding` already copies `range.start` before building its
+    // lazy stream creator, but that copy happens after several awaits — so a caller that does not await this
+    // call immediately (`const p = retrieve(id, r); r.start = 9; await p`) could still change the bounds
+    // between `validateRange` accepting them and the clamp using them. Copying here means every consumer of
+    // the range below, and every attempt of the retry loop, sees the one observation this call validated.
+    const requestedRange = range ? { start: range.start, end: range.end } : undefined
     try {
       await assertNotQuarantined(id)
       // Resolved ONCE for the whole call and threaded through. Every resolve re-hashes the id and
@@ -952,10 +958,10 @@ export async function createFolderBasedFileSystemContentStorage(
       let contentItem: ContentItem | undefined = undefined
       // The gzip probe defers its absence classification to the raw probe below, which asks the
       // question once for both representations.
-      if (!range) contentItem = await retrieveWithEncoding(id, 'gzip', undefined, true, true, baseFilePath)
+      if (!requestedRange) contentItem = await retrieveWithEncoding(id, 'gzip', undefined, true, true, baseFilePath)
       if (!contentItem) {
-        contentItem = await retrieveWithEncoding(id, null, range, true, false, baseFilePath)
-        if (contentItem && range) {
+        contentItem = await retrieveWithEncoding(id, null, requestedRange, true, false, baseFilePath)
+        if (contentItem && requestedRange) {
           // Update last access if this file is in the cache
           cache.touch(baseFilePath)
         }
@@ -967,7 +973,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // it inflates (its stale output is correctly discarded), leaving this request with neither a
       // cached file nor its result — the second attempt re-reads the id's current representation
       // instead of returning a spurious undefined for a valid id.
-      for (let attempt = 0; attempt < 2 && !contentItem && range; attempt++) {
+      for (let attempt = 0; attempt < 2 && !contentItem && requestedRange; attempt++) {
         // Deduplicated across concurrent callers of the same path, and handed the invalidation token
         // that says whether the gzip this inflation started from is still the current version.
         await cache.deduplicateInflation(baseFilePath, (token) =>
@@ -988,7 +994,7 @@ export async function createFolderBasedFileSystemContentStorage(
         try {
           // Serve range from the cached uncompressed file (undefined when the gzip didn't exist or
           // the decompression was discarded; the loop then retries once)
-          contentItem = await retrieveWithEncoding(id, null, range, true, false, baseFilePath)
+          contentItem = await retrieveWithEncoding(id, null, requestedRange, true, false, baseFilePath)
         } catch (err) {
           releasePin()
           throw err
