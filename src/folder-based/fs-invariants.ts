@@ -13,6 +13,14 @@ export type FsInvariants = {
    * read as absent — letting a must-succeed cleanup be falsely considered complete, and the mixed
    * state resurface later with no repair signal. Here only ENOENT/ENOTDIR/ENAMETOOLONG mean absent;
    * any other error fails the repair/commit path loudly.
+   *
+   * Answers for a REGULAR FILE specifically. Every path this is asked about — an id's two
+   * representations, a staged write, an intent journal, the ownership marker — is one only a file
+   * belongs at, and a directory occupying one is not the thing being asked about. Answering `true` for
+   * it made `delete()` reject FOREVER on an id nothing was ever stored under (a nested id creates the
+   * directory: `storeStream('a/b')` makes `a`, and `a.gzip/b` makes `a`'s compressed path), because the
+   * unlink cannot remove a directory and the survivor was read as a failed removal — which poisoned
+   * every GC batch containing that id, unrecoverably. Reads already answer "absent" for the same path.
    */
   existsForInvariant(target: string): Promise<boolean>
   /**
@@ -26,8 +34,8 @@ export function createFsInvariants(fs: IFileSystemComponent): FsInvariants {
   return {
     async existsForInvariant(target: string): Promise<boolean> {
       try {
-        await fs.stat(target)
-        return true
+        // `isFile()`, not merely "stat succeeded" — see the contract above.
+        return (await fs.stat(target)).isFile()
       } catch (err: any) {
         // ENAMETOOLONG belongs with ENOENT/ENOTDIR: no file of that name CAN exist, so it is provably
         // absent rather than a storage fault. `statForRead` already classifies it that way for reads,

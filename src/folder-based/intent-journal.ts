@@ -94,7 +94,18 @@ export type IntentJournal = {
      * so cache state describing them is still accurate; only once the rename has landed does that
      * state describe a version that no longer exists.
      */
-    onCommitted?: () => void
+    onCommitted?: () => void,
+    /**
+     * Invoked exactly once, once the counterpart representation is PROVEN gone (including when there
+     * was none to remove).
+     *
+     * Distinct from `onCommitted` because for a GZIP commit the counterpart is the raw path — the very
+     * path the caller's decompress-cache tracks. Gating that bookkeeping on the rename alone dropped
+     * the cache's record of a file the failed unlink had LEFT ON DISK: untracked, so invisible to TTL
+     * and LRU eviction and to `evictAll()` on stop, and no longer counted against the cache budget.
+     * Only a counterpart that is provably gone justifies forgetting the entry that described it.
+     */
+    onCounterpartRemoved?: () => void
   ): Promise<void>
   /**
    * Applies a pending intent for this id if one exists, so a caller never overwrites an unapplied
@@ -395,6 +406,26 @@ export async function createIntentJournal(
     liveIntentPaths.delete(intentPath)
   }
 
+  /**
+   * Recreates the reserved staging directory if it disappeared while this instance was running.
+   *
+   * Hoisted out of the returned object so the journal write can heal itself the same way a staged write
+   * does — both land in this directory, so both have to survive it going away.
+   */
+  async function ensureTempDir(): Promise<void> {
+    await fs.mkdir(tempDir, { recursive: true })
+    // The marker is not a check, it is the EVIDENCE the next construction consumes: without it, a
+    // flat-mode root whose staging directory was healed refuses to start as soon as a crash leaves
+    // one staged file behind ("contains files this storage cannot prove it owns"). Healing would
+    // otherwise turn a transient outage into a permanent, operator-only one.
+    if (!useHashPrefix && !(await existsForInvariant(path.join(tempDir, OWNERSHIP_MARKER)))) {
+      await pipe(
+        Readable.from([Buffer.from(OWNERSHIP_MARKER_CONTENT)]),
+        fs.createWriteStream(path.join(tempDir, OWNERSHIP_MARKER))
+      )
+    }
+  }
+
   async function writeIntent(op: Representation, id: string, stagedPath: string): Promise<string> {
     const intentPath = intentPathFor(id)
     // The staged BASENAME lets reconciliation prove whether the commit rename landed: renames
@@ -405,7 +436,20 @@ export async function createIntentJournal(
     // (a filesystem that reports its error at close), and an untracked journal on disk is one a later
     // repair would never look for.
     liveIntentPaths.add(intentPath)
-    await pipe(Readable.from([Buffer.from(body)]), fs.createWriteStream(intentPath))
+    try {
+      await pipe(Readable.from([Buffer.from(body)]), fs.createWriteStream(intentPath))
+    } catch (err) {
+      // The reserved directory disappearing under a live instance is healed here for the same reason
+      // `pipeToStaged` heals it: without this the caller's `writingUnder` responds to the ENOENT by
+      // invalidating the SHARD directory cache entry, which was never the problem, so the
+      // misattribution this journal write was the last place still making. This store still fails (its
+      // source is consumed); what is restored is the directory, so the next one does not inherit a
+      // permanently broken instance.
+      if ((err as { code?: string } | null)?.code === 'ENOENT') {
+        await ensureTempDir().catch(() => undefined)
+      }
+      throw err
+    }
     return intentPath
   }
 
@@ -431,8 +475,15 @@ export async function createIntentJournal(
     }
     if (
       (op !== 'raw' && op !== 'gzip') ||
+      // TYPE, not just truthiness. `!id` passes any truthy non-string, and the very next check hashes
+      // it: `createHash('sha256').update(12345)` throws a TypeError, which `reconcile()` wraps into
+      // `Refusing to start: The "data" argument must be of type string…` while KEEPING the journal — so
+      // every subsequent boot failed the same way, permanently, over a body this branch was written to
+      // discard. `staged` is typed too: it survived only because the regex coerced it.
+      typeof id !== 'string' ||
+      typeof staged !== 'string' ||
       !id ||
-      !STAGED_FILE_NAME.test(staged ?? '') ||
+      !STAGED_FILE_NAME.test(staged) ||
       // The intent path is a deterministic function of the id: a body whose id does not hash to
       // this filename is corruption or operator error, and applying it would reconcile the WRONG
       // id. Treat it as malformed. Either hash name is accepted so an intent written before the
@@ -441,6 +492,17 @@ export async function createIntentJournal(
     ) {
       // A partial/malformed intent means its commit never started (intents are written before
       // renames): discard it; an orphaned staged file, if any, is handled by the sweep.
+      //
+      // LOGGED, unlike before: this was the one reconciliation outcome that left no trace, and the
+      // assumption behind discarding silently — that a malformed body can only mean the write never got
+      // going — holds against process death but not against power loss, where the commit rename's
+      // metadata can be journaled while the intent file's data blocks are not. A zero-length intent
+      // beside a genuinely mixed on-disk state then reads as "never started" and the id keeps serving
+      // two versions, one per read path, with nothing anywhere saying so.
+      logger.warn(`Discarded a malformed intent journal; if content for this id reads inconsistently, repair it`, {
+        intent: path.basename(intentPath),
+        bytes: body.length
+      })
       await removeIntentOrThrow(intentPath, 'Discarding a malformed intent journal failed')
       return
     }
@@ -509,7 +571,8 @@ export async function createIntentJournal(
     counterpartPath: string,
     rename: (from: string, to: string) => Promise<void>,
     signal?: AbortSignal,
-    onCommitted?: () => void
+    onCommitted?: () => void,
+    onCounterpartRemoved?: () => void
   ): Promise<void> {
     // A pending intent means a previous commit for this id failed its cleanup in this process:
     // repair first (throws if impossible), so the intent written below always describes a
@@ -571,6 +634,11 @@ export async function createIntentJournal(
     // discharge the journal over a commit that DID land and leave a permanent mixed state with
     // nothing left to reconcile it.
     if (renamed) onCommitted?.()
+    if (!hadCounterpart) {
+      // Nothing to remove, so the counterpart is trivially gone. Reported so a caller can use one rule
+      // for both shapes rather than special-casing the fresh-id commit.
+      onCounterpartRemoved?.()
+    }
     if (hadCounterpart) {
       await noFailUnlink(counterpartPath)
       let counterpartGone: boolean
@@ -594,6 +662,9 @@ export async function createIntentJournal(
             `the id is quarantined from reads until a retry, read-triggered repair or restart completes the cleanup.`
         )
       }
+      // Proven gone: past the `counterpartGone` guard above, which throws otherwise. Reported before
+      // the journal discharge, which can fail on its own without resurrecting the counterpart.
+      onCounterpartRemoved?.()
       if (intentPath) {
         await removeIntentOrThrow(intentPath, `Committed ${id} but could not discharge its intent journal`)
       }
@@ -611,19 +682,7 @@ export async function createIntentJournal(
     // because nothing recreated it. Shard directories already self-heal exactly this way; the
     // reserved directory was the one place that did not. Only the directory is recreated: the
     // ownership marker and its checks belong to construction, which already proved this root is ours.
-    async ensureTempDir(): Promise<void> {
-      await fs.mkdir(tempDir, { recursive: true })
-      // The marker is not a check, it is the EVIDENCE the next construction consumes: without it, a
-      // flat-mode root whose staging directory was healed refuses to start as soon as a crash leaves
-      // one staged file behind ("contains files this storage cannot prove it owns"). Healing would
-      // otherwise turn a transient outage into a permanent, operator-only one.
-      if (!useHashPrefix && !(await existsForInvariant(path.join(tempDir, OWNERSHIP_MARKER)))) {
-        await pipe(
-          Readable.from([Buffer.from(OWNERSHIP_MARKER_CONTENT)]),
-          fs.createWriteStream(path.join(tempDir, OWNERSHIP_MARKER))
-        )
-      }
-    },
+    ensureTempDir,
 
     // Commits a staged file onto its canonical primary path and removes the other representation.
     // The logical object spans two paths (raw and .gzip) but only the rename is atomic, so when a
@@ -639,10 +698,21 @@ export async function createIntentJournal(
       counterpartPath,
       rename,
       signal,
-      onCommitted
+      onCommitted,
+      onCounterpartRemoved
     ): Promise<void> {
       try {
-        await doCommitRepresentation(op, id, stagedPath, primaryPath, counterpartPath, rename, signal, onCommitted)
+        await doCommitRepresentation(
+          op,
+          id,
+          stagedPath,
+          primaryPath,
+          counterpartPath,
+          rename,
+          signal,
+          onCommitted,
+          onCounterpartRemoved
+        )
       } catch (err) {
         // The commit phase's own cancellation checkpoints throw the caller's abort reason and nothing
         // else, so identity is the whole test: pass that through untouched (it IS a cancellation, and
@@ -676,7 +746,19 @@ export async function createIntentJournal(
 
     async ensureReconciled(id: string): Promise<boolean> {
       if (!unreconciledIds.has(id)) return true
-      const filePath = await resolveFilePath(id)
+      // Inside the try that makes this method's documented "never throws" true. `resolveFilePath` can
+      // reject — a `tempDirectoryName` or `disablePrefixHash` change between runs makes an id that
+      // resolved at store time stop resolving — and from here that escaped into `assertNotQuarantined`,
+      // past the repair gate whose whole purpose is to answer with a boolean.
+      let filePath: string
+      try {
+        filePath = await resolveFilePath(id)
+      } catch (err) {
+        logger.warn(`Read-triggered repair of the mixed state for ${id} failed; reads stay refused`, {
+          error: err instanceof Error ? err.message : String(err)
+        })
+        return false
+      }
       return withPathLock(filePath, async () => {
         if (!unreconciledIds.has(id)) return true
         try {
@@ -728,10 +810,20 @@ export async function createIntentJournal(
         try {
           await applyPendingIntent(path.join(tempDir, name))
         } catch (err: any) {
+          // The remedy has to name what an operator can actually DO. The previous wording said "fix the
+          // underlying filesystem issue (permissions, immutability)", which is right for a journal that
+          // could not be removed but wrong for the other way this fails: an intent whose id has neither a
+          // staged file nor a committed representation is unrepairable no matter how healthy the
+          // filesystem is, and the only way forward is to delete the journal — a file the message never
+          // named, in a directory documented as reserved.
           throw new Error(
             `Refusing to start: ${err instanceof Error ? err.message : String(err)} ` +
-              `The intent journal '${name}' under '${tempDirName}' was kept; fix the underlying filesystem issue ` +
-              `(permissions, immutability) and restart.`
+              `The intent journal '${name}' under '${tempDirName}' was kept, so this will fail identically on every ` +
+              `restart until it is resolved. If the cause is a filesystem fault (permissions, immutability, a ` +
+              `read-only mount), fix that and restart. If the journal is unrepairable — its id has neither a staged ` +
+              `file nor a committed representation, so there is nothing left to reconcile — remove ` +
+              `'${path.join(tempDir, name)}' to discard the repair instruction, then restart; the id's content is ` +
+              `re-fetchable because it is content-addressed.`
           )
         }
       }

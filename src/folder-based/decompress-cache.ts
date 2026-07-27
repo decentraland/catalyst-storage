@@ -44,6 +44,15 @@ export type DecompressCache = {
   /** Starts tracking a freshly committed decompressed file. Must be called under the path lock. */
   record(filePath: string, size: number): void
   /**
+   * Protects `filePath` from LRU eviction while a read still needs it, returning the release function.
+   *
+   * `retrieve` hands back a LAZY ContentItem, so between committing a decompressed file and the consumer
+   * opening it there is a window in which LRU could unlink it and turn present content into an ENOENT.
+   * `graceMs` bounds the pin so an item that is never consumed cannot exempt its entry indefinitely.
+   * TTL eviction is not affected: an entry past its TTL is stale regardless of who is holding it.
+   */
+  pin(filePath: string, graceMs: number): () => void
+  /**
    * Drops the tracking entry WITHOUT unlinking the file. Used when the canonical path stops being a
    * derived cache and becomes primary content (a store landed there): a stale entry would let
    * TTL/size eviction delete the only copy of the new content.
@@ -58,6 +67,8 @@ export type DecompressCache = {
   remove(filePath: string): Promise<boolean>
   /** Refreshes the last-access time used by TTL and LRU eviction. */
   touch(filePath: string): void
+  /** Whether this path is currently tracked as a derived cache file. */
+  isTracked(filePath: string): boolean
   /** Runs one eviction pass (TTL, then LRU down to the size budget), deduplicated while in flight. */
   evict(): Promise<void>
   /** Evicts every tracked file, to prevent disk leaks across restarts. */
@@ -69,7 +80,24 @@ export type DecompressCacheOptions = {
   ttl: number
   /** Total size budget in bytes; the least recently used entries are evicted past it. */
   maxSize: number
+  /**
+   * How many inflations may run at once. Admission is checked only AFTER an inflated file has been
+   * committed, and the eviction it triggers is deliberately not awaited (it needs the path lock the
+   * caller still holds), so this is what actually bounds the overshoot: worst case
+   * `maxConcurrentInflations × decompressMaxFileSize` above `maxSize`. Unbounded, it was
+   * `request concurrency × decompressMaxFileSize` — measured at 36x over budget with 50 concurrent cold
+   * range reads, and ~12.8 GB of derived files at the shipped defaults.
+   *
+   * Excess inflations QUEUE rather than fail: a range read of present content must still be served.
+   *
+   * Optional so a caller that does not care about the overshoot bound (the tests that exercise eviction
+   * directly) need not state one; the storage component always passes its configured value.
+   */
+  maxConcurrentInflations?: number
 }
+
+/** Used when `maxConcurrentInflations` is not given. The storage component supplies its own default. */
+const DEFAULT_MAX_CONCURRENT_INFLATIONS_FALLBACK = 4
 
 export function createDecompressCache(
   components: { logger: ILoggerComponent.ILogger; fsInvariants: FsInvariants },
@@ -95,6 +123,61 @@ export function createDecompressCache(
 
   // Bounded by in-flight decompressions.
   const inflightTokens = new Map<string, InvalidationToken>()
+
+  /**
+   * Admission gate for inflations, bounding how far the cache can run over budget.
+   *
+   * FIFO so a burst cannot starve its earliest arrival. Held across the whole inflation — including the
+   * commit rename and `record` — so `maxConcurrentInflations` really is the number of inflated files that
+   * can be in flight at once, which is what makes the overshoot bound in `DecompressCacheOptions` true.
+   */
+  /**
+   * Paths a range read is currently depending on, by reference count.
+   *
+   * Held from just before an inflation until the read that caused it has produced its item, so LRU cannot
+   * unlink the file that read is about to open. Every pin carries a timer that releases it, because the
+   * item `retrieve` returns is LAZY and a consumer is free never to open it — without the expiry a
+   * never-consumed item would pin its entry for the life of the process and quietly exempt it from the
+   * size budget, which is the same class of leak as the untracked orphan this cache already guards.
+   */
+  const pins = new Map<string, number>()
+
+  function pin(filePath: string, graceMs: number): () => void {
+    pins.set(filePath, (pins.get(filePath) ?? 0) + 1)
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      const remaining = (pins.get(filePath) ?? 1) - 1
+      if (remaining > 0) pins.set(filePath, remaining)
+      else pins.delete(filePath)
+    }
+    const expiry = setTimeout(release, graceMs)
+    // Never keep the process alive for a pin; the cache is a disk-space optimisation, not work in flight.
+    expiry.unref?.()
+    return () => {
+      clearTimeout(expiry)
+      release()
+    }
+  }
+
+  let activeInflations = 0
+  const inflationQueue: Array<() => void> = []
+  const maxConcurrentInflations = options.maxConcurrentInflations ?? DEFAULT_MAX_CONCURRENT_INFLATIONS_FALLBACK
+
+  async function acquireInflationSlot(): Promise<void> {
+    if (activeInflations < maxConcurrentInflations) {
+      activeInflations++
+      return
+    }
+    await new Promise<void>((resolve) => inflationQueue.push(resolve))
+    activeInflations++
+  }
+
+  function releaseInflationSlot(): void {
+    activeInflations--
+    inflationQueue.shift()?.()
+  }
 
   const pathLocks = new Map<string, Promise<unknown>>()
   function withPathLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
@@ -181,6 +264,21 @@ export function createDecompressCache(
   let evictionRequestedAgain = false
   /** Set when a pass ends over budget having freed nothing, so retries wait for the timer. */
   let evictionStalled = false
+  /**
+   * How many entries were tracked when the stall was recorded.
+   *
+   * The stall exists to stop admission-triggered passes from spinning on a failing unlink, but it was
+   * cleared ONLY by `evict()`, which admission never reaches while stalled — so the only thing that could
+   * clear it was the interval installed by `start()`, and a storage used without `start()` lost on-disk
+   * bounding permanently (measured: 5 of 5 decompressed copies retained against a 10-byte budget, versus
+   * 1 of 5 with the timer running). The FIRST pass is routinely unproductive — a single entry over budget
+   * has nothing evictable but the protected MRU entry — so this was reachable on an ordinary config.
+   *
+   * Comparing the entry count is what distinguishes the two stall causes without conflating them: a new
+   * admission means a new eviction candidate exists (the entry protected as most-recent no longer is), so
+   * a retry can now make progress; a failing unlink with no new entries still waits for the timer.
+   */
+  let stalledAtEntryCount = 0
 
   async function runEviction() {
     const now = Date.now()
@@ -212,6 +310,13 @@ export function createDecompressCache(
       for (const [filePath, entry] of entries) {
         if (evictable-- <= 0) break
         if (totalCacheSize <= options.maxSize) break
+        // A PINNED entry belongs to a range read that is still between committing this file and opening
+        // it. "Stop before the last entry" protects exactly one, which is a guarantee for one reader and
+        // no more: with concurrent inflations of distinct ids an entry stops being the most recent as
+        // soon as another lands, and 20 concurrent reads of present gzip-only ids produced a spurious
+        // ENOENT — content that was never missing, surfaced to the caller as a 5xx by the read contract.
+        // `continue`, not `break`: a pinned entry must not shield the older ones behind it from eviction.
+        if (pins.has(filePath)) continue
         await evictEntrySafely(filePath, entry, entry.lastAccess)
       }
     }
@@ -225,8 +330,10 @@ export function createDecompressCache(
     const freedSomething = totalCacheSize < before
     if (totalCacheSize > options.maxSize && !freedSomething) {
       evictionStalled = true
+      stalledAtEntryCount = entries.size
       return
     }
+    evictionStalled = false
     if ((evictionRequestedAgain || totalCacheSize > options.maxSize) && freedSomething) {
       evictionRequestedAgain = false
       await runEviction()
@@ -257,6 +364,7 @@ export function createDecompressCache(
     withPathLock,
     forget,
     evict,
+    pin,
     inflight: () => inflightDecompressions.values(),
     invalidateInflight(filePath: string): void {
       const token = inflightTokens.get(filePath)
@@ -267,6 +375,10 @@ export function createDecompressCache(
       const isOwner = !pending
       if (!pending) {
         pending = (async () => {
+          // Queued BEFORE the token is registered and before any inflating starts, so a waiting caller
+          // holds no invalidation state and costs nothing but the promise it is parked on. Joiners of an
+          // already-in-flight inflation never queue — they share this one.
+          await acquireInflationSlot()
           const token: InvalidationToken = { invalidated: false }
           inflightTokens.set(filePath, token)
           try {
@@ -275,6 +387,7 @@ export function createDecompressCache(
             if (inflightTokens.get(filePath) === token) {
               inflightTokens.delete(filePath)
             }
+            releaseInflationSlot()
           }
         })()
         inflightDecompressions.set(filePath, pending)
@@ -297,6 +410,11 @@ export function createDecompressCache(
       // an eviction immediately. `evict()` deduplicates itself, so a burst schedules one pass, not
       // one per entry; it is deliberately not awaited — `record` runs inside a commit holding this
       // path's lock, and the eviction it starts needs that same lock.
+      // A stall that was recorded with FEWER entries than are tracked now is no longer good evidence that
+      // a pass would be unproductive: this admission is itself a fresh candidate. See `stalledAtEntryCount`.
+      if (evictionStalled && entries.size > stalledAtEntryCount) {
+        evictionStalled = false
+      }
       if (totalCacheSize > options.maxSize && !evictionStalled) {
         if (inflightEviction) {
           evictionRequestedAgain = true
@@ -319,6 +437,7 @@ export function createDecompressCache(
       entries.delete(filePath)
       return true
     },
+    isTracked: (filePath: string) => entries.has(filePath),
     touch(filePath: string): void {
       const entry = entries.get(filePath)
       if (entry) {

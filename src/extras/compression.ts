@@ -1,4 +1,3 @@
-import destroy from 'destroy'
 import * as nodeFs from 'fs'
 import * as path from 'path'
 import { Readable, Transform, Writable } from 'stream'
@@ -6,6 +5,7 @@ import { pipeline } from 'stream/promises'
 import { createGzip } from 'zlib'
 import { ILoggerComponent } from '@well-known-components/interfaces'
 import { IFileSystemComponent } from '../fs/types'
+import { destroyAllQuietly } from '../stream-teardown'
 
 /**
  * The filesystem surface compression needs: the two streams, a size probe and a cleanup unlink.
@@ -166,11 +166,14 @@ async function gzipCompressFile(
       // `createWriteStream` throws, `pipeline` never takes ownership of it, so nothing else will
       // ever destroy it and its native zlib deflate state (~16KB) is held until GC — on a failure
       // loop, once per attempt.
-      for (const stream of [source, gzip, counter, destination]) {
-        if (!stream) continue
-        stream.on('error', () => undefined)
-        destroy(stream)
-      }
+      // `destroyAllQuietly`, not a hand-rolled loop. This was the one teardown site in the package that
+      // was not exception-safe: a `destroy()` that THROWS — a custom adapter's stream, an already-detached
+      // handle — replaced the real pipeline error (an ENOSPC on the staged write is the one that matters)
+      // with the teardown's own, skipped the remaining streams so the staged-gzip write descriptor and
+      // zlib's deflate state stayed held, and, because the throw escaped the `finally` rather than the
+      // `try`, meant `removeOutput` never ran and a partial staged `.gzip` was left behind. The shared
+      // helper exists for exactly this and every sibling teardown already used it.
+      destroyAllQuietly(source, gzip, counter, destination)
     }
 
     // Reaching here means the 1.1 rule is already satisfied, so there is nothing left to check: the

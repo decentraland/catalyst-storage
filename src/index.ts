@@ -56,6 +56,16 @@ export { PathNotContainedError, UncommittedIntentSurvivedError } from './folder-
 // a conforming `ContentItem`.
 export { bufferToStream, SimpleContentItem, streamToBuffer } from './content-item'
 
+/**
+ * Lets a caller ask, BEFORE calling `storeStream`, whether the source it holds is still storable.
+ *
+ * Exported because the rule it enforces is one a caller can otherwise only discover by failing: a body
+ * that has been read from — to hash it, to sniff its type, to measure it — cannot supply the content any
+ * more, and every backend refuses it. A caller that needs to inspect a body first can now check the
+ * source it is about to hand over rather than finding out from a rejected store.
+ */
+export { assertStorableStream } from './content-item'
+
 // Names the injectable detector in `S3ContentStorageOptions`, so that option is usable from a typed
 // callback rather than only from an inline literal.
 export type { FileTypeLoader } from './mime-detection'

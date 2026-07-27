@@ -83,6 +83,28 @@ function destroyQuietly(stream: Readable): void {
   stream.destroy()
 }
 
+/**
+ * Releases a source a FAILED store never took ownership of.
+ *
+ * Every backend validates the id before it starts piping, and a rejection there — `PathNotContainedError`
+ * for a traversing, empty, over-long or reserved id — left the caller's stream open forever: nothing had
+ * piped it, so nothing destroyed it, and an `fs.ReadStream` has no finalizer, so not even GC reclaimed
+ * it. A service that passes untrusted ids to `storeStream` (exactly the threat model that error exists
+ * for) leaked one descriptor — or one undrained request socket — per rejected call until EMFILE took
+ * down all storage with it. Measured at 30 leaked descriptors per 30 rejected calls, on every backend.
+ *
+ * Safe on every rejection path, not just that one: a store that failed mid-pipe has already had its
+ * source destroyed by `pipeline`, and destroying an ended or already-destroyed stream is a no-op. Runs
+ * AFTER the error is in hand and never replaces it — the teardown is silent by construction.
+ */
+function releaseUnconsumedSource(stream: Readable): void {
+  try {
+    if (!stream.destroyed) destroyQuietly(stream)
+  } catch {
+    // Best-effort: the operation's own rejection is what the caller needs to see.
+  }
+}
+
 function abortReasonOf(signal: AbortSignal): unknown {
   // `??` would also replace an explicit `null` abort reason; the caller must observe their own
   // cancellation cause, so only default when no reason was provided at all.
@@ -114,7 +136,12 @@ export async function runStoreWithSignal<T>(
   onAbort?: () => void
 ): Promise<T> {
   if (!signal) {
-    return operation()
+    try {
+      return await operation()
+    } catch (error) {
+      releaseUnconsumedSource(stream)
+      throw error
+    }
   }
   if (signal.aborted) {
     try {
@@ -161,6 +188,11 @@ export async function runStoreWithSignal<T>(
     // error, a source that closed prematurely on its own — surface as themselves; the marker check
     // is a hard override guaranteeing commit-phase errors are never translated even if one ever
     // matched a teardown shape.
+    //
+    // Released AFTER the translation decision is made from state already captured: the abort path has
+    // destroyed this source already (so this is a no-op there), and the paths that have NOT — an id
+    // rejected before any piping started — are the leak this closes.
+    releaseUnconsumedSource(stream)
     throw signal.aborted && isAbortTeardownError(error, signal, teardown) && !isNonCancellationError(error)
       ? abortReasonOf(signal)
       : error

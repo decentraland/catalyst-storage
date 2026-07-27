@@ -21,6 +21,7 @@ import {
   validateRange
 } from './types'
 import { assertStorableStream, contentCodingOf, normalizeContentEncoding, SimpleContentItem } from './content-item'
+import { assertStorableContentId } from './content-id'
 import { isAbortError, runStoreWithSignal } from './cancellation'
 import { destroyQuietly } from './stream-teardown'
 import { forEachWithConcurrency, mapWithConcurrency } from './concurrency'
@@ -80,6 +81,20 @@ export type S3ContentStorageOptions = {
    * authorization failure (rotated credentials, clock skew, a revoked policy) surfaces as an error.
    */
   report403AsAbsent?: boolean
+  /**
+   * Part size in bytes for the managed multipart upload. Defaults to lib-storage's own 5 MiB minimum.
+   *
+   * This is what sets the largest object a single store can write. Bodies reach lib-storage wrapped by the
+   * MIME head-peek, and that wrapper exposes no length — it is not an `fs.ReadStream` and has no
+   * `length`/`size`/`byteLength` — so lib-storage cannot right-size parts the way it does for a Buffer or
+   * a file stream. It falls back to the 5 MiB minimum, and with S3's 10,000-part limit that caps a store at
+   * roughly 50 GiB, which is only reported as `Exceeded 10000 parts` AFTER 50 GiB has crossed the wire.
+   *
+   * Raise it for a deployment that stores objects near or past that ceiling (64 MiB parts lift it to about
+   * 640 GiB) at the cost of proportionally more memory per concurrent upload, since lib-storage buffers a
+   * part at a time. Scene assets are nowhere near it, hence the unchanged default.
+   */
+  partSize?: number
 }
 
 /** S3's hard per-request limit for `DeleteObjects`; the SDK does not split a larger list. */
@@ -179,6 +194,28 @@ type SendOptions = NonNullable<Parameters<S3Client['send']>[1]>
 const UNCANCELLABLE_COMMANDS = new Set(['AbortMultipartUploadCommand'])
 
 /**
+ * Whether this command is the multipart create whose `UploadId` the store needs to capture.
+ *
+ * `CreateMultipartUploadCommand` is not imported (nothing here constructs one — lib-storage does), so this
+ * cannot use `instanceof` the way the abort exemption now does. Matching the input shape as well as the
+ * name gives it a second, mangling-proof signal: the create is the only command lib-storage issues that
+ * carries a `Bucket` and `Key` with no `UploadId` and no `Body`.
+ */
+function isCreateMultipartUpload(command: any): boolean {
+  if (command?.constructor?.name === 'CreateMultipartUploadCommand') return true
+  const input = command?.input
+  return (
+    !!input &&
+    typeof input.Bucket === 'string' &&
+    typeof input.Key === 'string' &&
+    input.UploadId === undefined &&
+    input.Body === undefined &&
+    input.Delete === undefined &&
+    input.Prefix === undefined
+  )
+}
+
+/**
  * Returns a client that behaves exactly like `s3` but attaches `signal` to the requests it issues.
  *
  * This exists because `@aws-sdk/lib-storage` calls `client.send(command)` with no request options, so
@@ -204,15 +241,34 @@ const UNCANCELLABLE_COMMANDS = new Set(['AbortMultipartUploadCommand'])
 function createAbortableClient(
   s3: S3Client,
   signal: AbortSignal,
-  onMultipartCreated: (uploadId: string) => void
+  onMultipartCreated: (uploadId: string) => void,
+  /**
+   * Called when the multipart create is ISSUED, before its response is known.
+   *
+   * The upload id can only be captured from a create that RESOLVES, so an abort landing while the create
+   * is in flight leaves a store that cannot clean up after itself: the `.then` that captures the id and
+   * the one in which lib-storage builds its own abort command are both on the rejected path, so zero
+   * `AbortMultipartUpload` requests are issued for an upload S3 may well have created. Knowing the create
+   * was attempted is what lets that be reported rather than passing silently.
+   */
+  onMultipartCreateIssued: () => void
 ): S3Client {
   const send = (command: any, sendOptions?: SendOptions): unknown => {
-    if (UNCANCELLABLE_COMMANDS.has(command?.constructor?.name)) {
+    // `instanceof` FIRST, name second. The name check exists because client-s3 is a peer dependency of
+    // lib-storage and a hoisted second copy would fail an identity test — sound reasoning, but it settled
+    // on `constructor.name`, which `esbuild --minify` and webpack's `mangleExports` rewrite. Lambda-bundled
+    // consumers do exactly that, and the failure is SILENT: the cleanup inherits the already-aborted
+    // signal, `AbortMultipartUpload` never leaves the process, and every cancelled multipart store leaks
+    // parts that are billed until a lifecycle rule reaps them. The identity check costs nothing when it
+    // holds, and the name check still covers the duplicated-copy case when it does not.
+    if (command instanceof AbortMultipartUploadCommand || UNCANCELLABLE_COMMANDS.has(command?.constructor?.name)) {
       return s3.send(command, sendOptions)
     }
     const withAbortSignal: SendOptions = { ...sendOptions, abortSignal: signal }
+    const isCreate = isCreateMultipartUpload(command)
+    if (isCreate) onMultipartCreateIssued()
     const result = s3.send(command, withAbortSignal)
-    if (command?.constructor?.name === 'CreateMultipartUploadCommand') {
+    if (isCreate) {
       // Capture the upload id as it is issued. lib-storage keeps it private and only cleans it up on
       // the paths that run BEFORE `CompleteMultipartUpload`, so this is what lets the caller abort an
       // upload whose complete request was torn down — without reaching into the SDK's internals.
@@ -481,11 +537,20 @@ export async function createS3BasedFileSystemContentStorage(
     // Set once lib-storage escalates to a multipart upload, so a failed or cancelled store can clean
     // its parts up itself.
     let multipartUploadId: string | undefined
+    // Set when the multipart create was issued, whether or not its response ever arrived.
+    let multipartCreateIssued = false
     // Requests issued by the managed upload carry this signal, so cancelling tears the in-flight
     // request down instead of merely losing the race inside `done()`. See createAbortableClient.
-    const abortableClient = createAbortableClient(s3, uploadAbort.signal, (uploadId) => {
-      multipartUploadId = uploadId
-    })
+    const abortableClient = createAbortableClient(
+      s3,
+      uploadAbort.signal,
+      (uploadId) => {
+        multipartUploadId = uploadId
+      },
+      () => {
+        multipartCreateIssued = true
+      }
+    )
     await runStoreWithSignal(
       stream,
       signal,
@@ -537,6 +602,23 @@ export async function createS3BasedFileSystemContentStorage(
                 })
               }
             }
+          } else if (multipartCreateIssued) {
+            // The create was issued but never answered — the abort tore it down in flight. S3 may still
+            // have processed the request, in which case a multipart upload exists that NOTHING can abort:
+            // its id only ever existed in the response that was discarded.
+            //
+            // Deliberately not "cleaned up" automatically. The only lookup available,
+            // `ListMultipartUploads` for this key, cannot distinguish this orphan from a CONCURRENT
+            // legitimate upload of the same id, and aborting that would fail a healthy store. Since no
+            // part was uploaded, nothing is billed for storage — the cost is an entry in
+            // `ListMultipartUploads` — so reporting it is the proportionate response.
+            logger.warn(
+              `The multipart upload of ${id} was cancelled while it was being created, so its upload id was ` +
+                `never received and it cannot be aborted from here. No parts were uploaded, so nothing is billed ` +
+                `for storage, but a stale multipart upload may remain listed for this key. A bucket lifecycle ` +
+                `rule for incomplete multipart uploads reclaims it.`,
+              { key: id }
+            )
           }
           // We aborted this upload, so its AbortError is provably our teardown: report the caller's
           // reason. An abort error we did NOT cause (an SDK-internal request abort racing the
@@ -557,6 +639,13 @@ export async function createS3BasedFileSystemContentStorage(
       // `{done: true}` from an already-consumed stream and reports "no content", so this stored a
       // 0-byte object under the id and resolved. Same rule the folder-based and in-memory backends
       // apply — see `assertStorableStream`.
+      //
+      // The id is checked FIRST, as on the other two backends: one bad call must not produce a different
+      // typed error depending on which backend is behind it. An S3 key has no per-segment limit of its
+      // own, so this rule is enforced purely to keep the id namespace identical across backends — an id
+      // this accepted and the folder-based backend cannot store is the divergence these shared checks
+      // exist to prevent.
+      assertStorableContentId(id)
       assertStorableStream(stream)
       // Inspect only the head for MIME detection, then stream the body straight to S3 so large
       // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
@@ -574,6 +663,10 @@ export async function createS3BasedFileSystemContentStorage(
       upload = new Upload({
         client: abortableClient,
         abortController: uploadAbort,
+        // Omitted unless configured, so lib-storage keeps its own default rather than this passing an
+        // explicit `undefined` that could shadow it. See `partSize` for why the default caps a store at
+        // roughly 50 GiB.
+        ...(options.partSize !== undefined ? { partSize: options.partSize } : {}),
         params: {
           Bucket,
           Key: id,
@@ -632,7 +725,23 @@ export async function createS3BasedFileSystemContentStorage(
             new GetObjectCommand({
               Bucket,
               Key: id,
-              Range: range ? `bytes=${range.start}-${clampedEnd ?? range.end}` : undefined
+              Range: range ? `bytes=${range.start}-${clampedEnd ?? range.end}` : undefined,
+              // Pins the bytes to the VERSION the metadata above was read from. `size`, `encoding` and
+              // `contentSize` come from that HeadObject, while this GetObject runs whenever the consumer
+              // opens the stream — so a re-store in between served one version's bytes under another
+              // version's advertised length, with no error: a 100-byte object re-stored at 95 bytes
+              // answered a `{start:90,end:99}` range with 5 bytes under `size: 10`, which a caller
+              // forwarding `size` as Content-Length turns into a truncated response with a mismatched
+              // header. A shrink past `start` instead surfaced as a raw SDK `InvalidRange`.
+              //
+              // With the precondition the same race fails loudly as a 412 instead, which the read
+              // contract's "treat a failing stream as a retryable miss" already covers — and a retry
+              // re-heads the object and gets a consistent pair. The folder-based backend documents this
+              // same window as unavoidable for itself; S3 can actually close it, so it does.
+              //
+              // Omitted when the head returned no ETag (an S3-compatible endpoint that does not send one),
+              // which degrades to the previous behaviour rather than making every read fail.
+              IfMatch: obj.ETag
             })
           )
           // `Body` is optional in the v3 types and the runtime shape depends on the platform: in
@@ -756,14 +865,41 @@ export async function createS3BasedFileSystemContentStorage(
     }
 
     let output: ListObjectsV2CommandOutput
+    // Every token this enumeration has already followed. Relaxing the stop condition to `IsTruncated
+    // !== false` (see below) traded a guaranteed termination for one that depends on the server issuing a
+    // FRESH token each page — and the endpoints that relaxation exists for are exactly the ones where that
+    // is not guaranteed: a gateway echoing the request's `ContinuationToken` back as
+    // `NextContinuationToken` made this loop re-request the same page forever, re-yielding the same ids on
+    // every pass, so a GC or sync sweep never terminated and kept deleting the same ids.
+    const followedTokens = new Set<string>()
     do {
       output = await s3.send(new ListObjectsV2Command(params))
       if (output.Contents) {
         for (const content of output.Contents) {
-          yield content.Key!
+          // The SDK types `Key` as optional and it flows straight into a caller's sweep, where
+          // `delete([...ids])` would build `{ Key: undefined }` and fail or silently no-op the whole batch.
+          // AWS always sets it, so this only fires for an S3-compatible endpoint or a truncated parse.
+          if (typeof content.Key !== 'string') {
+            logger.warn('Skipping a listed object with no key while enumerating', {
+              bucket: Bucket,
+              prefix: prefix ?? ''
+            })
+            continue
+          }
+          yield content.Key
         }
       }
-      params.ContinuationToken = output.NextContinuationToken
+      const nextToken = output.NextContinuationToken
+      if (nextToken !== undefined && followedTokens.has(nextToken)) {
+        logger.warn(
+          'Stopping enumeration: the endpoint returned a continuation token it had already issued, which ' +
+            'would repeat the same page indefinitely. The listing may be incomplete.',
+          { bucket: Bucket, prefix: prefix ?? '', pagesListed: followedTokens.size }
+        )
+        return
+      }
+      if (nextToken !== undefined) followedTokens.add(nextToken)
+      params.ContinuationToken = nextToken
       // Continue on any continuation token unless the server explicitly said this page was the last.
       //
       // Both halves matter, in opposite directions. Requiring a TOKEN stops the infinite loop a
