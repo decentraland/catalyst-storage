@@ -942,6 +942,85 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
+  describe('and the directory was observed some way other than by storing its own id', () => {
+    // The contract is "a directory this instance created or observed", and three ways of learning one existed
+    // did not record it: a recursive `mkdir` recorded only the leaf it was asked for, a lookup that found a
+    // directory at a content path discarded the fact, and the enumeration walk opened directories without
+    // noting them. Each left a directory this instance provably saw outside the evidence the classifier reads,
+    // so its later removal was classified as an ordinary miss.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'observed-ways-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    describe('and it is an INTERMEDIATE directory a recursive mkdir created', () => {
+      beforeEach(async () => {
+        // Creates `<root>/a` and `<root>/a/b`; only the second is the dirname the store asked for.
+        await storage.storeStream('a/b/c', bufferToStream(Buffer.from('x')))
+        rmSync(path.join(flatRoot, 'a'), { recursive: true, force: true })
+      })
+
+      it('should reject a read under the intermediate directory it created', async () => {
+        // `a/other` was never stored, but the directory that would have held the answer is gone, so absence
+        // cannot be proven — and this instance created that directory, which is what makes it damage.
+        await expect(storage.exist('a/other')).rejects.toBeDefined()
+      })
+
+      it('should still reject the read whose own parent was recorded', async () => {
+        await expect(storage.exist('a/b/c')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and it was seen by a LOOKUP that found a directory at a content path', () => {
+      beforeEach(async () => {
+        await nodeFs.mkdir(path.join(flatRoot, 'd'), { recursive: true })
+        await nodeFs.writeFile(path.join(flatRoot, 'd', 'inner'), 'x')
+        // Reports `false` — a directory is not content — but the instance has now seen `<root>/d` be one.
+        expect(await storage.exist('d')).toBe(false)
+        rmSync(path.join(flatRoot, 'd'), { recursive: true, force: true })
+      })
+
+      it('should reject a later read nested under it', async () => {
+        await expect(storage.exist('d/inner')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and it was seen by ENUMERATION', () => {
+      beforeEach(async () => {
+        await nodeFs.mkdir(path.join(flatRoot, 'e'), { recursive: true })
+        await nodeFs.writeFile(path.join(flatRoot, 'e', 'inner'), 'x')
+        const listed: string[] = []
+        for await (const id of storage.allFileIds()) listed.push(id)
+        expect(listed).toEqual(['e/inner'])
+        rmSync(path.join(flatRoot, 'e'), { recursive: true, force: true })
+      })
+
+      it('should reject a later read nested under the walked directory', async () => {
+        await expect(storage.exist('e/inner')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and nothing was ever observed on the path', () => {
+      it('should still report an ordinary miss', async () => {
+        // The other side of the rule: recording more observations must not turn never-created trees into
+        // faults, or every unknown id in a fresh root would reject.
+        expect(await storage.exist('untouched/child')).toBe(false)
+      })
+    })
+  })
+
   describe('and the root observation has been dropped from the bounded cache', () => {
     // The root is seeded into `knownDirectories`, but that set is FIFO-bounded and the root is inserted
     // FIRST, so it is the first entry evicted once a flat-mode deployment observes more than

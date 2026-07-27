@@ -236,7 +236,9 @@ export async function createFolderBasedFileSystemContentStorage(
    *
    * Purely an optimization — `ensureDirectoryFor` runs on every write, and its probe was one syscall per
    * call. Nothing about correctness depends on it, which is why a write that fails ENOENT/ENOTDIR under an
-   * entry may simply drop it (`writingUnder`) and let the retry recreate the tree.
+   * entry may simply drop it (`writingUnder`) and let the retry recreate the tree, and why it is capped: a
+   * flat-mode caller supplying ids with separators can otherwise mint distinct parent paths without limit and
+   * retain them for the component's lifetime. Evicting one costs a single `stat` on the next write there.
    */
   const presentDirectories = new Set<string>()
 
@@ -255,19 +257,42 @@ export async function createFolderBasedFileSystemContentStorage(
     presentDirectories.delete(dirname)
   }
 
-  /** Records a directory as present AND as observed. Both paths that see one exist call this. */
-  function rememberDirectory(dirname: string): void {
-    presentDirectories.add(dirname)
-    if (observedDirectories.has(dirname) || dirname === root) return
-    // FIFO past the cap: insertion order, so the first key is the oldest. Losing an entry only costs that
-    // directory its damage report. Unreachable with hash prefixes (65,536 shards < the cap); reachable in
-    // flat mode, where ids nest arbitrarily. The ROOT is never stored — see `wasObserved`.
-    while (observedDirectories.size >= MAX_TRACKED_DIRECTORIES) {
-      const oldest = observedDirectories.values().next()
+  /**
+   * Adds to a capped set, evicting the OLDEST entry first — Sets iterate in insertion order, so that is the
+   * front. Both sets degrade gracefully when an entry is lost: the presence cache costs a `stat`, the
+   * observation log costs that directory its damage report. Unreachable with hash prefixes (65,536 shards <
+   * the cap); reachable in flat mode, where ids nest arbitrarily.
+   */
+  function addCapped(set: Set<string>, value: string): void {
+    if (set.has(value)) return
+    while (set.size >= MAX_TRACKED_DIRECTORIES) {
+      const oldest = set.values().next()
       if (oldest.done) break
-      observedDirectories.delete(oldest.value)
+      set.delete(oldest.value)
     }
-    observedDirectories.add(dirname)
+    set.add(value)
+  }
+
+  /**
+   * Records that `dirname` exists as a directory, AND that every ancestor up to the root does.
+   *
+   * The CHAIN, not just the leaf. A recursive `mkdir` creates all of it and a successful `stat`/`opendir`
+   * proves all of it, so each level is a genuine observation — and recording only the leaf left directories
+   * this instance had created outside the evidence `faultBehindAbsence` reads, so their later removal was
+   * classified as an ordinary miss. Stops at the first already-observed ancestor, so the hot path costs one
+   * lookup; only the presence cache needs the leaf, since that is what `ensureDirectoryFor` asks about.
+   */
+  function rememberDirectory(dirname: string): void {
+    addCapped(presentDirectories, dirname)
+    let candidate = dirname
+    while (!wasObserved(candidate)) {
+      addCapped(observedDirectories, candidate)
+      if (candidate === root) return
+      const parent = path.dirname(candidate)
+      // Defensive: `resolveFilePath` guarantees containment, so the root is always reached first.
+      if (parent === candidate || parent.length < root.length) return
+      candidate = parent
+    }
   }
 
   /**
@@ -474,7 +499,14 @@ export async function createFolderBasedFileSystemContentStorage(
       // here is what makes enumeration and the point lookups answer the same question. Directories are
       // never removed to make room — destroying something this storage cannot prove it owns is exactly
       // what the reserved-namespace checks refuse to do.
-      if (!stat.isFile()) return undefined
+      if (!stat.isFile()) {
+        // A DIRECTORY here is itself an observation: this instance has now seen that path be one, so its later
+        // removal is damage for ids nested under it rather than an ordinary miss. Recording only the id's
+        // parent above discarded that — a read-only replica that had seen `<root>/d` through `exist('d')`
+        // classified a later read of `d/inner` as absent.
+        if (stat.isDirectory()) rememberDirectory(filePath)
+        return undefined
+      }
       return stat
     } catch (err: any) {
       // ENAMETOOLONG joins ENOENT/ENOTDIR as PROVABLY absent: no file of that name can exist, so it
@@ -1550,7 +1582,11 @@ export async function createFolderBasedFileSystemContentStorage(
     // MAX_BUFFERED_DIRECTORY_ENTRIES. Dropped the moment it is not.
     let buffered: { name: string; isDirectory: boolean }[] | undefined = []
 
-    for await (const entry of await components.fs.opendir(folder, { bufferSize: 4000 })) {
+    const listing = await components.fs.opendir(folder, { bufferSize: 4000 })
+    // Opening it proves it is a directory, which is an observation like any other: enumeration is part of the
+    // read contract, so a directory this walk descended into must not read as never-having-existed afterwards.
+    rememberDirectory(folder)
+    for await (const entry of listing) {
       const isDirectory = entry.isDirectory()
       // Non-directory entries only: a DIRECTORY named `<id>.gzip` is another id's nesting, not a compressed
       // representation, and recording it would suppress a raw file that is a valid id of its own.
