@@ -1,6 +1,7 @@
 import { pipeline, Readable, Transform } from 'stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'zlib'
 import { ContentItem } from './types'
+import { destroyQuietly } from './stream-teardown'
 
 /**
  * Content-coding tokens that mean "these bytes are not encoded" (RFC 9110 §8.4.1). Normalized to
@@ -8,9 +9,6 @@ import { ContentItem } from './types'
  * does for any other unencoded content instead of reporting the logical size as unknown.
  */
 const IDENTITY_ENCODINGS = new Set(['', 'identity'])
-
-/** Absorbs a torn-down stream's trailing 'error', which would otherwise be an uncaught exception. */
-const ignoreStreamError = (): void => undefined
 
 /**
  * The value a `ContentItem` reports as its `encoding`, given a raw `Content-Encoding`.
@@ -122,9 +120,8 @@ export class SimpleContentItem implements ContentItem {
         decoder = createDecoderFor(coding)
       } catch (err) {
         // The source is already open; leaving it undestroyed would hold its descriptor for the life
-        // of the process. Listener first: it may still emit 'error' after being destroyed.
-        stream.on('error', ignoreStreamError)
-        stream.destroy()
+        // of the process.
+        destroyQuietly(stream)
         throw err
       }
       // `pipeline`, not `stream.pipe(decoder)`: pipe forwards neither errors nor teardown between the
@@ -168,30 +165,40 @@ function prematureClose(): Error {
 }
 
 /**
+ * Throws when `stream` cannot supply the content of a store, because it has already errored, already
+ * been consumed, or already been torn down.
+ *
+ * Every backend must refuse such a source rather than store what it yields, which is NOTHING. A
+ * consumed stream produces zero bytes and its pipe RESOLVES, so a store handed one committed an empty
+ * object and reported success — and in a content-addressed store that is permanent: `exist(id)`
+ * answers `true`, so the id is never re-fetched and the real content never lands. Reachable from any
+ * caller that inspects a body before storing it (a hash or size check) and from a retry that reuses
+ * its source.
+ *
+ * `streamToBuffer` has refused these four states from the start, for exactly this reason, which is why
+ * the in-memory backend rejected while the folder-based and S3 backends silently stored 0 bytes. The
+ * checks live here so all three share one rule; they are synchronous, so no event can slip in between.
+ *
+ * @public
+ */
+export function assertStorableStream(stream: Readable): void {
+  if (stream.errored) throw stream.errored
+  // Fully consumed by someone else: there are no bytes left to collect, and storing that as empty
+  // content is the silent-corruption case above.
+  if (stream.readableEnded || stream.destroyed || stream.closed) throw prematureClose()
+}
+
+/**
  * @public
  */
 export function streamToBuffer(stream: Readable): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     // A stream that has ALREADY settled will never emit 'end', 'error' or 'close' again, so the
-    // listeners below would never fire and this promise would hang forever. Reachable from a retry
-    // that reuses a source, or a caller that inspected the body before storing it — and the failure
-    // mode (a store that never settles) is far worse than the rejection it replaces. Checked
-    // synchronously, before any listener is attached, so no event can slip in between.
-    if (stream.errored) {
-      reject(stream.errored)
-      return
-    }
-    if (stream.readableEnded) {
-      // Fully consumed by someone else: there are no bytes left to collect, and reporting that as
-      // an empty buffer would silently store empty content. Premature-close is the same shape a
-      // destroyed source produces, and cancellation handling already recognizes it as teardown.
-      reject(prematureClose())
-      return
-    }
-    if (stream.destroyed || stream.closed) {
-      reject(prematureClose())
-      return
-    }
+    // listeners below would never fire and this promise would hang forever — a far worse failure than
+    // the rejection it replaces. Shared with the streaming backends via `assertStorableStream`, whose
+    // throw rejects this promise: the two must agree, or one backend stores 0 bytes for a source
+    // another rejects. Checked synchronously, before any listener is attached.
+    assertStorableStream(stream)
     const buffers: Uint8Array[] = []
     // Tracks settlement so the 'close' fallback below costs nothing on the graceful path: 'close'
     // always follows 'end'/'error', and building its error unconditionally captured a stack on

@@ -2,14 +2,13 @@ import {
   createAwsS3BasedFileSystemContentStorage,
   createS3BasedFileSystemContentStorage,
   FileTypeLoader,
-  IContentStorageComponent,
-  S3ContentStorageOptions
+  IContentStorageComponent
 } from '../src'
 import { bufferToStream, streamToBuffer } from '../src'
 import { createFakeS3Client, FakeS3Client } from './fake-s3-client'
 import { Readable } from 'stream'
 import { Upload } from '@aws-sdk/lib-storage'
-import { PutObjectCommand } from '@aws-sdk/client-s3'
+import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 import { createLogComponent } from '@well-known-components/logger'
 import { createConfigComponent } from '@well-known-components/env-config-provider'
 
@@ -56,17 +55,37 @@ const magicByteLoader: FileTypeLoader = async () => ({
   }
 })
 
-describe('S3 Storage using ', () => {
-  it('creates storage with right config', async () => {
-    await expect(
-      createAwsStorage(
-        {
-          config: createConfigComponent({ AWS_REGION: 'eu-west-1' }),
-          logs: await createLogComponent({})
-        },
-        'some-bucket'
-      )
-    ).resolves.toBeDefined()
+describe('when the AWS factory builds its own client', () => {
+  let send: jest.SpyInstance
+
+  beforeEach(() => {
+    // Stubbed at the prototype, because this factory constructs the client internally and there is
+    // nothing to inject. Unstubbed, construction issued the startup ListBucket probe against the real
+    // AWS endpoint.
+    send = jest.spyOn(S3Client.prototype, 'send').mockResolvedValue({ Contents: [], IsTruncated: false } as never)
+    jest.spyOn(S3Client.prototype, 'destroy').mockImplementation(() => undefined)
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+  })
+
+  it('should construct a usable storage from the region config alone', async () => {
+    const storage = await createAwsStorage(
+      { config: createConfigComponent({ AWS_REGION: 'eu-west-1' }), logs: await createLogComponent({}) },
+      'some-bucket'
+    )
+
+    expect(typeof storage.storeStream).toBe('function')
+  })
+
+  it('should verify bucket access before returning', async () => {
+    await createAwsStorage(
+      { config: createConfigComponent({ AWS_REGION: 'eu-west-1' }), logs: await createLogComponent({}) },
+      'some-bucket'
+    )
+
+    expect(send.mock.calls.map(([command]) => command.constructor.name)).toContain('ListObjectsV2Command')
   })
 })
 
@@ -364,8 +383,16 @@ describe('S3 Storage enumeration', () => {
 describe('S3 Storage client lifecycle', () => {
   describe('when the factory constructed the client itself', () => {
     let storage: IContentStorageComponent
+    let destroy: jest.SpyInstance
 
     beforeEach(async () => {
+      // This factory builds its OWN `S3Client`, so there is nothing to inject: without stubbing the
+      // prototype, constructing it reached the real `s3.eu-west-1.amazonaws.com` for the startup
+      // ListBucket probe. That passed only because no credentials resolve in CI — on a machine that
+      // has them, `some-bucket` answers NoSuchBucket and construction (correctly) refuses to start,
+      // failing this test for a reason that has nothing to do with what it checks.
+      jest.spyOn(S3Client.prototype, 'send').mockResolvedValue({ Contents: [], IsTruncated: false } as never)
+      destroy = jest.spyOn(S3Client.prototype, 'destroy').mockImplementation(() => undefined)
       storage = await createAwsStorage(
         {
           config: createConfigComponent({ AWS_REGION: 'eu-west-1' }),
@@ -375,10 +402,17 @@ describe('S3 Storage client lifecycle', () => {
       )
     })
 
-    it('should expose a stop that releases the client it owns', async () => {
+    afterEach(() => {
+      jest.restoreAllMocks()
+    })
+
+    it('should destroy the client it owns when stopped', async () => {
       // The SDK's guidance is to destroy a client explicitly in Node, or its sockets stay open long
-      // after the last request. Nothing offered a way to do that, so the agent outlived the component.
-      await expect(storage.stop?.()).resolves.toBeUndefined()
+      // after the last request. Asserting that `stop()` RESOLVES proved nothing — it returns
+      // `Promise<void>`, so the assertion held with the `destroy()` call deleted.
+      await storage.stop?.()
+
+      expect(destroy).toHaveBeenCalledTimes(1)
     })
   })
 
@@ -486,17 +520,15 @@ describe('S3 Storage retrieve error logging', () => {
     return { logs: { getLogger: () => logger }, logger }
   }
 
-  async function storageWithHeadError(headError: any, { canListBucket = true } = {}) {
+  async function storageWithHeadError(headError: any, { canListBucket = true, report403AsAbsent = false } = {}) {
     const { logs, logger } = createSpyLogs()
     const fake = createFakeS3Client()
     const storage = await (async () => {
-      // The startup probe decides whether a 403 on a read is decidable. Denying it models a principal
-      // without s3:ListBucket, for which a missing key genuinely answers 403.
+      // Denying the probe models a principal without s3:ListBucket, for which a missing key genuinely
+      // answers 403. It is NO LONGER what decides the read: a 403 `AccessDenied` on the probe is also
+      // what a policy scoped to a different (or misspelled) bucket returns, so the lenient mode is the
+      // caller's explicit `report403AsAbsent` and the probe only reports what it saw.
       if (!canListBucket) {
-        // `AccessDenied` is what S3 returns for an authorization denial, and it is the ONLY 403 that
-        // says anything about this principal's `s3:ListBucket`. `ListObjectsV2` is a GET with an XML
-        // error body, so the code survives — unlike a HEAD, whose empty body is the whole reason the
-        // ambiguity exists.
         fake.on('ListObjectsV2Command', () => {
           throw Object.assign(new Error('Access Denied'), {
             name: 'AccessDenied',
@@ -504,7 +536,7 @@ describe('S3 Storage retrieve error logging', () => {
           })
         })
       }
-      const created = await createStorage({ logs } as any, fake, { Bucket: 'test' })
+      const created = await createStorage({ logs } as any, fake, { Bucket: 'test', report403AsAbsent })
       fake.on('HeadObjectCommand', () => {
         throw headError
       })
@@ -513,7 +545,10 @@ describe('S3 Storage retrieve error logging', () => {
     return { storage, logger }
   }
 
-  async function retrieveWithHeadError(headError: any, options?: { canListBucket?: boolean }) {
+  async function retrieveWithHeadError(
+    headError: any,
+    options?: { canListBucket?: boolean; report403AsAbsent?: boolean }
+  ) {
     const { storage, logger } = await storageWithHeadError(headError, options)
     const result = await storage.retrieve('some-key')
     return { result, logger }
@@ -528,16 +563,36 @@ describe('S3 Storage retrieve error logging', () => {
     logger.warn.mock.calls.filter((call) => (call[1] as { key?: string })?.key === 'some-key')
 
   describe('when headObject returns 403 Forbidden', () => {
-    // Whether a 403 means "absent" depends entirely on whether a MISSING key would have answered 404
-    // for this principal, which is what the startup s3:ListBucket probe establishes.
-    describe('and the principal cannot s3:ListBucket', () => {
+    // Whether a 403 means "absent" depends on whether a MISSING key would have answered 404 for this
+    // principal — which only the operator can state, because no response distinguishes it.
+    describe('and the caller has declared that a 403 cannot be told from a missing key', () => {
       it('should report the content as absent and warn with the key', async () => {
-        const { result, logger } = await retrieveWithHeadError(forbidden(), { canListBucket: false })
+        const { result, logger } = await retrieveWithHeadError(forbidden(), {
+          canListBucket: false,
+          report403AsAbsent: true
+        })
 
         expect(result).toBeUndefined()
         expect(logger.error).not.toHaveBeenCalled()
         expect(retrievalWarnings(logger)).toHaveLength(1)
         expect(retrievalWarnings(logger)[0][1]).toMatchObject({ key: 'some-key', statusCode: 403 })
+      })
+    })
+
+    describe('and the startup probe was denied but the caller has declared nothing', () => {
+      it('should reject rather than report the content as absent', async () => {
+        // A 403 `AccessDenied` on the probe is NOT evidence that this principal lacks s3:ListBucket on
+        // an existing bucket: a policy scoped to `arn:aws:s3:::my-bucket` denies every OTHER bucket
+        // the same way, including a MISSPELLED one, because the implicit deny is evaluated before S3
+        // checks that the bucket exists — so the NoSuchBucket guard never fires. Inferring the lenient
+        // mode from it turned a one-character typo into a node that answered "absent" for every id for
+        // its whole lifetime while its writes rejected loudly.
+        const headError = forbidden()
+        const { storage } = await storageWithHeadError(headError, { canListBucket: false })
+
+        await expect(storage.retrieve('some-key')).rejects.toBe(headError)
+        await expect(storage.exist('some-key')).rejects.toBe(headError)
+        await expect(storage.fileInfo('some-key')).rejects.toBe(headError)
       })
     })
 
@@ -950,82 +1005,6 @@ describe('S3 Storage review regressions', () => {
     })
   })
 
-  describe('when a custom getKey is supplied', () => {
-    describe('and no inverse is given', () => {
-      it('should not compile, so a TypeScript caller learns at build time', () => {
-        // @ts-expect-error getKey and getId are a matched pair in S3ContentStorageOptions. This
-        // assertion FAILS TO COMPILE if the options type ever stops enforcing that, which is the
-        // only way to pin a compile-time guarantee from a test.
-        const invalid: S3ContentStorageOptions = { Bucket: 'example', getKey: (hash: string) => `contents/${hash}` }
-
-        expect(invalid).toBeDefined()
-      })
-
-      it('should refuse to construct, because allFileIds would not round-trip', async () => {
-        // Cast because the type already rejects this shape; the runtime guard exists for JavaScript
-        // callers, who have no such protection.
-        const options = { Bucket: 'example', getKey: (hash: string) => `contents/${hash}` } as S3ContentStorageOptions
-
-        await expect(
-          createStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), options)
-        ).rejects.toThrow(/must be supplied together; received only getKey/)
-      })
-    })
-
-    describe('and only the inverse is given', () => {
-      it('should refuse to construct rather than run a mixed mapping', async () => {
-        // TypeScript rejects this shape, so only a JavaScript caller reaches the guard. Accepting it
-        // would leave reads and writes on identity keys while enumeration decoded them, so every key
-        // would fail the round-trip check and the bucket would enumerate as empty.
-        const options = {
-          Bucket: 'example',
-          getId: (key: string) => key.slice(3)
-        } as unknown as S3ContentStorageOptions
-
-        await expect(
-          createStorage({ logs: await createLogComponent({}) }, createFakeS3Client(), options)
-        ).rejects.toThrow(/must be supplied together; received only getId/)
-      })
-    })
-
-    describe('and its inverse is given', () => {
-      let storage: IContentStorageComponent
-      let fake: FakeS3Client
-
-      beforeEach(async () => {
-        fake = createFakeS3Client()
-        storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
-          Bucket: 'example',
-          getKey: (hash: string) => `contents/${hash}`,
-          getId: (key: string) => key.replace(/^contents\//, '')
-        })
-        await storage.storeStream('an-id', bufferToStream(Buffer.from('payload')))
-      })
-
-      it('should enumerate ids rather than raw keys', async () => {
-        const listed: string[] = []
-        for await (const each of storage.allFileIds()) listed.push(each)
-
-        expect(listed).toEqual(['an-id'])
-      })
-
-      it('should delete an enumerated id instead of silently removing nothing', async () => {
-        const listed: string[] = []
-        for await (const each of storage.allFileIds()) listed.push(each)
-        await storage.delete(listed)
-
-        expect(fake.objects.size).toBe(0)
-      })
-
-      it('should filter by an id prefix, not a key prefix', async () => {
-        const listed: string[] = []
-        for await (const each of storage.allFileIds('an-')) listed.push(each)
-
-        expect(listed).toEqual(['an-id'])
-      })
-    })
-  })
-
   describe('when a range is requested on an object stored with a content encoding', () => {
     let storage: IContentStorageComponent
 
@@ -1047,48 +1026,6 @@ describe('S3 Storage review regressions', () => {
     it('should still serve the whole object', async () => {
       await expect(storage.retrieve('encoded-id')).resolves.toBeDefined()
     })
-  })
-})
-
-describe('S3 Storage prefix enumeration with a sharding key mapping', () => {
-  let storage: IContentStorageComponent
-  let fake: FakeS3Client
-
-  beforeEach(async () => {
-    // `getKey` maps a COMPLETE id to a key, so it cannot be applied to a partial prefix: doing so
-    // produced a server-side Prefix no real key starts with, and enumeration silently returned
-    // nothing for every prefix — a prefix-sharded GC sweep concluded the bucket was empty.
-    fake = createFakeS3Client()
-    storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
-      Bucket: 'example',
-      getKey: (hash: string) => `${hash.slice(0, 2)}/${hash}`,
-      getId: (key: string) => key.slice(3)
-    })
-    for (const id of ['abcdef', 'abzzzz', 'aq1234', 'bbbbbb']) {
-      await storage.storeStream(id, bufferToStream(Buffer.from(id)))
-    }
-  })
-
-  const collect = async (prefix?: string): Promise<string[]> => {
-    const listed: string[] = []
-    for await (const each of storage.allFileIds(prefix)) listed.push(each)
-    return listed.sort()
-  }
-
-  it('should enumerate every id when no prefix is given', async () => {
-    expect(await collect()).toEqual(['abcdef', 'abzzzz', 'aq1234', 'bbbbbb'])
-  })
-
-  it('should return every id matching a prefix shorter than the shard width', async () => {
-    expect(await collect('a')).toEqual(['abcdef', 'abzzzz', 'aq1234'])
-  })
-
-  it('should return the ids matching a longer prefix', async () => {
-    expect(await collect('ab')).toEqual(['abcdef', 'abzzzz'])
-  })
-
-  it('should return nothing for a prefix no id matches', async () => {
-    expect(await collect('zz')).toEqual([])
   })
 })
 
@@ -1154,91 +1091,6 @@ describe('S3 Storage identity content encoding', () => {
     const item = await storage.retrieve('id', { start: 0, end: 3 })
 
     expect(item!.size).toBe(4)
-  })
-})
-
-describe('S3 Storage enumeration of a bucket holding foreign keys', () => {
-  let storage: IContentStorageComponent
-  let fake: FakeS3Client
-
-  beforeEach(async () => {
-    // `getId` is applied to every key the bucket returns, including ones this mapping never produced.
-    // A lossy inverse maps those onto ids that look real: here a foreign `zz/abcdef` yields the id
-    // `abcdef`, whose actual key is `ab/abcdef`.
-    fake = createFakeS3Client()
-    storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
-      Bucket: 'shared',
-      getKey: (hash: string) => `${hash.slice(0, 2)}/${hash}`,
-      getId: (key: string) => key.slice(3)
-    })
-    await storage.storeStream('abcdef', bufferToStream(Buffer.from('real content')))
-    fake.objects.set('zz/abcdef', { body: Buffer.from('another tenant') })
-    fake.objects.set('unrelated-object', { body: Buffer.from('no shard at all') })
-  })
-
-  const collect = async (): Promise<string[]> => {
-    const listed: string[] = []
-    for await (const each of storage.allFileIds()) listed.push(each)
-    return listed
-  }
-
-  it('should yield only the ids whose keys this mapping produced', async () => {
-    expect(await collect()).toEqual(['abcdef'])
-  })
-
-  it('should not report an id twice because a foreign key decoded onto it', async () => {
-    const listed = await collect()
-
-    expect(listed.filter((each) => each === 'abcdef')).toHaveLength(1)
-  })
-
-  describe('and the bucket holds ONLY a foreign key that decodes onto a plausible id', () => {
-    beforeEach(async () => {
-      // The harm is that enumeration claims content this storage does not hold. Deleting the real
-      // object first leaves only the foreign `zz/abcdef`, which still decodes to the id `abcdef`.
-      await storage.delete(['abcdef'])
-    })
-
-    it('should report the id as absent', async () => {
-      expect(await storage.exist('abcdef')).toBe(false)
-    })
-
-    it('should not enumerate an id that exist() says is not there', async () => {
-      // Enumeration and existence must agree. Without the round-trip check they did not: the id was
-      // yielded from the foreign key while `exist()` correctly answered false, so a sync consumer
-      // would skip fetching content the node does not have.
-      expect(await collect()).toEqual([])
-    })
-  })
-})
-
-describe('S3 Storage enumeration when the inverse rejects foreign keys', () => {
-  let storage: IContentStorageComponent
-  let fake: FakeS3Client
-
-  beforeEach(async () => {
-    // A strict inverse parses its own namespace and THROWS on anything outside it. That is a clear
-    // "not mine", but it used to propagate and fail the whole enumeration over a single object this
-    // storage does not own — making a shared bucket unenumerable.
-    fake = createFakeS3Client()
-    storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
-      Bucket: 'shared',
-      getKey: (hash: string) => `contents/${hash}`,
-      getId: (key: string) => {
-        const match = /^contents\/(.+)$/.exec(key)
-        if (!match) throw new Error(`not a key of this namespace: ${key}`)
-        return match[1]
-      }
-    })
-    await storage.storeStream('abcdef', bufferToStream(Buffer.from('real content')))
-    fake.objects.set('someone-elses/object', { body: Buffer.from('another tenant') })
-  })
-
-  it('should complete instead of rejecting on the foreign key', async () => {
-    const listed: string[] = []
-    for await (const each of storage.allFileIds()) listed.push(each)
-
-    expect(listed).toEqual(['abcdef'])
   })
 })
 

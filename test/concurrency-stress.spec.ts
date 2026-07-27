@@ -60,6 +60,16 @@ type StormResult = {
   corruptAtRest: string[]
   duplicateIds: string[]
   injectedFaults: number
+  /**
+   * Reads that actually delivered a complete, verified version of an id.
+   *
+   * Every other field here is a list of VIOLATIONS asserted to be empty, and `if (!item) continue`
+   * swallows a miss — so a storage that stored nothing at all satisfied almost all of them. Counting
+   * the work that succeeded is what makes the suite fail when the storage stops doing any.
+   */
+  verifiedReads: number
+  /** Stores that completed, for the same reason. */
+  completedStores: number
 }
 
 async function runStorm(options: { seed: number; injectFaults?: boolean }): Promise<StormResult> {
@@ -89,7 +99,9 @@ async function runStormIn(
     mixedStates: [],
     corruptAtRest: [],
     duplicateIds: [],
-    injectedFaults: 0
+    injectedFaults: 0,
+    verifiedReads: 0,
+    completedStores: 0
   }
 
   const root = mkdtempSync(path.join(os.tmpdir(), 'stress-'))
@@ -135,6 +147,7 @@ async function runStormIn(
           const body = bodyFor(version)
           if (rnd() < 0.6) await storage.storeStreamAndCompress(id, bufferToStream(body))
           else await storage.storeStream(id, bufferToStream(body))
+          result.completedStores++
         } else if (roll < 0.4) {
           await storage.delete([id])
         } else if (roll < 0.7) {
@@ -144,6 +157,8 @@ async function runStormIn(
           const version = versionOf(bytes)
           if (version === undefined || !bytes.equals(bodyFor(version))) {
             result.corruption.push(`full read of ${id} returned ${bytes.length} bytes that are not one version`)
+          } else {
+            result.verifiedReads++
           }
         } else {
           // Range from 0 keeps the version header inside the slice, so the expected bytes are exactly
@@ -157,6 +172,8 @@ async function runStormIn(
             result.corruption.push(
               `range read of ${id} [0,${end}] returned ${bytes.length} bytes that are not one version`
             )
+          } else {
+            result.verifiedReads++
           }
         }
       } catch (error: any) {
@@ -233,6 +250,15 @@ describe('folder-based storage under concurrent stores, deletes and range reads'
 
     it('should enumerate each surviving id exactly once', () => {
       expect(result.duplicateIds).toEqual([])
+    })
+
+    it('should actually have stored and served content while doing it', () => {
+      // Without this, the assertions above are all "no violations found" over an empty result set: a
+      // storage that stored nothing, or served `undefined` for everything, passed them — the misses are
+      // swallowed by `if (!item) continue`. These two counters are what make the suite prove the storm
+      // did real work, so a regression that breaks reads or stores fails here instead of going green.
+      expect(result.completedStores).toBeGreaterThan(0)
+      expect(result.verifiedReads).toBeGreaterThan(0)
     })
   })
 

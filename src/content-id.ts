@@ -5,6 +5,19 @@ import { PathNotContainedError } from './folder-based/errors'
 export const GZIP_EXTENSION = '.gzip'
 
 /**
+ * The path of the compressed representation belonging to a canonical raw path.
+ *
+ * Exists so the suffix is written ONCE. It was spelled as a `+ '.gzip'` literal in eleven places, none
+ * of which referenced `GZIP_EXTENSION` — so the constant an id is VALIDATED against and the string the
+ * paths are BUILT from could drift apart, silently splitting the two halves of the same rule.
+ *
+ * @public
+ */
+export function gzipPathOf(filePath: string): string {
+  return filePath + GZIP_EXTENSION
+}
+
+/**
  * The id-shape rules every backend enforces, independent of how (or whether) an id becomes a path.
  *
  * These three are not filesystem concerns — they are properties of the id namespace itself, and a
@@ -21,9 +34,18 @@ export function assertValidContentId(id: string): void {
     throw new PathNotContainedError('The id is empty, so it does not name a stored object')
   }
 
-  if (id.endsWith(GZIP_EXTENSION)) {
+  // Case-INSENSITIVE, because the collision this prevents is a filesystem one and half the
+  // filesystems this library runs on fold case. On APFS, NTFS or an SMB/CIFS mount, `<id>.GZIP` IS
+  // `<id>.gzip`: storing it overwrote another id's compressed representation, so that id's reads
+  // failed to inflate, its `contentSize` came out of the wrong file's last four bytes, and
+  // `allFileIds()` reported it once while never listing the id that had clobbered it — the exact
+  // damage this rule exists to prevent, reached through the spelling it did not check. Rejecting
+  // every case keeps one id namespace across every backend and filesystem, rather than one that
+  // silently widens on ext4.
+  if (id.toLowerCase().endsWith(GZIP_EXTENSION)) {
     throw new PathNotContainedError(
-      `The id ends in ${GZIP_EXTENSION}, which names the compressed representation of another id: ${JSON.stringify(id)}`
+      `The id ends in ${GZIP_EXTENSION} (in any case), which names the compressed representation of ` +
+        `another id: ${JSON.stringify(id)}`
     )
   }
 

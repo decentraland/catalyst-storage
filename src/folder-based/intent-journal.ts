@@ -7,23 +7,14 @@ import { markAsNonCancellationError } from '../cancellation'
 import { IFileSystemComponent } from '../fs/types'
 import { FsInvariants } from './fs-invariants'
 import { mapWithConcurrency } from '../concurrency'
+// Declared with the other caller-facing errors, since this one reaches callers through `storeStream`.
+// Re-exported here so existing deep imports of this module keep resolving it.
+import { UncommittedIntentSurvivedError } from './errors'
+import { gzipPathOf } from '../content-id'
+
+export { UncommittedIntentSurvivedError }
 
 const pipe = promisify(pipeline)
-
-/**
- * Thrown when a commit rename failed AND its pre-rename intent could not be cleared. The staged
- * file it names is then the only PROOF that the rename never landed: callers must preserve that
- * exact path (instead of their usual staging cleanup), so the next construction can discard the
- * intent as pre-rename instead of applying the failed commit as a completed transition.
- */
-export class UncommittedIntentSurvivedError extends Error {
-  constructor(
-    readonly stagedPath: string,
-    message: string
-  ) {
-    super(message)
-  }
-}
 
 /**
  * Reserved directory (under the storage root) where an atomic `storeStream` stages its temp file
@@ -73,8 +64,6 @@ export type Representation = 'raw' | 'gzip'
  * mixed state in favor of the representation the intent names — instead of reads silently preferring
  * the stale counterpart.
  *
- * Every method here is a no-op or a refusal in non-atomic mode: without `fs.rename` nothing stages,
- * so there is nothing to journal, sweep or reconcile.
  */
 export type IntentJournal = {
   /** A fresh staged path under the reserved directory, tagged with this instance's boot id. */
@@ -148,8 +137,6 @@ export type IntentJournalOptions = {
   tempDir: string
   /** Its basename, used verbatim in the operator-facing refusal messages. */
   tempDirName: string
-  /** False in legacy no-rename mode, where none of the staging machinery applies. */
-  atomic: boolean
   /** False in `disablePrefixHash` mode, where the root itself is the content namespace. */
   useHashPrefix: boolean
 }
@@ -173,43 +160,41 @@ export async function createIntentJournal(
 ): Promise<IntentJournal> {
   const { fs, logger, withPathLock, resolveFilePath } = components
   const { existsForInvariant, noFailUnlink } = components.fsInvariants
-  const { tempDir, tempDirName, atomic, useHashPrefix } = options
+  const { tempDir, tempDirName, useHashPrefix } = options
 
-  if (atomic) {
-    // stat() follows symlinks, so a pre-existing symlink at the reserved path would pass the
-    // directory check below and route staged writes and the startup sweep OUTSIDE the storage
-    // root. Refuse it when the fs component can detect it (lstat is optional for custom adapters;
-    // without it, the documented exclusive-root operational model is the guarantee).
-    if (fs.lstat) {
-      let linkStat
-      try {
-        linkStat = await fs.lstat(tempDir)
-      } catch {
-        linkStat = undefined
-      }
-      if (linkStat?.isSymbolicLink()) {
-        throw new Error(
-          `Refusing to start: the reserved temp path '${tempDirName}' is a symbolic link; staged writes and the ` +
-            `startup sweep would operate outside the storage root. Replace it with a real directory or configure ` +
-            `a different tempDirectoryName.`
-        )
-      }
+  // stat() follows symlinks, so a pre-existing symlink at the reserved path would pass the
+  // directory check below and route staged writes and the startup sweep OUTSIDE the storage
+  // root. Refuse it when the fs component can detect it (lstat is optional for custom adapters;
+  // without it, the documented exclusive-root operational model is the guarantee).
+  if (fs.lstat) {
+    let linkStat
+    try {
+      linkStat = await fs.lstat(tempDir)
+    } catch {
+      linkStat = undefined
     }
-    // A legacy flat-mode content id could live exactly AT the reserved path as a file; mkdir would
-    // then fail with a low-level filesystem error. Detect it first and give the same actionable
-    // guidance as the other reservation conflicts.
-    if (await fs.existPath(tempDir)) {
-      const tempDirStat = await fs.stat(tempDir)
-      if (!tempDirStat.isDirectory()) {
-        throw new Error(
-          `Refusing to start: the reserved temp path '${tempDirName}' under the storage root exists as a file — ` +
-            `likely a pre-existing content id. Migrate it out or configure a different tempDirectoryName.`
-        )
-      }
+    if (linkStat?.isSymbolicLink()) {
+      throw new Error(
+        `Refusing to start: the reserved temp path '${tempDirName}' is a symbolic link; staged writes and the ` +
+          `startup sweep would operate outside the storage root. Replace it with a real directory or configure ` +
+          `a different tempDirectoryName.`
+      )
     }
-    // Created up front so storeStream can stage into it without a per-write mkdir.
-    await fs.mkdir(tempDir, { recursive: true })
   }
+  // A legacy flat-mode content id could live exactly AT the reserved path as a file; mkdir would
+  // then fail with a low-level filesystem error. Detect it first and give the same actionable
+  // guidance as the other reservation conflicts.
+  if (await fs.existPath(tempDir)) {
+    const tempDirStat = await fs.stat(tempDir)
+    if (!tempDirStat.isDirectory()) {
+      throw new Error(
+        `Refusing to start: the reserved temp path '${tempDirName}' under the storage root exists as a file — ` +
+          `likely a pre-existing content id. Migrate it out or configure a different tempDirectoryName.`
+      )
+    }
+  }
+  // Created up front so storeStream can stage into it without a per-write mkdir.
+  await fs.mkdir(tempDir, { recursive: true })
 
   // Construction invariant: the storage never runs in a state where the reserved staging namespace
   // could hide addressable content. With hash prefixes, ids can never resolve into the reserved dir
@@ -225,7 +210,7 @@ export async function createIntentJournal(
   // after an upgrade. A byte-exact forgery of the marker alongside exclusively staged-shaped
   // siblings is indistinguishable from genuine ownership by construction and is treated as opt-in.
   // This also means the orphan sweep never needs a runtime ownership check.
-  if (atomic && !useHashPrefix) {
+  if (!useHashPrefix) {
     const markerPath = path.join(tempDir, OWNERSHIP_MARKER)
     const refuseToStart = (reason: string): never => {
       throw new Error(
@@ -286,6 +271,25 @@ export async function createIntentJournal(
     path.join(tempDir, `${createHash('sha256').update(id).digest('hex')}.intent`)
 
   /**
+   * Intent journals this process has written and not yet PROVEN removed.
+   *
+   * A journal only ever exists after a counterpart cleanup failed, and `reconcile()` guarantees the disk
+   * holds none once construction returns — it applies every journal it finds or refuses to start. So in
+   * the steady state this set is empty, and "does this id have a pending intent?" is answerable without
+   * touching the filesystem. It used to cost, per operation: one `stat` on every store (the pre-commit
+   * repair probe) and one `stat` plus one `unlink` plus one more `stat` on every DELETE — measured at
+   * 56.2 -> 38.5 µs per deleted id at the storage's own concurrency, ~17.7 s per million ids, to ask a
+   * question whose answer was provably "no".
+   *
+   * Entries are added BEFORE the journal write and removed only once its absence is proven, so the set
+   * is never optimistic in the dangerous direction: a rejected write that still landed a valid journal
+   * (the NFS/FUSE report-at-close case) stays tracked. Like `hasLegacyIntents`, `knownDirectories` and
+   * the staged-file ownership model, this relies on the documented exclusive-root ownership — a second
+   * live instance over one root is out of contract.
+   */
+  const liveIntentPaths = new Set<string>()
+
+  /**
    * Whether this root still holds journals named by the pre-sha256 scheme.
    *
    * Set once, by `reconcile()`, which already lists the staging directory at construction. Every
@@ -338,7 +342,10 @@ export async function createIntentJournal(
   ): Promise<void> {
     await noFailUnlink(intentPath)
     try {
-      if (!(await existsForInvariant(intentPath))) return
+      if (!(await existsForInvariant(intentPath))) {
+        liveIntentPaths.delete(intentPath)
+        return
+      }
     } catch {
       // Could not prove the dangerous journal is gone; fall through and preserve the staged proof.
     }
@@ -354,7 +361,22 @@ export async function createIntentJournal(
   // outlives its purpose is later interpreted as a pending repair instruction. Centralized so the
   // invariant cannot be accidentally weakened back into a best-effort unlink.
   async function removeIntentOrThrow(intentPath: string, context: string): Promise<void> {
-    await noFailUnlink(intentPath)
+    try {
+      await fs.unlink(intentPath)
+      // Removed by us. Still verified below: this invariant is must-succeed, and an adapter that
+      // resolves an unlink without removing anything is exactly what the verification is for. Rare —
+      // a journal only exists after a counterpart cleanup failed.
+    } catch (err: any) {
+      const code = err?.code
+      // The unlink ITSELF proved the journal is absent, so the follow-up `stat` would be asking a
+      // question already answered. This is the ordinary case — no journal exists — and it is on the
+      // delete path, which a GC sweep runs per id.
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        liveIntentPaths.delete(intentPath)
+        return
+      }
+      // Any other failure decides nothing; the verification below does.
+    }
     let survived: boolean
     try {
       survived = await existsForInvariant(intentPath)
@@ -370,6 +392,7 @@ export async function createIntentJournal(
     if (survived) {
       throw new Error(`${context}: the intent journal '${intentPath}' could not be removed.`)
     }
+    liveIntentPaths.delete(intentPath)
   }
 
   async function writeIntent(op: Representation, id: string, stagedPath: string): Promise<string> {
@@ -378,6 +401,10 @@ export async function createIntentJournal(
     // consume the staged file, so "staged still present" means the rename provably never happened.
     // Stored as a basename (not an absolute path) so a root remount cannot poison the journal.
     const body = JSON.stringify({ op, id, staged: path.basename(stagedPath) })
+    // Tracked BEFORE the write, not after: a write that REJECTS can still have landed a complete journal
+    // (a filesystem that reports its error at close), and an untracked journal on disk is one a later
+    // repair would never look for.
+    liveIntentPaths.add(intentPath)
     await pipe(Readable.from([Buffer.from(body)]), fs.createWriteStream(intentPath))
     return intentPath
   }
@@ -431,7 +458,7 @@ export async function createIntentJournal(
       return
     }
     const filePath = await resolveFilePath(id)
-    const gzipPath = filePath + '.gzip'
+    const gzipPath = gzipPathOf(filePath)
     const primaryPath = op === 'raw' ? filePath : gzipPath
     const counterpartPath = op === 'raw' ? gzipPath : filePath
     if (!(await existsForInvariant(primaryPath))) {
@@ -464,7 +491,10 @@ export async function createIntentJournal(
   }
 
   async function repairPendingIntent(id: string): Promise<void> {
-    if (!atomic) return
+    // Nothing is on disk to repair unless this process wrote a journal it could not clear — see
+    // `liveIntentPaths`. Construction has already applied (or refused to start over) every journal a
+    // previous process left, so the ordinary store and delete pay no syscall for this question.
+    if (liveIntentPaths.size === 0) return
     const intentPath = await findIntentPath(id)
     if (intentPath) {
       await applyPendingIntent(intentPath)
@@ -582,7 +612,6 @@ export async function createIntentJournal(
     // reserved directory was the one place that did not. Only the directory is recreated: the
     // ownership marker and its checks belong to construction, which already proved this root is ours.
     async ensureTempDir(): Promise<void> {
-      if (!atomic) return
       await fs.mkdir(tempDir, { recursive: true })
       // The marker is not a check, it is the EVIDENCE the next construction consumes: without it, a
       // flat-mode root whose staging directory was healed refuses to start as soon as a crash leaves
@@ -630,7 +659,12 @@ export async function createIntentJournal(
     },
 
     async assertNoIntent(id: string, context: string): Promise<void> {
-      if (!atomic) return
+      // Deliberately NOT gated on `liveIntentPaths`, unlike `repairPendingIntent`. This is the
+      // defensive check that a journal never outlives its id, so making it conditional on the
+      // in-memory view of which journals exist would make it vacuous — it could then only ever fire in
+      // the cases the view already knows about, which are exactly the ones `repairPendingIntent`
+      // handled. `removeIntentOrThrow` is what was made cheap instead: an `unlink` answering ENOENT is
+      // itself the proof of absence, so the ordinary case costs one syscall rather than two.
       await removeIntentOrThrow(intentPathFor(id), context)
       // Only when this root actually carries pre-sha256 journals: such an intent must not survive a
       // delete of its id, or the next construction refuses to start over a journal whose id no longer
@@ -666,8 +700,6 @@ export async function createIntentJournal(
     },
 
     async reconcile(): Promise<void> {
-      // No intents are ever written without atomic-write support.
-      if (!atomic) return
       let entries: string[]
       try {
         entries = await fs.readdir(tempDir)
@@ -710,9 +742,6 @@ export async function createIntentJournal(
     // leftover of an earlier process — a write racing this sweep stages under the current bootId and
     // is never touched. Best-effort: a missing dir or a failed unlink is ignored.
     async sweepOrphanedTempFiles(): Promise<number> {
-      // No staging happens without atomic-write support, so there is nothing of ours to sweep — and
-      // the directory (if it exists at all) is not ours to touch.
-      if (!atomic) return 0
       // Ownership of the reserved dir is a construction invariant (see the OWNERSHIP_MARKER logic
       // above): if this storage is running, everything staged-shaped in there is ours.
       let entries: string[]

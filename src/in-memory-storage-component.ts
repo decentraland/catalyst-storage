@@ -41,8 +41,15 @@ export function createInMemoryStorage(): IContentStorageComponent {
     },
     storeStream: storeBuffered,
     async delete(ids: string[]): Promise<void> {
-      ids.forEach((id) => assertAddressableContentId(id))
-      ids.forEach((id) => storage.delete(id))
+      // Validated and deleted id by id, NOT validated-all-then-deleted-all. The folder-based backend
+      // resolves and removes each id in turn, so `delete(['victim', '../evil'])` removes `victim` and
+      // then rejects; validating up front here left `victim` in place for the same call, so a service
+      // exercised against this backend in tests saw the opposite outcome in production. `delete` is
+      // idempotent, so retrying the whole list is the recovery in both.
+      for (const id of ids) {
+        assertAddressableContentId(id)
+        storage.delete(id)
+      }
     },
     async retrieve(fileId: string, range?: { start: number; end: number }): Promise<ContentItem | undefined> {
       if (range) validateRange(range)
@@ -56,11 +63,17 @@ export function createInMemoryStorage(): IContentStorageComponent {
       }
       const content = storage.get(fileId)
       if (!content) return undefined
+      // COPIED, not aliased. `fromBuffer` streams the buffer it is given as-is, so handing over the
+      // stored one let a consumer that writes into a chunk it received rewrite stored content in
+      // place — `for await (const chunk of await item.asStream()) chunk.write('…')` changed what the
+      // next `retrieve` returned. A `subarray` range is a view over the same memory, so it aliased
+      // too. Every other backend reads bytes off a disk or a socket and so cannot be aliased; this
+      // one has to copy to give the same guarantee.
       if (range) {
         const clampedEnd = clampRange(range, content.length)
-        return SimpleContentItem.fromBuffer(content.subarray(range.start, clampedEnd + 1))
+        return SimpleContentItem.fromBuffer(Buffer.from(content.subarray(range.start, clampedEnd + 1)))
       }
-      return SimpleContentItem.fromBuffer(content)
+      return SimpleContentItem.fromBuffer(Buffer.from(content))
     },
     async existMultiple(fileIds: string[]): Promise<Map<string, boolean>> {
       fileIds.forEach((fileId) => assertAddressableContentId(fileId))

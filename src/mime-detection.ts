@@ -5,7 +5,7 @@ import { ILoggerComponent } from '@well-known-components/interfaces'
 // This indirection preserves the native import() needed for ESM-only packages.
 const _importDynamic = Function('modulePath', 'return import(modulePath)') as (modulePath: string) => Promise<any>
 
-/** file-type v21 needs no more than the first ~4100 bytes to identify any type it knows. */
+/** `file-type` needs no more than the first ~4100 bytes to identify any type it knows. */
 export const MIME_DETECTION_BYTES = 4100
 
 export const DEFAULT_MIME_TYPE = 'application/octet-stream'
