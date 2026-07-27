@@ -69,6 +69,12 @@ storing can check the source it is about to hand over instead of learning from a
 validators stay internal: they encode invariants that only make sense applied at a specific point, and the
 backends apply them on the caller's behalf.
 
+`streamToBuffer(stream, maxBytes?)` takes an **optional** cap, and it is opt-in on purpose: callers know
+their own content sizes, and a default ceiling would start rejecting bodies that store and read correctly
+today. Pass one when the stream is a **decoded** one — `streamToBuffer(await item.asStream())` over
+attacker-supplied compressed content inflates without limit, because the folder-based backend's
+`decompressMaxFileSize` bounds only the range-request inflation path, not a full read.
+
 Previously every module was re-exported wholesale, which made a lot of internals public by accident —
 the MIME detector and its ESM loader memo, the id validators, the bounded-map helper, the stream
 teardown utilities, the range validators, `compressContentFile`. None of them were imported by any

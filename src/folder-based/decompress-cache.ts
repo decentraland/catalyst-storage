@@ -359,83 +359,94 @@ export function createDecompressCache(
    */
   let stalledOnEvictionFailure = false
 
+  /**
+   * Runs eviction passes until the budget is met, nothing is left to try, or a pass makes no progress.
+   *
+   * ITERATIVE rather than tail-recursive. Each pass re-runs only when the previous one actually freed
+   * something, so the depth was bounded by the entry count — but the module's own sizing note puts that at
+   * ~100k entries, and an async self-call suspends a frame per level rather than reusing one. A loop makes
+   * the bound structural instead of something to reason about, and `now` is recomputed per pass either way.
+   */
   async function runEviction() {
-    const now = Date.now()
-    // Whether any entry was actually handed to `evictEntrySafely` this pass. See `stalledOnEvictionFailure`.
-    let attemptedAnEviction = false
-    // How many entries this pass actually REMOVED.
-    //
-    // Counted, not inferred from the total. `freedSomething = totalCacheSize < before` compared against a
-    // snapshot taken at pass start, and every admission landing DURING the pass raises the total past it — so
-    // a pass that had evicted perfectly well concluded it freed nothing, stalled, and stopped enforcing the
-    // budget. That is what made a burst settle 34x over: 50 admissions arrive while the first pass is on its
-    // first `await`, and the pass then measured 14.7 MB against a 600 KB snapshot and gave up.
-    let evictedThisPass = 0
-
-    // TTL eviction. Entries are visited oldest-first, so the first one still inside its TTL means
-    // every entry behind it is too — no need to walk the rest of the tracker.
-    for (const [filePath, entry] of entries) {
-      if (now - entry.lastAccess <= options.ttl) break
-      // PINNED entries are skipped here as well as in the size pass. "Past its TTL" and "no reader needs it"
-      // are different claims, and at a default TTL of an hour against a pin measured in seconds they never
-      // disagree — but an aggressively short `decompressCacheTTL` makes them collide, and the whole point of
-      // the pin is that a file survives until the read holding it has its descriptor. `continue`, not
-      // `break`: a pinned entry must not stop the older ones behind it from being reclaimed. The next pass
-      // takes it once the pin is gone; `evictAll` on shutdown ignores pins by design.
-      if (pins.get(filePath)?.has(entry.generation)) continue
-      attemptedAnEviction = true
-      if (await evictEntrySafely(filePath, entry, entry.lastAccess)) evictedThisPass++
-    }
-
-    // Size eviction (LRU)
-    if (totalCacheSize > options.maxSize) {
-      // Walked from the front, which IS least-recently-used first (see `entries`), instead of sorting.
+    for (;;) {
+      const now = Date.now()
+      // Whether any entry was handed to `evictEntrySafely` this pass. See `stalledOnEvictionFailure`.
+      let attemptedAnEviction = false
+      // How many entries this pass actually REMOVED.
       //
-      // The most recently used entry is never evicted here, so a budget smaller than a single
-      // decompressed file cannot delete the copy the request that just created it is about to open —
-      // `retrieve` builds a LAZY ContentItem, so the file has to outlive the call. With the access
-      // ordering that is simply "stop before the last entry". This is only a guarantee for the
-      // SINGLE-entry case: with concurrent inflations of different ids the just-recorded entry may not
-      // be the most recent by the time a pass runs, and its lazily-opened stream can still fail ENOENT.
-      // Callers already have to treat that as a retryable miss (see the read contract). The cache holds
-      // at most `maxSize` plus one file; TTL reclaims the survivor.
-      //
-      // `lastAccess` is read as each entry is CHOSEN, so an entry touched while an earlier unlink was
-      // in flight is no longer a valid LRU victim and is skipped by `evictEntry`'s own check.
-      let evictable = entries.size - 1
+      // Counted, not inferred from the total. `freedSomething = totalCacheSize < before` compared against a
+      // snapshot taken at pass start, and every admission landing DURING the pass raises the total past it — so
+      // a pass that had evicted perfectly well concluded it freed nothing, stalled, and stopped enforcing the
+      // budget. That is what made a burst settle 34x over: 50 admissions arrive while the first pass is on its
+      // first `await`, and the pass then measured 14.7 MB against a 600 KB snapshot and gave up.
+      let evictedThisPass = 0
+
+      // TTL eviction. Entries are visited oldest-first, so the first one still inside its TTL means
+      // every entry behind it is too — no need to walk the rest of the tracker.
       for (const [filePath, entry] of entries) {
-        if (evictable-- <= 0) break
-        if (totalCacheSize <= options.maxSize) break
-        // A PINNED entry belongs to a range read that is still between committing this file and opening
-        // it. "Stop before the last entry" protects exactly one, which is a guarantee for one reader and
-        // no more: with concurrent inflations of distinct ids an entry stops being the most recent as
-        // soon as another lands, and 20 concurrent reads of present gzip-only ids produced a spurious
-        // ENOENT — content that was never missing, surfaced to the caller as a 5xx by the read contract.
-        // `continue`, not `break`: a pinned entry must not shield the older ones behind it from eviction.
+        if (now - entry.lastAccess <= options.ttl) break
+        // PINNED entries are skipped here as well as in the size pass. "Past its TTL" and "no reader needs it"
+        // are different claims, and at a default TTL of an hour against a pin measured in seconds they never
+        // disagree — but an aggressively short `decompressCacheTTL` makes them collide, and the whole point of
+        // the pin is that a file survives until the read holding it has its descriptor. `continue`, not
+        // `break`: a pinned entry must not stop the older ones behind it from being reclaimed. The next pass
+        // takes it once the pin is gone; `evictAll` on shutdown ignores pins by design.
         if (pins.get(filePath)?.has(entry.generation)) continue
         attemptedAnEviction = true
         if (await evictEntrySafely(filePath, entry, entry.lastAccess)) evictedThisPass++
       }
-    }
 
-    // Entries admitted DURING this pass are missing from the snapshot above, and `evict()` turned
-    // every `record()` in that window into a no-op by handing back the in-flight promise. Without a
-    // re-arm a burst of range requests settled ~9x over budget and stayed there until the next timer
-    // tick. Only re-run while progress is being made: a pass that frees nothing (an unlinkable file,
-    // or nothing evictable left besides the protected MRU entry) would otherwise spin on every
-    // admission, retrying a failing unlink and logging each time.
-    const freedSomething = evictedThisPass > 0
-    if (totalCacheSize > options.maxSize && !freedSomething) {
-      evictionStalled = true
-      stalledAtAdmission = admissionsSeen
-      stalledAt = Date.now()
-      stalledOnEvictionFailure = attemptedAnEviction
+      // Size eviction (LRU)
+      if (totalCacheSize > options.maxSize) {
+        // Walked from the front, which IS least-recently-used first (see `entries`), instead of sorting.
+        //
+        // The most recently used entry is never evicted here, so a budget smaller than a single
+        // decompressed file cannot delete the copy the request that just created it is about to open —
+        // `retrieve` builds a LAZY ContentItem, so the file has to outlive the call. With the access
+        // ordering that is simply "stop before the last entry". This is only a guarantee for the
+        // SINGLE-entry case: with concurrent inflations of different ids the just-recorded entry may not
+        // be the most recent by the time a pass runs, and its lazily-opened stream can still fail ENOENT.
+        // Callers already have to treat that as a retryable miss (see the read contract). The cache holds
+        // at most `maxSize` plus one file; TTL reclaims the survivor.
+        //
+        // `lastAccess` is read as each entry is CHOSEN, so an entry touched while an earlier unlink was
+        // in flight is no longer a valid LRU victim and is skipped by `evictEntry`'s own check.
+        let evictable = entries.size - 1
+        for (const [filePath, entry] of entries) {
+          if (evictable-- <= 0) break
+          if (totalCacheSize <= options.maxSize) break
+          // A PINNED entry belongs to a range read that is still between committing this file and opening
+          // it. "Stop before the last entry" protects exactly one, which is a guarantee for one reader and
+          // no more: with concurrent inflations of distinct ids an entry stops being the most recent as
+          // soon as another lands, and 20 concurrent reads of present gzip-only ids produced a spurious
+          // ENOENT — content that was never missing, surfaced to the caller as a 5xx by the read contract.
+          // `continue`, not `break`: a pinned entry must not shield the older ones behind it from eviction.
+          if (pins.get(filePath)?.has(entry.generation)) continue
+          attemptedAnEviction = true
+          if (await evictEntrySafely(filePath, entry, entry.lastAccess)) evictedThisPass++
+        }
+      }
+
+      // Entries admitted DURING this pass are missing from the snapshot above, and `evict()` turned
+      // every `record()` in that window into a no-op by handing back the in-flight promise. Without a
+      // re-arm a burst of range requests settled ~9x over budget and stayed there until the next timer
+      // tick. Only re-run while progress is being made: a pass that frees nothing (an unlinkable file,
+      // or nothing evictable left besides the protected MRU entry) would otherwise spin on every
+      // admission, retrying a failing unlink and logging each time.
+      const freedSomething = evictedThisPass > 0
+      if (totalCacheSize > options.maxSize && !freedSomething) {
+        evictionStalled = true
+        stalledAtAdmission = admissionsSeen
+        stalledAt = Date.now()
+        stalledOnEvictionFailure = attemptedAnEviction
+        return
+      }
+      evictionStalled = false
+      if ((evictionRequestedAgain || totalCacheSize > options.maxSize) && freedSomething) {
+        evictionRequestedAgain = false
+        continue
+      }
       return
-    }
-    evictionStalled = false
-    if ((evictionRequestedAgain || totalCacheSize > options.maxSize) && freedSomething) {
-      evictionRequestedAgain = false
-      await runEviction()
     }
   }
 

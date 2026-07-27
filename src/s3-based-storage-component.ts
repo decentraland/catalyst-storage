@@ -206,6 +206,12 @@ const UNCANCELLABLE_COMMANDS = new Set(['AbortMultipartUploadCommand'])
  * cannot use `instanceof` the way the abort exemption now does. Matching the input shape as well as the
  * name gives it a second, mangling-proof signal: the create is the only command lib-storage issues that
  * carries a `Bucket` and `Key` with no `UploadId` and no `Body`.
+ *
+ * THE SHAPE ALONE IS NOT UNIQUE, and stays sound only because of where this client goes. `HeadObject` and
+ * `GetObject` carry exactly the same fields, so they would match — but the abortable client is handed to
+ * `new Upload(...)` and nowhere else, and lib-storage issues neither. If that client is ever reused for
+ * ordinary requests, this must gain a positive discriminator first: a false positive would report a create
+ * that never happened, and (were the response to carry a `UploadId`) capture an id from the wrong request.
  */
 function isCreateMultipartUpload(command: any): boolean {
   if (command?.constructor?.name === 'CreateMultipartUploadCommand') return true

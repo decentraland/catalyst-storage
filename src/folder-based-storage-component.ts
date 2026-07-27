@@ -261,6 +261,13 @@ export async function createFolderBasedFileSystemContentStorage(
     // answer this read contract exists to prevent. Sets iterate in insertion order, so the first key is
     // the oldest, and one eviction per insertion past the cap keeps the guarantee for everything else.
     // Unreachable in hash-prefix mode (16^4 shards < the cap) and bounded work in flat mode.
+    //
+    // FIFO, deliberately — insertion order, NOT recency. A frequently-read early-inserted shard can be
+    // evicted before a rarely-read later one, which for a true LRU would be wrong; here it only costs that
+    // shard one syscall to re-learn, and its damage report until it does. Recency would mean a `delete` plus
+    // an `add` on every HIT, and the early return above is what keeps this off the read path entirely: this
+    // set is touched by every successful stat and every classified miss. Not worth two mutations per read for
+    // a heuristic whose cap is unreachable in the default mode.
     while (knownDirectories.size >= MAX_KNOWN_DIRECTORIES) {
       const oldest = knownDirectories.values().next()
       if (oldest.done) break
