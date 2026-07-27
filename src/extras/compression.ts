@@ -12,7 +12,7 @@ import { destroyAllQuietly } from '../stream-teardown'
  * Narrow on purpose, so any adapter that can stream and stat its own paths can be compressed
  * through — not just real local files.
  *
- * @public
+ * @internal
  */
 export type CompressionFileSystem = Pick<
   IFileSystemComponent,
@@ -45,7 +45,7 @@ type CompressionResult = {
 }
 
 /**
- * @public
+ * @internal
  */
 export async function compressContentFile(
   contentFilePath: string,

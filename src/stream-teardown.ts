@@ -8,7 +8,7 @@ import { Readable, Writable } from 'stream'
  * 200/200 escapes without it, 0 with it). Shared rather than re-declared per module so there is one
  * thing to reason about.
  *
- * @public
+ * @internal
  */
 export const ignoreStreamError = (): void => undefined
 
@@ -22,7 +22,7 @@ export const ignoreStreamError = (): void => undefined
  *
  * `undefined` is accepted so callers can tear down streams whose construction may not have happened.
  *
- * @public
+ * @internal
  */
 export function destroyQuietly(stream: Readable | Writable | undefined): void {
   if (!stream) return
@@ -38,7 +38,7 @@ export function destroyQuietly(stream: Readable | Writable | undefined): void {
  * {@link destroyQuietly} over several streams, for the pipeline teardown paths that have two or three
  * to release and must not let one failure skip the rest.
  *
- * @public
+ * @internal
  */
 export function destroyAllQuietly(...streams: (Readable | Writable | undefined)[]): void {
   for (const stream of streams) destroyQuietly(stream)

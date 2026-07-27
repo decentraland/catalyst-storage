@@ -34,7 +34,7 @@ const pipe = promisify(pipeline)
  *
  * 4,096 entries is ~160KB of names, which is nothing against the syscalls it saves.
  *
- * @public
+ * @internal
  */
 export const MAX_BUFFERED_DIRECTORY_ENTRIES = 4096
 

@@ -47,7 +47,7 @@ const PATH_SEPARATORS = path.sep === '\\' ? /[/\\]/ : /\//
  * of which referenced `GZIP_EXTENSION` — so the constant an id is VALIDATED against and the string the
  * paths are BUILT from could drift apart, silently splitting the two halves of the same rule.
  *
- * @public
+ * @internal
  */
 export function gzipPathOf(filePath: string): string {
   return filePath + GZIP_EXTENSION
@@ -63,7 +63,7 @@ export function gzipPathOf(filePath: string): string {
  *   path and makes enumeration ambiguous;
  * - a NUL byte cannot survive a round trip through any real storage.
  *
- * @public
+ * @internal
  */
 export function assertValidContentId(id: string): void {
   if (id.length === 0) {
@@ -161,7 +161,7 @@ const SYNTHETIC_ROOT = path.resolve(path.sep, 'catalyst-storage-id-namespace')
  * - CONTAINMENT: orthogonal — `../evil` resolves to exactly its own path and so round-trips
  *   cleanly, it is simply outside the namespace.
  *
- * @public
+ * @internal
  */
 export function assertAddressableContentId(id: string): void {
   assertValidContentId(id)

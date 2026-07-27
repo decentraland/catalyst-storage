@@ -14,7 +14,7 @@ export class PathNotContainedError extends Error {}
  * genuinely exceeds `decompressMaxFileSize`). Typed so a read reports it as a miss: there is nothing
  * servable and nothing an operator can repair on this request.
  *
- * @public
+ * @internal
  */
 export class DecompressionLimitExceededError extends Error {}
 

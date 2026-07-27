@@ -48,7 +48,7 @@ function isVacuousCoding(coding: string): boolean {
  * Surviving codings keep their original spelling and order, so the result stays a valid header value
  * rather than a normalized-away one.
  *
- * @public
+ * @internal
  */
 export function normalizeContentEncoding(encoding: string | null | undefined): string | null {
   if (typeof encoding !== 'string') return encoding ?? null
