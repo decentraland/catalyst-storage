@@ -951,19 +951,34 @@ export async function createFolderBasedFileSystemContentStorage(
    * 'error' and 'close' release too, so an open that never succeeds cannot hold the pin, and the grace timer
    * in `cache.pin` is the backstop for an item that is never read at all. Release is idempotent.
    *
-   * `cache.pin` is a no-op for a path with no tracked entry, so an ordinary raw-primary read pays nothing.
+   * `cache.pin` is a no-op for a path with no tracked entry, so an ordinary raw-primary read pays nothing —
+   * which is why the pin is taken TWICE, before and after producing the item. A pin binds to the entry
+   * tracked at the moment it is taken, so the first one protects an entry that is already there (keeping a
+   * cache HIT a hit for the duration of the probe), while the second covers the path having BECOME tracked
+   * while `produce` ran: a concurrent range read can inflate and record the file between the first pin and
+   * this call's `stat` of it, in which case the item served is a tracked cache file that the first pin —
+   * a no-op at the time — never protected, and a later admission-triggered eviction could unlink it before
+   * the consumer opened the stream. There is no `await` between `produce` resolving and the second pin, so
+   * nothing can run in that gap. When the entry was tracked all along both pins bind the same generation and
+   * are simply released together.
    */
   async function pinnedUntilOpen(
     filePath: string,
     produce: () => Promise<ContentItem | undefined>
   ): Promise<ContentItem | undefined> {
-    const releasePin = cache.pin(filePath, CACHE_PIN_GRACE_MS)
+    const releaseExisting = cache.pin(filePath, CACHE_PIN_GRACE_MS)
     let item: ContentItem | undefined
     try {
       item = await produce()
     } catch (err) {
-      releasePin()
+      releaseExisting()
       throw err
+    }
+    // Bound to whatever is tracked NOW, which is the entry this item actually serves.
+    const releaseServed = cache.pin(filePath, CACHE_PIN_GRACE_MS)
+    const releasePin = (): void => {
+      releaseExisting()
+      releaseServed()
     }
     if (!item) {
       releasePin()

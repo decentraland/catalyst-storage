@@ -1593,3 +1593,91 @@ describe('when a pin is taken and the cache file at that path is then replaced',
     expect(await waitFor(async () => unlinked.includes('/never-recorded'), 2_000)).toBe(true)
   })
 })
+
+describe('when a range read observes a cache file another read materialized between its pin and its stat', () => {
+  // The pin binds to the entry tracked at the moment it is taken, and it is taken BEFORE the raw-path stat.
+  // So a path that is untracked at pin time gets a no-op pin — and a concurrent range read can inflate and
+  // record the file in the gap, leaving this call serving a now-tracked cache file with no real protection.
+  // A later admission-triggered eviction then unlinks it before the consumer opens the lazy stream.
+  let root: string
+  let storage: IContentStorageComponent
+  let rawPathOf: (id: string) => string
+  let statsEntered: number
+  let releaseGate: () => void
+  let firstStatEntered: Promise<void>
+  let gatedId: string
+  // The gate is ARMED only once setup is done: the stores below stat the same raw path themselves (a gzip
+  // commit checks its raw counterpart), and gating those deadlocks the fixture.
+  let armed: boolean
+
+  beforeEach(async () => {
+    root = mkdtempSync(path.join(os.tmpdir(), 'pin-after-produce-'))
+    gatedId = 'gated'
+    rawPathOf = (id: string) => path.join(root, id)
+    statsEntered = 0
+    armed = false
+    let signalEntered: () => void = () => undefined
+    firstStatEntered = new Promise<void>((resolve) => (signalEntered = resolve))
+    const gate = new Promise<void>((resolve) => (releaseGate = resolve))
+
+    const realFs = createFsComponent()
+    const gatedFs: IFileSystemComponent = {
+      ...realFs,
+      stat: (async (target: any, options?: any) => {
+        // Only the FIRST stat of the gated id's raw path waits: that is the probe belonging to the read whose
+        // pin was a no-op. Every later stat — including the other read's, which must be free to inflate and
+        // record — proceeds normally.
+        if (armed && String(target) === rawPathOf(gatedId)) {
+          statsEntered++
+          if (statsEntered === 1) {
+            signalEntered()
+            await gate
+          }
+        }
+        return realFs.stat(target, options)
+      }) as IFileSystemComponent['stat']
+    }
+
+    storage = await createFolderBasedFileSystemContentStorage(
+      { fs: gatedFs, logs: await createLogComponent({}) },
+      root,
+      {
+        disablePrefixHash: true,
+        // Exactly one inflated file fits, so the second admission below is what triggers eviction.
+        decompressCacheMaxSize: 30_000,
+        decompressCacheEvictionInterval: 60_000
+      }
+    )
+    await storage.storeStreamAndCompress(gatedId, bufferToStream(Buffer.alloc(30_000, 0x41)))
+    await storage.storeStreamAndCompress('other', bufferToStream(Buffer.alloc(30_000, 0x42)))
+    armed = true
+  })
+
+  afterEach(async () => {
+    releaseGate()
+    await storage.stop?.()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('should still serve the read whose pin was taken before the entry existed', async () => {
+    // The gated read starts first: it pins (a no-op, nothing is tracked) and then blocks in its stat.
+    const gatedRead = storage.retrieve(gatedId, { start: 0, end: 9 })
+    await firstStatEntered
+
+    // A second read inflates and records the same path, then finishes so its own pin is released.
+    const warming = await storage.retrieve(gatedId, { start: 0, end: 9 })
+    await streamToBuffer(await warming!.asStream())
+
+    // Let the gated read's stat through: it now observes a TRACKED cache file it never pinned.
+    releaseGate()
+    const item = await gatedRead
+    expect(item).toBeDefined()
+
+    // Push the cache over budget so eviction runs while the gated read's stream is still unopened. Its
+    // candidate is the gated id's entry, which is the oldest.
+    const pressure = await storage.retrieve('other', { start: 0, end: 9 })
+    await streamToBuffer(await pressure!.asStream())
+
+    expect((await streamToBuffer(await item!.asStream())).length).toBe(10)
+  })
+})

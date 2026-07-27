@@ -90,7 +90,20 @@ export function contentCodingOf(encoding: string | null): string | null {
 }
 
 /**
- * Builds the decoder for a content coding. Only called once the coding is known to be non-identity.
+ * The decoder factory for each coding this storage can undo.
+ *
+ * A MAP rather than a switch that constructs, so whether a coding is decodable can be answered without
+ * building a zlib stream — which is what lets `asStream` settle the question before it opens the source.
+ */
+const DECODER_FACTORIES: Record<string, () => Transform> = {
+  gzip: createGunzip,
+  'x-gzip': createGunzip,
+  deflate: createInflate,
+  br: createBrotliDecompress
+}
+
+/**
+ * The factory that will undo `encoding`, or a throw naming `asRawStream()`.
  *
  * An UNRECOGNIZED coding throws rather than passing the encoded bytes through: `asStream()` is
  * documented as yielding decompressed content, so returning still-compressed bytes under that
@@ -98,21 +111,30 @@ export function contentCodingOf(encoding: string | null): string | null {
  * from stored metadata (S3's `ContentEncoding` is arbitrary object metadata), so it is not
  * constrained to the codings this library writes.
  */
-function createDecoderFor(encoding: string): Transform {
-  switch (encoding) {
-    case 'gzip':
-    case 'x-gzip':
-      return createGunzip()
-    case 'deflate':
-      return createInflate()
-    case 'br':
-      return createBrotliDecompress()
-    default:
-      throw new Error(
-        `Cannot decode content stored with an unsupported encoding: ${JSON.stringify(encoding)}. ` +
-          `Use asRawStream() to read the stored bytes as they are.`
-      )
+function decoderFactoryFor(codings: string[], encoding: string | null): () => Transform {
+  // MORE THAN ONE coding is refused, not partially undone. Only one decoder is applied, so a body stored as
+  // `gzip, br` would have Brotli undone and be handed back STILL GZIPPED — under a contract that says this
+  // yields decompressed content, with nothing to tell the caller otherwise. Refusing is the same answer this
+  // already gives for a coding it cannot decode at all, and for the same reason.
+  //
+  // No backend in this library writes more than one coding: the folder-based one writes `gzip` and S3 writes
+  // none, so this is only reachable for an object an operator or a migration put there. Chaining decoders in
+  // reverse would be the alternative, but it would be a decode path with no way to produce test input from
+  // the library itself and no caller asking for it.
+  if (codings.length > 1) {
+    throw new Error(
+      `Cannot decode content stored with multiple content codings: ${JSON.stringify(encoding)}. ` +
+        `This storage undoes at most one. Use asRawStream() to read the stored bytes as they are.`
+    )
   }
+  const factory = DECODER_FACTORIES[codings[0]]
+  if (!factory) {
+    throw new Error(
+      `Cannot decode content stored with an unsupported encoding: ${JSON.stringify(codings[0])}. ` +
+        `Use asRawStream() to read the stored bytes as they are.`
+    )
+  }
+  return factory
 }
 
 /**
@@ -150,31 +172,22 @@ export class SimpleContentItem implements ContentItem {
    * Gets the readable stream, uncompressed if necessary.
    */
   async asStream(): Promise<Readable> {
+    // The coding is settled BEFORE the source is opened. Validating afterwards meant an item whose encoding
+    // this storage cannot undo still paid for an S3 GetObject or a file open, only to destroy it and throw —
+    // and if that open ITSELF failed, the caller got the open's error instead of the clearer statement that
+    // the representation is undecodable. Nothing is opened until there is something to do with it.
+    const codings = appliedCodings(this.encoding)
+    const decoderFactory = codings.length === 0 ? undefined : decoderFactoryFor(codings, this.encoding)
+
     const stream = await this.streamCreator()
 
-    const codings = appliedCodings(this.encoding)
-    if (codings.length > 0) {
+    if (decoderFactory) {
       let decoder: Transform
       try {
-        // MORE THAN ONE coding is refused, not partially undone. Only one decoder is applied here, so a body
-        // stored as `gzip, br` would have Brotli undone and be handed back STILL GZIPPED — under a contract
-        // that says this yields decompressed content, with nothing to tell the caller otherwise. Refusing is
-        // the same answer this already gives for a coding it cannot decode at all, and for the same reason.
-        //
-        // No backend in this library writes more than one coding: the folder-based one writes `gzip` and S3
-        // writes none, so this is only reachable for an object an operator or a migration put there. Chaining
-        // decoders in reverse would be the alternative, but it would be a decode path with no way to produce
-        // test input from the library itself and no caller asking for it.
-        if (codings.length > 1) {
-          throw new Error(
-            `Cannot decode content stored with multiple content codings: ${JSON.stringify(this.encoding)}. ` +
-              `This storage undoes at most one. Use asRawStream() to read the stored bytes as they are.`
-          )
-        }
-        decoder = createDecoderFor(codings[0])
+        decoder = decoderFactory()
       } catch (err) {
-        // The source is already open; leaving it undestroyed would hold its descriptor for the life
-        // of the process.
+        // Constructing a zlib stream is not expected to fail, but the source is open by now, and leaving it
+        // undestroyed would hold its descriptor for the life of the process.
         destroyQuietly(stream)
         throw err
       }

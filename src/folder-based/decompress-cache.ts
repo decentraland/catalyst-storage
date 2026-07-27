@@ -376,6 +376,13 @@ export function createDecompressCache(
     // every entry behind it is too — no need to walk the rest of the tracker.
     for (const [filePath, entry] of entries) {
       if (now - entry.lastAccess <= options.ttl) break
+      // PINNED entries are skipped here as well as in the size pass. "Past its TTL" and "no reader needs it"
+      // are different claims, and at a default TTL of an hour against a pin measured in seconds they never
+      // disagree — but an aggressively short `decompressCacheTTL` makes them collide, and the whole point of
+      // the pin is that a file survives until the read holding it has its descriptor. `continue`, not
+      // `break`: a pinned entry must not stop the older ones behind it from being reclaimed. The next pass
+      // takes it once the pin is gone; `evictAll` on shutdown ignores pins by design.
+      if (pins.get(filePath)?.has(entry.generation)) continue
       attemptedAnEviction = true
       if (await evictEntrySafely(filePath, entry, entry.lastAccess)) evictedThisPass++
     }
