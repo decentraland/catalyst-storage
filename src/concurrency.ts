@@ -29,7 +29,7 @@ export async function mapWithConcurrency<T, R>(
  * an 8MB array of `undefined`s that nothing ever read, and the ids a GC sweep deletes are exactly the
  * scale that reaches for this helper.
  *
- * @public
+ * @internal
  */
 export async function forEachWithConcurrency<T>(
   items: readonly T[],

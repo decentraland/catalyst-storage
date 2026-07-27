@@ -215,6 +215,19 @@ describe('S3 Storage', () => {
     expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('Hello'))
   })
 
+  it(`When a caller mutates a requested range after retrieve, then the lazy stream serves the original bounds`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+    const range = { start: 0, end: 4 }
+
+    const item = await storage.retrieve(id, range)
+    range.start = 7
+    range.end = 11
+
+    expect(item!.size).toBe(5)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('Hello'))
+  })
+
   it(`When content is stored, then a range in the middle returns correct size`, async () => {
     const data = Buffer.from('Hello, World!')
     await storage.storeStream(id, bufferToStream(data))
@@ -347,35 +360,107 @@ describe('S3 Storage MIME type detection', () => {
 })
 
 describe('S3 Storage enumeration', () => {
-  describe('when a page reports itself truncated but carries no continuation token', () => {
-    let listed: string[]
+  describe('when an endpoint cycles through continuation tokens it has already issued', () => {
+    let storage: IContentStorageComponent
     let requests: number
 
     beforeEach(async () => {
-      // Re-requesting with an undefined token returns the FIRST page again, so without the guard this
-      // yields the same keys forever and hangs whatever is consuming the iterator.
+      requests = 0
+      const fake = createFakeS3Client()
+      fake.on('ListObjectsV2Command', ({ ContinuationToken }: { ContinuationToken?: string }) => {
+        requests++
+        if (ContinuationToken === undefined) {
+          return { Contents: [{ Key: 'first' }], IsTruncated: true, NextContinuationToken: 'a' }
+        }
+        if (ContinuationToken === 'a') {
+          return { Contents: [{ Key: 'second' }], IsTruncated: true, NextContinuationToken: 'b' }
+        }
+        return { Contents: [{ Key: 'third' }], IsTruncated: true, NextContinuationToken: 'a' }
+      })
+      storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
+        Bucket: 'example'
+      })
+      // Construction probes s3:ListBucket once; the assertions below count only enumeration requests.
+      requests = 0
+    })
+
+    it('should reject rather than following the cycle forever', async () => {
+      await expect(async () => {
+        for await (const _each of storage.allFileIds()) {
+          // drain the iterator so the pagination failure surfaces
+        }
+      }).rejects.toThrow('returned continuation token')
+    })
+
+    it('should not emit the page whose cursor it is about to reject', async () => {
+      // The cursor is validated BEFORE the page is yielded, so a caller streaming ids never processes the
+      // repeated page. Previously the third page — a duplicate of one already seen — reached the consumer and
+      // only then did the iterator reject, so a GC or sync sweep acted on repeats.
+      const listed: string[] = []
+      await expect(async () => {
+        for await (const each of storage.allFileIds()) listed.push(each)
+      }).rejects.toThrow('returned continuation token')
+
+      expect(listed).toEqual(['first', 'second'])
+    })
+
+    it('should stop when the repeated older token is observed', async () => {
+      await expect(async () => {
+        for await (const _each of storage.allFileIds()) {
+          // drain the iterator so the pagination failure surfaces
+        }
+      }).rejects.toThrow('This enumeration is incomplete')
+
+      expect(requests).toBe(3)
+    })
+  })
+
+  describe('when a page reports itself truncated but carries no continuation token', () => {
+    let storage: IContentStorageComponent
+    let requests: number
+
+    beforeEach(async () => {
       requests = 0
       const fake = createFakeS3Client()
       fake.on('ListObjectsV2Command', () => {
         requests++
         return { Contents: [{ Key: 'only-key' }], IsTruncated: true, NextContinuationToken: undefined }
       })
-      const storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
+      storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
         Bucket: 'example'
       })
       // Construction probes s3:ListBucket once to decide whether a 403 can mean "absent"; this
       // assertion is about what ENUMERATION issues, so it counts from here.
       requests = 0
-      listed = []
-      for await (const each of storage.allFileIds()) listed.push(each)
     })
 
-    it('should stop after the page it could not continue from', () => {
+    it('should reject rather than completing a partial listing', async () => {
+      await expect(async () => {
+        for await (const _each of storage.allFileIds()) {
+          // drain the iterator so the pagination failure surfaces
+        }
+      }).rejects.toThrow('truncated listing without a continuation token')
+    })
+
+    it('should not emit the page it cannot continue from', async () => {
+      // Same reason as the token-cycle case: an enumeration that cannot be completed refuses before handing
+      // the caller anything from the page that proved it.
+      const listed: string[] = []
+      await expect(async () => {
+        for await (const each of storage.allFileIds()) listed.push(each)
+      }).rejects.toThrow('truncated listing without a continuation token')
+
+      expect(listed).toEqual([])
+    })
+
+    it('should stop after the page it could not continue from', async () => {
+      await expect(async () => {
+        for await (const _each of storage.allFileIds()) {
+          // drain the iterator so the pagination failure surfaces
+        }
+      }).rejects.toThrow('This enumeration is incomplete')
+
       expect(requests).toBe(1)
-    })
-
-    it('should still yield the keys that page contained', () => {
-      expect(listed).toEqual(['only-key'])
     })
   })
 })

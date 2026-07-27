@@ -17,11 +17,27 @@ export type IContentStorageComponent = IBaseComponent & {
   /**
    * Stores the stream under the given id.
    *
+   * The source must be one nothing has read from yet. A stream that has already been consumed — even
+   * partially, as when a caller hashes or sniffs the body first — is REFUSED rather than stored, because
+   * what it can still supply is not the content. `unshift`-ing the bytes back does not make it storable
+   * again; hand over a fresh source instead.
+   *
+   * A REJECTED store consumes the source: it is destroyed on the way out, so a caller retrying after
+   * correcting the id must supply a new stream. Without that, a service passing untrusted ids leaked one
+   * descriptor — or one undrained request socket — per rejected call, since nothing had piped the stream and
+   * so nothing would ever close it.
+   *
    * @param signal Optional cancellation signal. When it aborts, the store stops consuming the
    * stream, tears down any in-flight transport (e.g. the S3 upload), and rejects with the
    * signal's reason. A store that completes before observing the abort is allowed to succeed;
    * either way no partial content is ever observable under the id, and the previous version of the
    * id stays intact on cancellation.
+   *
+   * ONE EXCEPTION to "the previous version stays intact", on the S3 backend only: a request S3 has
+   * already received IN FULL when the abort fires cannot be un-sent, so the service may still apply it.
+   * The residue is bounded — S3 object writes are atomic, so the key holds either the previous content or
+   * the complete new content, never a mixture — but a cancelled store is not a guaranteed rollback there.
+   * The folder-based backend has no such window: its commit is a local rename it fully controls.
    */
   storeStream(fileId: string, content: Readable, signal?: AbortSignal): Promise<void>
   /**
@@ -76,7 +92,7 @@ export class RangeNotSupportedError extends Error {
 /**
  * Validates that a range is well-formed (start >= 0 and start <= end).
  *
- * @public
+ * @internal
  */
 export function validateRange(range: { start: number; end: number }): void {
   // Safe integers only: NaN/Infinity/fractional bounds would otherwise surface as low-level stream
@@ -93,7 +109,7 @@ export function validateRange(range: { start: number; end: number }): void {
  * Clamps range.end to the file size and validates that start is within bounds.
  * Returns the clamped end value.
  *
- * @public
+ * @internal
  */
 export function clampRange(range: { start: number; end: number }, size: number): number {
   validateRange(range)

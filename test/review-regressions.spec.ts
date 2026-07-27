@@ -135,20 +135,38 @@ describe('review regressions', () => {
     describe('and the encoding is an unsupported coding', () => {
       let item: SimpleContentItem
       let source: Readable
+      let opened: number
 
       beforeEach(() => {
+        opened = 0
         source = bufferToStream(Buffer.from('compressed somehow'))
-        item = new SimpleContentItem(async () => source, 18, 'x-unknown-coding')
+        item = new SimpleContentItem(
+          async () => {
+            opened++
+            return source
+          },
+          18,
+          'x-unknown-coding'
+        )
       })
 
       it('should reject rather than hand back encoded bytes labelled as decoded', async () => {
         await expect(item.asStream()).rejects.toThrow(/unsupported encoding/)
       })
 
-      it('should release the opened source instead of leaking it', async () => {
+      it('should not open the source at all, rather than opening and releasing it', async () => {
+        // Stronger than the leak check this replaces: the coding is settled before `streamCreator` runs, so an
+        // undecodable representation costs no S3 GetObject and no file open — and an open that fails on its own
+        // can no longer replace the clearer statement that the representation cannot be decoded.
         await item.asStream().catch(() => undefined)
 
-        expect(source.destroyed).toBe(true)
+        expect(opened).toBe(0)
+      })
+
+      it('should leave the source undestroyed, because it was never taken', async () => {
+        await item.asStream().catch(() => undefined)
+
+        expect(source.destroyed).toBe(false)
       })
     })
   })

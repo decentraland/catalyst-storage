@@ -2,7 +2,7 @@ import { Readable } from 'stream'
 import { clampRange, ContentItem, FileInfo, IContentStorageComponent, validateRange } from './types'
 import { SimpleContentItem, streamToBuffer } from './content-item'
 import { runStoreWithSignal } from './cancellation'
-import { assertAddressableContentId } from './content-id'
+import { assertAddressableContentId, assertStorableContentId } from './content-id'
 import { PathNotContainedError } from './folder-based/errors'
 
 /**
@@ -28,6 +28,10 @@ export function createInMemoryStorage(): IContentStorageComponent {
   const storeBuffered = (fileId: string, content: Readable, signal?: AbortSignal): Promise<void> =>
     runStoreWithSignal(content, signal, async () => {
       assertAddressableContentId(fileId)
+      // This backend has no filesystem to refuse an unstorable name for it, so without this it accepted
+      // ids the folder-based and S3 backends cannot store — the divergence these shared checks exist to
+      // prevent. Reads deliberately do NOT enforce it; see `assertStorableContentId`.
+      assertStorableContentId(fileId)
       const buffer = await streamToBuffer(content)
       signal?.throwIfAborted()
       storage.set(fileId, buffer)
