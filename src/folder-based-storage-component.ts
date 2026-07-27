@@ -344,44 +344,64 @@ export async function createFolderBasedFileSystemContentStorage(
   let tempFileSweep: Promise<void> = Promise.resolve()
 
   /**
-   * Why a read found nothing at `filePath`: the path whose loss makes this a FAULT, or `undefined` when the
-   * id is provably absent.
+   * The deepest path on `from`'s ancestor chain, inclusive, that this instance has observed to be a directory.
    *
-   * DERIVED FROM THE DISK on each call, walking up from the id's parent until it finds a real directory. Two
-   * things end the walk, and they are the whole classification:
-   *
-   * - a CONTENT path holding a regular file: nothing can exist beneath a file, so the id is unstorable
-   *   (`ensureDirectoryFor` refuses it) and absence is accurate whatever this instance saw there before.
-   *   Depth is what makes it a content path — a file where a SHARD belongs is foreign, not an id.
-   * - a directory: everything below it is genuinely missing, so the id is absent unless one of those missing
-   *   paths is one this instance observed, which means a tree it owns was destroyed and the read must reject.
-   *
-   * Recomputing beats remembering. A recorded damage set was wrong four different reachable ways — consumed
-   * by its own report, keyed on one path while the break was at another, outliving a store that claimed the
-   * path, and stale for that path's descendants — and all four are questions about the CURRENT tree, which
-   * can simply be asked. Costs one `stat` per ancestor, only on a miss and only up to the first intact
-   * directory: in hash mode that is the shard, so a hit-shaped miss pays a single probe.
+   * The root always qualifies, so this always answers. Pure string work.
    */
-  async function faultBehindAbsence(filePath: string): Promise<string | undefined> {
-    const missing: string[] = []
-    let candidate = path.dirname(filePath)
+  function deepestObservedOnChain(from: string): string {
+    let candidate = from
     for (;;) {
-      let occupant: Awaited<ReturnType<typeof statOccupant>>
+      if (wasObserved(candidate)) return candidate
+      if (candidate === root) return root
+      const parent = path.dirname(candidate)
+      // Defensive: `resolveFilePath` guarantees containment, so the root is always reached first.
+      if (parent === candidate || parent.length < root.length) return root
+      candidate = parent
+    }
+  }
+
+  /**
+   * Why a read found nothing at `filePath`: the path whose loss makes this a FAULT, or `undefined` when the id
+   * is provably absent.
+   *
+   * DERIVED FROM THE DISK on each call rather than from remembered damage. A recorded damage set was wrong
+   * four different reachable ways — consumed by its own report, keyed on one path while the break was at
+   * another, outliving a store that claimed the path, and stale for that path's descendants — and all four are
+   * questions about the CURRENT tree, which can simply be asked.
+   *
+   * Only an OBSERVED path being broken can be a fault, and the DEEPEST observed one settles it: if that is
+   * still a directory then so is every path above it, so nothing this instance owns is broken. Healthy trees
+   * therefore cost ONE probe whatever the id's depth. Only a genuinely broken one pays the walk above it,
+   * which looks for the single thing that turns a fault back into absence — a CONTENT path holding a regular
+   * file. Nothing can exist beneath a file, so the id is unstorable (`ensureDirectoryFor` refuses it, `delete`
+   * resolves for it) and absence is what makes those three agree. Depth is what makes a path a content path: a
+   * file where a SHARD belongs, or at the root, is foreign to the layout rather than an id.
+   */
+  async function faultBehindAbsence(
+    filePath: string,
+    /** What the caller's own probe already found at `path.dirname(filePath)`, so it is never re-stated. */
+    parentOccupant: Awaited<ReturnType<typeof statOccupant>>
+  ): Promise<string | undefined> {
+    const dirname = path.dirname(filePath)
+    const observed = deepestObservedOnChain(dirname)
+    let occupant: Awaited<ReturnType<typeof statOccupant>>
+    if (observed === dirname) {
+      occupant = parentOccupant
+    } else {
       try {
-        occupant = await statOccupant(candidate)
+        occupant = await statOccupant(observed)
       } catch {
-        // Unreadable, so nothing here can be proven either way. Fail closed: the alternative is reporting
-        // content absent on no evidence.
-        return candidate
+        // Unreadable, so absence cannot be proven. Fail closed.
+        return observed
       }
-      if (occupant === 'directory') break
-      // Anything proven not to be a directory leaves the mkdir-skip cache, so the next write recreates the
-      // chain on its first attempt. Done here because the walk knows the whole broken chain; the caller only
-      // knows the id's own parent.
+    }
+    if (occupant === 'directory') return undefined
+
+    // An observed directory is broken. Walk up from it for a content file that superseded the path; anything
+    // proven not to be a directory also leaves the mkdir-skip cache, so the next write recreates the chain.
+    let candidate = observed
+    for (;;) {
       forgetDirectory(candidate)
-      // This storage SERVES a content path holding a file as an id, so ids under it are unstorable — which
-      // `ensureDirectoryFor` enforces and `delete` agrees with. Reading the current tree rather than the
-      // observation history is what keeps two nodes with identical disks answering alike.
       if (occupant === 'file' && depthBelowRoot(candidate) >= MIN_CONTENT_DEPTH) {
         // Absence is the answer, but the transition destroyed whatever was under it, so say so once.
         if (wasObserved(candidate)) {
@@ -389,14 +409,18 @@ export async function createFolderBasedFileSystemContentStorage(
         }
         return undefined
       }
-      missing.push(candidate)
-      if (candidate === root) break
+      if (candidate === root) return observed
       const parent = path.dirname(candidate)
-      // Defensive: `resolveFilePath` guarantees containment, so the root always terminates the walk first.
-      if (parent === candidate || parent.length < root.length) break
+      // Defensive, as above.
+      if (parent === candidate || parent.length < root.length) return observed
       candidate = parent
+      try {
+        occupant = await statOccupant(candidate)
+      } catch {
+        return observed
+      }
+      if (occupant === 'directory') return observed
     }
-    return missing.find(wasObserved)
   }
 
   /**
@@ -477,22 +501,26 @@ export async function createFolderBasedFileSystemContentStorage(
       // second as absence is the "a broken store looks like an empty node" answer this contract refuses.
       //
       // The common case is settled in ONE syscall: an intact parent means the id is simply not there, and
-      // observing it is what lets a LATER disappearance of the same directory be recognized as damage.
+      // observing it is what lets a LATER disappearance of the same directory be recognized as damage. This
+      // probe's own answer is THREADED INTO the classifier below, so the walk never re-stats `dirname` —
+      // without that, every miss whose parent is not a directory paid one redundant syscall.
       const dirname = path.dirname(filePath)
-      let parent: { isDirectory(): boolean } | undefined
+      let parentOccupant: Awaited<ReturnType<typeof statOccupant>>
       try {
-        parent = await components.fs.stat(dirname)
+        parentOccupant = await statOccupant(dirname)
       } catch {
-        // Absent, obstructed or unreadable — `faultBehindAbsence` classifies all of those.
+        // Unreadable, so absence cannot be proven. Fail closed, as the walk itself does for an ancestor.
+        logger.warn(`Refusing to report ${filePath} as absent: its parent directory could not be read`)
+        throw err
       }
-      if (parent?.isDirectory()) {
+      if (parentOccupant === 'directory') {
         rememberDirectory(dirname)
         return undefined
       }
 
       // Anything else goes to the classifier, which walks the tree rather than consulting remembered damage
       // and drops every broken path from the mkdir-skip cache as it goes.
-      const fault = await faultBehindAbsence(filePath)
+      const fault = await faultBehindAbsence(filePath, parentOccupant)
       if (fault === undefined) return undefined
       logger.warn(`Refusing to report ${filePath} as absent: ${JSON.stringify(fault)} is no longer a directory`)
       throw err
