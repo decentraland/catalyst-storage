@@ -215,6 +215,19 @@ describe('S3 Storage', () => {
     expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('Hello'))
   })
 
+  it(`When a caller mutates a requested range after retrieve, then the lazy stream serves the original bounds`, async () => {
+    const data = Buffer.from('Hello, World!')
+    await storage.storeStream(id, bufferToStream(data))
+    const range = { start: 0, end: 4 }
+
+    const item = await storage.retrieve(id, range)
+    range.start = 7
+    range.end = 11
+
+    expect(item!.size).toBe(5)
+    expect(await streamToBuffer(await item!.asStream())).toEqual(Buffer.from('Hello'))
+  })
+
   it(`When content is stored, then a range in the middle returns correct size`, async () => {
     const data = Buffer.from('Hello, World!')
     await storage.storeStream(id, bufferToStream(data))
@@ -347,6 +360,49 @@ describe('S3 Storage MIME type detection', () => {
 })
 
 describe('S3 Storage enumeration', () => {
+  describe('when an endpoint cycles through continuation tokens it has already issued', () => {
+    let storage: IContentStorageComponent
+    let requests: number
+
+    beforeEach(async () => {
+      requests = 0
+      const fake = createFakeS3Client()
+      fake.on('ListObjectsV2Command', ({ ContinuationToken }: { ContinuationToken?: string }) => {
+        requests++
+        if (ContinuationToken === undefined) {
+          return { Contents: [{ Key: 'first' }], IsTruncated: true, NextContinuationToken: 'a' }
+        }
+        if (ContinuationToken === 'a') {
+          return { Contents: [{ Key: 'second' }], IsTruncated: true, NextContinuationToken: 'b' }
+        }
+        return { Contents: [{ Key: 'third' }], IsTruncated: true, NextContinuationToken: 'a' }
+      })
+      storage = await createStorage({ logs: await createLogComponent({}) }, fake, {
+        Bucket: 'example'
+      })
+      // Construction probes s3:ListBucket once; the assertions below count only enumeration requests.
+      requests = 0
+    })
+
+    it('should reject rather than following the cycle forever', async () => {
+      const listed: string[] = []
+      await expect(async () => {
+        for await (const each of storage.allFileIds()) listed.push(each)
+      }).rejects.toThrow('returned continuation token')
+      expect(listed).toEqual(['first', 'second', 'third'])
+    })
+
+    it('should stop when the repeated older token is observed', async () => {
+      await expect(async () => {
+        for await (const _each of storage.allFileIds()) {
+          // drain the iterator so the pagination failure surfaces
+        }
+      }).rejects.toThrow('This enumeration is incomplete')
+
+      expect(requests).toBe(3)
+    })
+  })
+
   describe('when a page reports itself truncated but carries no continuation token', () => {
     let storage: IContentStorageComponent
     let requests: number

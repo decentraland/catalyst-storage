@@ -738,7 +738,9 @@ export async function createS3BasedFileSystemContentStorage(
       // Tested against the NORMALIZED coding: `identity` (and an empty header) mean the bytes are not
       // encoded at all, so such an object is perfectly rangeable — rejecting it would have made any
       // object an operator tagged `Content-Encoding: identity` permanently un-rangeable.
-      if (range && contentCodingOf(encoding) !== null) {
+      const requestedRange = range ? { start: range.start, end: range.end } : undefined
+
+      if (requestedRange && contentCodingOf(encoding) !== null) {
         throw new RangeNotSupportedError(
           `Cannot serve a range of ${id}: it is stored with Content-Encoding '${encoding}', and S3 ranges ` +
             `address the compressed bytes. Read it whole with retrieve(id) and slice the decoded stream, or store ` +
@@ -746,8 +748,14 @@ export async function createS3BasedFileSystemContentStorage(
         )
       }
 
-      const clampedEnd = range && size !== null ? clampRange(range, size) : undefined
-      const itemSize = range ? (clampedEnd !== undefined ? clampedEnd - range.start + 1 : null) : size
+      // SNAPSHOT the caller-owned range before returning a lazy item. `asStream()` may run much later,
+      // after the caller has mutated their object; both the advertised size and S3 Range header must
+      // describe the bounds that were validated and clamped during `retrieve()`.
+      const clampedEnd = requestedRange && size !== null ? clampRange(requestedRange, size) : undefined
+      const itemSize = requestedRange ? (clampedEnd !== undefined ? clampedEnd - requestedRange.start + 1 : null) : size
+      const rangeHeader = requestedRange
+        ? `bytes=${requestedRange.start}-${clampedEnd ?? requestedRange.end}`
+        : undefined
 
       return new SimpleContentItem(
         async () => {
@@ -755,7 +763,7 @@ export async function createS3BasedFileSystemContentStorage(
             new GetObjectCommand({
               Bucket,
               Key: id,
-              Range: range ? `bytes=${range.start}-${clampedEnd ?? range.end}` : undefined,
+              Range: rangeHeader,
               // Pins the bytes to the VERSION the metadata above was read from. `size`, `encoding` and
               // `contentSize` come from that HeadObject, while this GetObject runs whenever the consumer
               // opens the stream — so a re-store in between served one version's bytes under another
@@ -902,11 +910,11 @@ export async function createS3BasedFileSystemContentStorage(
     // re-request the same page forever, re-yielding the same ids on every pass, so a GC or sync sweep never
     // terminated and kept deleting the same ids.
     //
-    // Only the PREVIOUS token is kept, not every token seen. A repeat can only manifest as an immediate one
-    // (the server hands back what it was just given), and retaining the whole set cost one token per page for
-    // the life of the enumeration — tens of megabytes on a bucket with 100M objects — to detect a condition
-    // the last value already answers.
-    let previousToken: string | undefined
+    // Keep every continuation token this enumeration has been told to follow. The common gateway bug is an
+    // immediate echo of the request token, but a broken cursor can also cycle through older tokens
+    // (`A -> B -> A`). Retaining one token per page is a deliberate completeness tradeoff: silently looping or
+    // ending a short listing would let GC/sync consumers act on a bucket view that is not complete.
+    const seenContinuationTokens = new Set<string>()
     do {
       output = await s3.send(new ListObjectsV2Command(params))
       if (output.Contents) {
@@ -935,18 +943,20 @@ export async function createS3BasedFileSystemContentStorage(
             `the full bucket contents.`
         )
       }
-      if (nextToken !== undefined && nextToken === previousToken) {
-        // THROWS rather than returning. Ending the iterator normally would hand the caller a silently short
-        // listing, which is precisely the failure the relaxed stop condition below exists to avoid — a GC or
-        // sync sweep would act on a partial view of the bucket and could delete content it simply never saw.
-        // A rejection makes the incomplete enumeration impossible to mistake for a complete one.
-        throw new Error(
-          `Cannot enumerate ${Bucket}: the endpoint returned the same continuation token twice, so paging ` +
-            `cannot advance and the listing would repeat the same page indefinitely. This enumeration is ` +
-            `incomplete and must not be treated as the full bucket contents.`
-        )
+      if (nextToken !== undefined) {
+        if (seenContinuationTokens.has(nextToken)) {
+          // THROWS rather than returning. Ending the iterator normally would hand the caller a silently short
+          // listing, which is precisely the failure the relaxed stop condition below exists to avoid — a GC or
+          // sync sweep would act on a partial view of the bucket and could delete content it simply never saw.
+          // A rejection makes the incomplete enumeration impossible to mistake for a complete one.
+          throw new Error(
+            `Cannot enumerate ${Bucket}: the endpoint returned continuation token '${nextToken}' more than once, ` +
+              `so paging cannot advance safely and the listing may cycle indefinitely. This enumeration is ` +
+              `incomplete and must not be treated as the full bucket contents.`
+          )
+        }
+        seenContinuationTokens.add(nextToken)
       }
-      previousToken = nextToken
       params.ContinuationToken = nextToken
       // Continue on any continuation token unless the server explicitly said this page was the last.
       //

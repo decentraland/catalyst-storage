@@ -1019,7 +1019,7 @@ describe('when an S3 endpoint returns a continuation token it has already issued
   it('should reject rather than enumerating forever', async () => {
     // Rejecting, not ending early: a silently short listing is the failure the relaxed stop condition
     // exists to avoid, and a GC sweep acting on a partial view could delete content it never saw.
-    await expect(collectIds(storage)).rejects.toThrow('the endpoint returned the same continuation token twice')
+    await expect(collectIds(storage)).rejects.toThrow('the endpoint returned continuation token')
   })
 
   it('should stop after re-requesting the repeated token only once', async () => {
