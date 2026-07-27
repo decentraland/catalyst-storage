@@ -312,4 +312,59 @@ describe('compressContentFile', () => {
 
     expect(existsSync(input + '.gzip')).toBe(false)
   })
+
+  describe("when the source's failed open lands while the size probe is still in flight", () => {
+    let input: string
+    let uncaught: unknown[]
+    let listeners: NodeJS.UncaughtExceptionListener[]
+    let slowProbeFs: CompressionFileSystem
+
+    beforeEach(() => {
+      // A read stream reports a failed `open(2)` ASYNCHRONOUSLY, and the size probe that follows it is
+      // awaited — so for the whole of that await nothing is listening on the source, and an emit landing
+      // inside the window is an unhandled 'error' event, which terminates the process by default. The
+      // window is real with the plain filesystem (a missing input fails both the open and the probe, and
+      // which lands first is decided by load): it surfaced twice in this suite as an intermittent uncaught
+      // ENOENT, attributed to whichever test was running, while running green 40/40 in isolation.
+      //
+      // A DELIBERATELY SLOW probe makes the ordering certain instead of load-dependent, so this fails
+      // every time without the listener rather than once in a hundred runs.
+      input = path.join(dir, 'missing')
+      slowProbeFs = {
+        createReadStream,
+        createWriteStream,
+        unlink: nodeFs.unlink,
+        stat: nodeFs.stat,
+        lstat: async (target: any) => {
+          await new Promise((resolve) => setTimeout(resolve, 50))
+          return nodeFs.lstat(target)
+        }
+      } as CompressionFileSystem
+      uncaught = []
+      listeners = process.listeners('uncaughtException')
+      process.removeAllListeners('uncaughtException')
+      process.on('uncaughtException', (error) => uncaught.push(error))
+    })
+
+    afterEach(() => {
+      process.removeAllListeners('uncaughtException')
+      listeners.forEach((listener) => process.on('uncaughtException', listener))
+    })
+
+    it('should not let the error escape as an uncaught exception', async () => {
+      await expect(compressContentFile(input, undefined, undefined, undefined, slowProbeFs)).rejects.toThrow()
+      // Past the point where the emit would have landed, so a missed listener is visible here.
+      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      expect(uncaught).toEqual([])
+    })
+
+    it('should still reject and still remove a stale output', async () => {
+      await nodeFs.writeFile(input + '.gzip', 'stale')
+
+      await expect(compressContentFile(input, undefined, undefined, undefined, slowProbeFs)).rejects.toThrow()
+
+      expect(existsSync(input + '.gzip')).toBe(false)
+    })
+  })
 })

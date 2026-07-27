@@ -280,11 +280,40 @@ export async function createFolderBasedFileSystemContentStorage(
    * mkdir-skip cache" — see `damagedDirectories`.
    */
   function wasObservedAsDirectory(dirname: string): boolean {
+    // THE ROOT IS PERMANENTLY OBSERVED, answered here rather than from a set. Construction `mkdir`s it, so
+    // this instance has provably seen it be a directory, and that fact cannot expire.
+    //
+    // Seeding it into `knownDirectories` is NOT enough, which is the whole reason this branch exists: that
+    // set is FIFO-bounded, and the root is inserted first, so it is the FIRST entry evicted once a flat-mode
+    // deployment observes more than MAX_KNOWN_DIRECTORIES directories — which nested ids reach in ordinary
+    // operation. `forgetDirectory(root)` reaches the same state far sooner and without any cap: a write that
+    // fails ENOTDIR under a root replaced by a file drops the entry, after which a destroyed root read as an
+    // ordinary miss again (measured: `exist()` answered `false`). Both routes lose an observation that is
+    // true by construction, so it is not stored as evidence that can be lost.
+    if (dirname === root) return true
     return knownDirectories.has(dirname) || damagedDirectories.has(dirname)
   }
 
   function forgetDirectory(dirname: string): void {
     knownDirectories.delete(dirname)
+  }
+
+  /**
+   * Discards the damage evidence for a path a successful store now OWNS as this storage's own content.
+   *
+   * A directory that broke and an id that legitimately occupies the same path are different states, and the
+   * evidence for the first has to stop applying once the second is true. Without this, a store of `a2` after
+   * `<root>/a2` had been observed as a directory and then destroyed left the damage entry in place, so reads
+   * of `a2/b` kept REJECTING — while the store side refuses that id as an ordinary prefix collision and
+   * `delete` resolves for it. The whole point of this contract is that those three agree, and `a2/b` under a
+   * legitimately occupied prefix is the provably-absent case this PR exists to report as absent.
+   *
+   * Keyed on the id's canonical RAW path for both commit shapes, because that is the path a directory
+   * occupied: a gzip-only commit leaves nothing at it, but the id exists either way, so a read below it is
+   * "nothing stored here" rather than a fault.
+   */
+  function forgetDamagedDirectory(target: string): void {
+    damagedDirectories.delete(target)
   }
 
   /** Moves a broken directory's observation out of the mkdir-skip cache; see `damagedDirectories`. */
@@ -364,13 +393,10 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   await components.fs.mkdir(root, { recursive: true })
-  // SEEDED as an observed directory, because this `mkdir` is the observation: the root provably existed as a
-  // directory at construction. Without it the read path had no observed ancestor to attribute damage to at
-  // the root boundary, so a root REMOVED or REPLACED underneath a live instance — before any operation
-  // happened to record a shard — classified every read under an uncreated shard as an ordinary miss.
-  // Measured in both shard modes and for both removal and replacement: `exist()` answered `false` for a
-  // storage root that was gone, which is the "a broken store looks like an empty node" outcome this read
-  // contract exists to refuse, reached at the one boundary nothing else records.
+  // Seeded so a flat-mode store of a top-level id skips one `stat` on its first write. It is ONLY a cache
+  // warm: the damage evidence for the root does not live here, because this set is FIFO-bounded and the
+  // entry is therefore losable — `wasObservedAsDirectory` answers for the root directly, and that is what
+  // makes a destroyed root reject rather than read as an empty node.
   rememberDirectory(root)
 
   // Prepares (and refuses to start over an unsafe) staging area, so it must run after the root
@@ -1331,6 +1357,9 @@ export async function createFolderBasedFileSystemContentStorage(
         throw err
       }
     })
+    // This id now owns the path, so any damage evidence naming it as a lost DIRECTORY no longer applies.
+    // Only after the store has fully succeeded: a failed one owns nothing. See `forgetDamagedDirectory`.
+    forgetDamagedDirectory(filePath)
   }
 
   // Concurrent-read contract: reads do NOT hold a write's lock for the duration of that write, and never
@@ -1988,6 +2017,9 @@ export async function createFolderBasedFileSystemContentStorage(
     // or the raw-only representation of the new version. Until that commit the previous version
     // stays fully intact; a process killed at any point leaves only sweepable staged files.
     await writingUnder(filePath, () => storeCompressedStaged(id, filePath, stream, rename, signal))
+    // As in `doStoreStream`, and keyed on the same raw path even when the commit went to the gzip: the id
+    // exists, so a read below its path is "nothing stored here". See `forgetDamagedDirectory`.
+    forgetDamagedDirectory(filePath)
   }
 
   /** The fully-staged compressed store. Separated so the directory-cache healing wraps it whole. */

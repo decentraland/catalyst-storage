@@ -769,6 +769,115 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
+  describe('and a store later claims the path a damaged directory occupied', () => {
+    // Damage evidence and a legitimately occupied path are different states, and the first has to stop
+    // applying once the second is true. It did not: after `<root>/a2` had been observed as a directory and
+    // then destroyed, a SUCCESSFUL store of the id `a2` left the damage entry in place, so reads of `a2/b`
+    // kept rejecting — while the store side refuses that id as an ordinary prefix collision and `delete`
+    // resolves for it. Those three have to agree, and under a legitimately occupied prefix the answer is
+    // "absent", which is the case this whole change exists to report correctly.
+    let repaired: IContentStorageComponent
+    let flatRoot: string
+
+    const damageThenStore = async (compressed: boolean): Promise<void> => {
+      // Observes `<root>/a2` as a directory, then destroys it, then reports the damage once — which is what
+      // moves the observation into the damaged set.
+      await repaired.storeStream('a2/b', bufferToStream(Buffer.from('nested')))
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+      await expect(repaired.exist('a2/b')).rejects.toBeDefined()
+      // The id `a2` now legitimately owns that path — as a file for a raw store, or as `a2.gzip` for a
+      // compressed one. Both shapes must clear the evidence: the id exists either way.
+      const body = compressed ? Buffer.alloc(3000, 'A') : Buffer.from('content of a2')
+      if (compressed) await repaired.storeStreamAndCompress('a2', bufferToStream(body))
+      else await repaired.storeStream('a2', bufferToStream(body))
+    }
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'repaired-prefix-'))
+      repaired = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+    })
+
+    afterEach(async () => {
+      await repaired.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    describe('and the store committed the raw representation', () => {
+      beforeEach(async () => {
+        await damageThenStore(false)
+      })
+
+      it('should report a read under the occupied prefix as absent rather than a fault', async () => {
+        expect(await repaired.exist('a2/b')).toBe(false)
+      })
+
+      it('should agree with retrieve', async () => {
+        expect(await repaired.retrieve('a2/b')).toBeUndefined()
+      })
+
+      it('should still serve the id that now owns the path', async () => {
+        expect(await repaired.exist('a2')).toBe(true)
+      })
+    })
+
+    describe('and the store committed the compressed representation', () => {
+      beforeEach(async () => {
+        await damageThenStore(true)
+      })
+
+      it('should report a read under the occupied prefix as absent rather than a fault', async () => {
+        expect(await repaired.exist('a2/b')).toBe(false)
+      })
+
+      it('should still serve the id that now owns the path', async () => {
+        expect(await repaired.exist('a2')).toBe(true)
+      })
+    })
+  })
+
+  describe('and the root observation has been dropped from the bounded cache', () => {
+    // The root is seeded into `knownDirectories`, but that set is FIFO-bounded and the root is inserted
+    // FIRST, so it is the first entry evicted once a flat-mode deployment observes more than
+    // MAX_KNOWN_DIRECTORIES directories — which nested ids reach in ordinary operation. Filling that cache
+    // in a test would mean creating 100,000 directories, so this drives the SAME loss through
+    // `forgetDirectory(root)`, which a write failing ENOTDIR under a file-occupied root reaches immediately.
+    // Either way the observation is gone from the set, which is the state that must not decide the answer.
+    let orphaned: IContentStorageComponent
+    let parentDir: string
+    let rootPath: string
+
+    beforeEach(async () => {
+      parentDir = mkdtempSync(path.join(os.tmpdir(), 'root-evicted-'))
+      rootPath = path.join(parentDir, 'storage-root')
+      orphaned = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        rootPath,
+        { disablePrefixHash: true }
+      )
+      rmSync(rootPath, { recursive: true, force: true })
+      await nodeFs.writeFile(rootPath, 'not a directory')
+      // Fails ENOTDIR at its staged write, and `writingUnder` responds by forgetting the root entry.
+      await expect(orphaned.storeStream('some-id', bufferToStream(Buffer.from('x')))).rejects.toBeDefined()
+    })
+
+    afterEach(async () => {
+      await orphaned?.stop?.().catch(() => undefined)
+      rmSync(parentDir, { recursive: true, force: true })
+    })
+
+    it('should still reject rather than report the id as absent', async () => {
+      await expect(orphaned.exist('some-id')).rejects.toBeDefined()
+    })
+
+    it('should still reject retrieve', async () => {
+      await expect(orphaned.retrieve('some-id')).rejects.toBeDefined()
+    })
+  })
+
   describe('and an ancestor of an id path is another id content file', () => {
     let obstructed: IContentStorageComponent
     let flatRoot: string
