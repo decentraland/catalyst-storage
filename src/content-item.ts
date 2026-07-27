@@ -14,8 +14,14 @@ const IDENTITY_ENCODINGS = new Set(['', 'identity'])
  * Codings that describe the TRANSFER of the bytes rather than the content itself, and so are already
  * undone by the time a body reaches us. `aws-chunked` is written by S3 on flexible-checksum uploads,
  * frequently alongside a real coding (`gzip, aws-chunked`).
+ *
+ * `aws-chunked` ONLY. Bare `chunked` was here too and has been removed: it is a `Transfer-Encoding`
+ * value, not a content coding, so an object whose `Content-Encoding` says `chunked` carries metadata that
+ * is simply wrong. Treating it as "nothing is applied" silently accepted that and served the bytes as if
+ * the header agreed; leaving it unrecognised means `asStream()` refuses it and names `asRawStream()`, which
+ * is what every other coding this library cannot undo already does.
  */
-const TRANSPARENT_CODINGS = new Set(['aws-chunked', 'chunked'])
+const TRANSPARENT_CODINGS = new Set(['aws-chunked'])
 
 /** Whether a single, trimmed coding token describes nothing that is still applied to these bytes. */
 function isVacuousCoding(coding: string): boolean {
@@ -54,21 +60,32 @@ export function normalizeContentEncoding(encoding: string | null | undefined): s
 }
 
 /**
- * The content coding that still has to be undone, or `null` when the bytes are already plain.
+ * Every coding still applied to the stored bytes, outermost LAST, lowercased.
  *
  * `Content-Encoding` is a comma-separated LIST applied in order, so the value is not a single token:
  * treating it as one made `gzip, aws-chunked` — the ordinary shape for an S3 object uploaded with a
  * checksum — unreadable through `asStream()`, along with a bare `aws-chunked` that needs no decoding
  * at all.
  */
-export function contentCodingOf(encoding: string | null): string | null {
-  if (encoding === null) return null
-  const codings = encoding
+function appliedCodings(encoding: string | null): string[] {
+  if (encoding === null) return []
+  return encoding
     .split(',')
     .map((each) => each.trim().toLowerCase())
     .filter((each) => !isVacuousCoding(each))
-  // Only the outermost coding can be undone here; a genuine multi-coding body would need to be
-  // unwrapped in reverse, which no backend in this library produces.
+}
+
+/**
+ * The single content coding that still has to be undone, or `null` when the bytes are already plain.
+ *
+ * Answers for the OUTERMOST coding, which is the only one that could be undone first. Callers use it as
+ * "is anything still applied to these bytes?" — to decide whether `contentSize` is knowable, and whether a
+ * byte range can address the content — and for both of those a multi-coding body answers the same as a
+ * single-coding one. Deciding what to DECODE goes through `appliedCodings` instead, because a body with more
+ * than one coding cannot be undone by one decoder; see `asStream`.
+ */
+export function contentCodingOf(encoding: string | null): string | null {
+  const codings = appliedCodings(encoding)
   return codings.length === 0 ? null : codings[codings.length - 1]
 }
 
@@ -135,11 +152,26 @@ export class SimpleContentItem implements ContentItem {
   async asStream(): Promise<Readable> {
     const stream = await this.streamCreator()
 
-    const coding = contentCodingOf(this.encoding)
-    if (coding !== null) {
+    const codings = appliedCodings(this.encoding)
+    if (codings.length > 0) {
       let decoder: Transform
       try {
-        decoder = createDecoderFor(coding)
+        // MORE THAN ONE coding is refused, not partially undone. Only one decoder is applied here, so a body
+        // stored as `gzip, br` would have Brotli undone and be handed back STILL GZIPPED — under a contract
+        // that says this yields decompressed content, with nothing to tell the caller otherwise. Refusing is
+        // the same answer this already gives for a coding it cannot decode at all, and for the same reason.
+        //
+        // No backend in this library writes more than one coding: the folder-based one writes `gzip` and S3
+        // writes none, so this is only reachable for an object an operator or a migration put there. Chaining
+        // decoders in reverse would be the alternative, but it would be a decode path with no way to produce
+        // test input from the library itself and no caller asking for it.
+        if (codings.length > 1) {
+          throw new Error(
+            `Cannot decode content stored with multiple content codings: ${JSON.stringify(this.encoding)}. ` +
+              `This storage undoes at most one. Use asRawStream() to read the stored bytes as they are.`
+          )
+        }
+        decoder = createDecoderFor(codings[0])
       } catch (err) {
         // The source is already open; leaving it undestroyed would hold its descriptor for the life
         // of the process.

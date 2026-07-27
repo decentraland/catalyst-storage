@@ -935,6 +935,69 @@ export async function createFolderBasedFileSystemContentStorage(
   // a failed post-rename cleanup are repaired before serving, and REJECT when they cannot be — a
   // read never exposes a known-mixed state (see the intent journal's quarantine).
   //
+  /**
+   * Produces an item and, when the path it serves is a TRACKED cache file, protects that file from LRU
+   * eviction until the consumer's stream has its descriptor.
+   *
+   * Applied wherever a cache file may be served, not only after the call that inflated it. `retrieve` hands
+   * back a LAZY item, so between producing it and the consumer opening the stream an eviction pass — which
+   * an admission elsewhere can start at any moment — may unlink the file. Wrapping only the inflating call
+   * left every cache HIT exposed to that, which is the common case once a range has been served once.
+   *
+   * The pin is released once the descriptor exists, NOT once the stream object does: `fs.createReadStream`
+   * opens lazily, so releasing when the creator returned dropped the protection while the open was still
+   * pending and the file could be unlinked underneath it (measured 1 failure in 50 concurrent reads). Once
+   * the fd is open an unlink cannot disturb the reader — the inode survives until the descriptor closes.
+   * 'error' and 'close' release too, so an open that never succeeds cannot hold the pin, and the grace timer
+   * in `cache.pin` is the backstop for an item that is never read at all. Release is idempotent.
+   *
+   * `cache.pin` is a no-op for a path with no tracked entry, so an ordinary raw-primary read pays nothing.
+   */
+  async function pinnedUntilOpen(
+    filePath: string,
+    produce: () => Promise<ContentItem | undefined>
+  ): Promise<ContentItem | undefined> {
+    const releasePin = cache.pin(filePath, CACHE_PIN_GRACE_MS)
+    let item: ContentItem | undefined
+    try {
+      item = await produce()
+    } catch (err) {
+      releasePin()
+      throw err
+    }
+    if (!item) {
+      releasePin()
+      return undefined
+    }
+    // Wrapped over `asRawStream` with the inner item's own encoding, so `asStream`'s decoding behaviour and
+    // the item's advertised metadata are unchanged. A cache file is always unencoded; a raw-primary read may
+    // not be, and either way the inner item decides.
+    const inner = item
+    return new SimpleContentItem(
+      async () => {
+        let stream: Readable
+        try {
+          stream = await inner.asRawStream()
+        } catch (err) {
+          releasePin()
+          throw err
+        }
+        // `pending` is false once the descriptor is open; a non-fs stream has no such phase.
+        if ((stream as Readable & { pending?: boolean }).pending === false) {
+          releasePin()
+        } else {
+          stream.once('open', releasePin)
+        }
+        stream.once('error', releasePin)
+        stream.once('close', releasePin)
+        return stream
+      },
+      inner.size,
+      inner.encoding,
+      inner.contentSize
+    )
+  }
+
   // Error contract: `undefined` means "there is nothing to serve for this id" — it is absent, it
   // does not resolve to a servable path, it exceeded the decompression cap, or it vanished mid-read.
   // A failure of the storage ITSELF (EACCES/EIO/ENOSPC on its own directories, a corrupt gzip, a
@@ -960,7 +1023,14 @@ export async function createFolderBasedFileSystemContentStorage(
       // question once for both representations.
       if (!requestedRange) contentItem = await retrieveWithEncoding(id, 'gzip', undefined, true, true, baseFilePath)
       if (!contentItem) {
-        contentItem = await retrieveWithEncoding(id, null, requestedRange, true, false, baseFilePath)
+        // Pinned for the SAME reason a freshly inflated one is: if this path is a tracked cache file, the
+        // item returned here is lazy too, and a burst of concurrent reads over already-materialized entries
+        // touches several of them and then lets an eviction pass unlink one whose reader has not opened it
+        // yet. Only the inflating call used to wrap its item, so a cache HIT — the common case once a range
+        // has been served for an id — was left exposed to exactly the ENOENT the pin exists to prevent.
+        contentItem = await pinnedUntilOpen(baseFilePath, () =>
+          retrieveWithEncoding(id, null, requestedRange, true, false, baseFilePath)
+        )
         if (contentItem && requestedRange) {
           // Update last access if this file is in the cache
           cache.touch(baseFilePath)
@@ -990,56 +1060,11 @@ export async function createFolderBasedFileSystemContentStorage(
         // The gap between `record` (inside the inflation's own path lock) and this line is microtasks with
         // no I/O, and across it the just-recorded entry is the most recent one, which the LRU walk already
         // refuses to evict.
-        const releasePin = cache.pin(baseFilePath, CACHE_PIN_GRACE_MS)
-        try {
+        contentItem = await pinnedUntilOpen(baseFilePath, () =>
           // Serve range from the cached uncompressed file (undefined when the gzip didn't exist or
           // the decompression was discarded; the loop then retries once)
-          contentItem = await retrieveWithEncoding(id, null, requestedRange, true, false, baseFilePath)
-        } catch (err) {
-          releasePin()
-          throw err
-        }
-        if (!contentItem) {
-          releasePin()
-        } else {
-          // Released once the consumer's stream has its DESCRIPTOR, not merely once the stream object
-          // exists. `fs.createReadStream` opens lazily, so releasing when the creator returned was too
-          // early: the pin dropped, an eviction pass unlinked the file, and the still-pending open then
-          // failed ENOENT — the very race the pin exists to prevent, reintroduced by releasing at the wrong
-          // moment (measured 1 failure in 50 concurrent reads). Once the fd is open, an unlink cannot
-          // disturb the reader: the inode survives until the descriptor closes.
-          //
-          // 'error' and 'close' release too, so an open that never succeeds cannot hold the pin, and the
-          // grace timer remains the backstop for an item that is never read at all. `release` is idempotent.
-          //
-          // Wrapped over `asRawStream` with the inner item's own encoding (always `null` here — this is
-          // the decompressed cache file, read through a byte range), so `asStream`'s decoding behaviour
-          // and the item's advertised metadata are unchanged.
-          const inner = contentItem
-          contentItem = new SimpleContentItem(
-            async () => {
-              let stream: Readable
-              try {
-                stream = await inner.asRawStream()
-              } catch (err) {
-                releasePin()
-                throw err
-              }
-              // `pending` is false once the descriptor is open; a non-fs stream has no such phase.
-              if ((stream as Readable & { pending?: boolean }).pending === false) {
-                releasePin()
-              } else {
-                stream.once('open', releasePin)
-              }
-              stream.once('error', releasePin)
-              stream.once('close', releasePin)
-              return stream
-            },
-            inner.size,
-            inner.encoding,
-            inner.contentSize
-          )
-        }
+          retrieveWithEncoding(id, null, requestedRange, true, false, baseFilePath)
+        )
       }
 
       return contentItem

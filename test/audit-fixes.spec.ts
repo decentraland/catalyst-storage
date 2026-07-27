@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, createReadStream, promises as nodeFsPromises } fro
 import os from 'os'
 import path from 'path'
 import { Readable, Writable } from 'stream'
-import { gzipSync } from 'zlib'
+import { brotliCompressSync, gzipSync } from 'zlib'
 import { createLogComponent } from '@well-known-components/logger'
 import {
   assertStorableStream,
@@ -20,6 +20,7 @@ import {
   RangeNotSupportedError
 } from '../src'
 import { createFakeS3Client } from './fake-s3-client'
+import { createDecompressCache } from '../src/folder-based/decompress-cache'
 
 /** The real detector is ESM-only and reached through an import Jest's registry does not own. */
 const undetectingLoader: FileTypeLoader = async () => ({ fileTypeFromBuffer: async () => undefined })
@@ -1278,6 +1279,162 @@ describe('when an S3 object carries a transfer coding in its Content-Encoding', 
   })
 })
 
+describe('when an S3 object carries more than one real content coding', () => {
+  // `asStream()` applies at most one decoder, so `gzip, br` had Brotli undone and was handed back STILL
+  // GZIPPED — under a contract that says the stream yields decompressed content, with nothing to say
+  // otherwise. Refusing is the same answer already given for a coding this storage cannot decode at all.
+  let storage: IContentStorageComponent
+  let s3: ReturnType<typeof createFakeS3Client>
+  let doublyEncoded: Buffer
+
+  beforeEach(async () => {
+    s3 = createFakeS3Client()
+    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, s3, {
+      Bucket: 'a-bucket',
+      fileTypeLoader: undetectingLoader
+    })
+    // Genuinely gzip-then-brotli encoded, so a partially applied decode would be observable.
+    doublyEncoded = brotliCompressSync(gzipSync(Buffer.from('the real content')))
+    s3.objects.set('doubly', { body: doublyEncoded, contentEncoding: 'gzip, br' })
+  })
+
+  afterEach(() => {
+    s3.destroy()
+  })
+
+  it('should report both codings, since both are still applied', async () => {
+    expect((await storage.fileInfo('doubly'))!.encoding).toBe('gzip, br')
+  })
+
+  it('should report an unknown contentSize', async () => {
+    expect((await storage.fileInfo('doubly'))!.contentSize).toBeNull()
+  })
+
+  it('should refuse to decode rather than returning half-decoded bytes', async () => {
+    const item = await storage.retrieve('doubly')
+
+    await expect(item!.asStream()).rejects.toThrow('multiple content codings')
+  })
+
+  it('should name asRawStream in the refusal, so the bytes stay reachable', async () => {
+    const item = await storage.retrieve('doubly')
+
+    await expect(item!.asStream()).rejects.toThrow('asRawStream()')
+  })
+
+  it('should still hand over the stored bytes through asRawStream', async () => {
+    const item = await storage.retrieve('doubly')
+
+    expect([...(await streamToBuffer(await item!.asRawStream()))]).toEqual([...doublyEncoded])
+  })
+
+  it('should refuse a range, because something is still applied to the stored bytes', async () => {
+    await expect(storage.retrieve('doubly', { start: 0, end: 3 })).rejects.toBeInstanceOf(RangeNotSupportedError)
+  })
+
+  it('should still decode a single coding alongside a transfer coding', async () => {
+    s3.objects.set('single', { body: gzipSync(Buffer.from('the real content')), contentEncoding: 'gzip, aws-chunked' })
+    const item = await storage.retrieve('single')
+
+    expect((await streamToBuffer(await item!.asStream())).toString()).toBe('the real content')
+  })
+})
+
+describe('when an S3 object declares chunked as its content encoding', () => {
+  // `chunked` is a Transfer-Encoding value, not a content coding, so this metadata is simply wrong. It used
+  // to be folded away as "nothing applied", which served the bytes as though the header agreed; it is now
+  // left unrecognised so the refusal names `asRawStream()`.
+  let storage: IContentStorageComponent
+  let s3: ReturnType<typeof createFakeS3Client>
+
+  beforeEach(async () => {
+    s3 = createFakeS3Client()
+    storage = await createS3BasedFileSystemContentStorage({ logs: await createLogComponent({}) }, s3, {
+      Bucket: 'a-bucket',
+      fileTypeLoader: undetectingLoader
+    })
+    s3.objects.set('chunky', { body: Buffer.from('the real content'), contentEncoding: 'chunked' })
+  })
+
+  afterEach(() => {
+    s3.destroy()
+  })
+
+  it('should report it rather than folding it away', async () => {
+    expect((await storage.fileInfo('chunky'))!.encoding).toBe('chunked')
+  })
+
+  it('should refuse to decode it', async () => {
+    const item = await storage.retrieve('chunky')
+
+    await expect(item!.asStream()).rejects.toThrow('unsupported encoding')
+  })
+
+  it('should still hand over the stored bytes through asRawStream', async () => {
+    const item = await storage.retrieve('chunky')
+
+    expect((await streamToBuffer(await item!.asRawStream())).toString()).toBe('the real content')
+  })
+})
+
+describe('when concurrent range reads hit an already-materialized cache file', () => {
+  // Only the call that INFLATED a cache file wrapped its item in the pin, so a cache HIT — the common case
+  // once a range has been served for an id — handed back a lazy stream with no protection. A burst of such
+  // reads touches several entries and then lets an eviction pass unlink one whose reader has not opened it
+  // yet, failing a read for content that was present.
+  const CONCURRENT_READS = 20
+  let root: string
+  let storage: IContentStorageComponent
+  let ids: string[]
+  let outcomes: PromiseSettledResult<number>[]
+
+  beforeEach(async () => {
+    root = mkdtempSync(path.join(os.tmpdir(), 'cache-hit-pin-'))
+    storage = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      root,
+      {
+        disablePrefixHash: true,
+        // Smaller than one inflated file, so every admission is over budget and eviction is always hunting.
+        decompressCacheMaxSize: 20_000,
+        decompressCacheEvictionInterval: 60_000
+      }
+    )
+    ids = Array.from({ length: CONCURRENT_READS }, (_, index) => `id-${index}`)
+    for (const id of ids) {
+      await storage.storeStreamAndCompress(id, bufferToStream(Buffer.alloc(30_000, 0x41)))
+    }
+    // MATERIALIZE first, sequentially, so the burst below is entirely cache hits rather than inflations.
+    for (const id of ids) {
+      const warm = await storage.retrieve(id, { start: 0, end: 9 })
+      await streamToBuffer(await warm!.asStream())
+    }
+
+    outcomes = await Promise.allSettled(
+      ids.map(async (id) => {
+        const item = await storage.retrieve(id, { start: 0, end: 9 })
+        if (!item) throw new Error(`retrieve returned undefined for ${id}`)
+        return (await streamToBuffer(await item.asStream())).length
+      })
+    )
+  })
+
+  afterEach(async () => {
+    await storage.stop?.()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('should serve every read rather than losing one to a concurrent eviction', () => {
+    expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toEqual([])
+  })
+
+  it('should serve the requested range for every read that hit the cache', () => {
+    expect(outcomes.map((outcome) => (outcome as PromiseFulfilledResult<number>).value)).toEqual(
+      Array.from({ length: CONCURRENT_READS }, () => 10)
+    )
+  })
+})
+
 describe('when a caller mutates the range object before awaiting retrieve', () => {
   // The snapshot used to be taken after the metadata read, so a caller that did not await immediately could
   // change the bounds while that request was in flight — between `validateRange` accepting them and the
@@ -1372,5 +1529,67 @@ describe('when a gzip placed under a shard has more than one member', () => {
     // Pinned deliberately: detecting the discrepancy costs an O(n) inflate on a metadata call, so the
     // caveat is documented on `readGzipOriginalSize` and `FileInfo.contentSize` instead of paid for here.
     expect((await storage.fileInfo('multi'))!.contentSize).toBe(4)
+  })
+})
+
+describe('when a pin is taken and the cache file at that path is then replaced', () => {
+  // Pins used to be keyed by PATH alone, so one taken for a file that `forget()`/`remove()` later dropped
+  // went on protecting whatever a subsequent inflation recorded at the same path — silently exempting an
+  // entry nobody was reading from the size budget for the rest of the grace window. Binding a pin to the
+  // tracked entry's generation makes the successor a different thing, which it is.
+  let unlinked: string[]
+  let cache: ReturnType<typeof createDecompressCache>
+
+  beforeEach(() => {
+    unlinked = []
+    cache = createDecompressCache(
+      {
+        logger: { log() {}, info() {}, debug() {}, warn() {}, error() {} } as any,
+        fsInvariants: {
+          existsForInvariant: async () => false,
+          noFailUnlink: async (target: string) => {
+            unlinked.push(target)
+            return true
+          }
+        }
+      },
+      { ttl: 3_600_000, maxSize: 10 }
+    )
+  })
+
+  it('should not let a stale pin protect the next generation at that path', async () => {
+    cache.record('/a', 100)
+    cache.pin('/a', 60_000)
+    // A store landing at this path promotes it to primary content and drops the entry.
+    cache.forget('/a')
+    // A later inflation records a NEW cache file at the same path, which the old pin must not cover.
+    cache.record('/a', 100)
+    cache.record('/b', 100)
+
+    // Awaited rather than sampled: `record` starts a pass it cannot await, so an explicit `evict()` may
+    // return the one already in flight rather than a fresh walk.
+    expect(await waitFor(async () => unlinked.includes('/a'), 2_000)).toBe(true)
+  })
+
+  it('should still protect the generation the pin was actually taken for', async () => {
+    // THREE entries, because the LRU walk always leaves the most recent one alone: with two, the only
+    // candidate is the pinned entry and nothing is evicted either way, so the assertion would hold vacuously.
+    cache.record('/a', 100)
+    cache.pin('/a', 60_000)
+    cache.record('/b', 100)
+    cache.record('/c', 100)
+
+    // '/b' being reclaimed proves a pass ran and was productive, so '/a' surviving is a real skip.
+    expect(await waitFor(async () => unlinked.includes('/b'), 2_000)).toBe(true)
+    expect(unlinked).not.toContain('/a')
+  })
+
+  it('should be a no-op for a path with no tracked entry', async () => {
+    const release = cache.pin('/never-recorded', 60_000)
+    cache.record('/never-recorded', 100)
+    cache.record('/b', 100)
+    release()
+
+    expect(await waitFor(async () => unlinked.includes('/never-recorded'), 2_000)).toBe(true)
   })
 })

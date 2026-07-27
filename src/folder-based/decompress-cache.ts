@@ -50,6 +50,10 @@ export type DecompressCache = {
    * opening it there is a window in which LRU could unlink it and turn present content into an ENOENT.
    * `graceMs` bounds the pin so an item that is never consumed cannot exempt its entry indefinitely.
    * TTL eviction is not affected: an entry past its TTL is stale regardless of who is holding it.
+   *
+   * Bound to the entry tracked at the time of the call: a LATER cache file at the same path is a different
+   * thing and is not protected by this pin. A path with no tracked entry has nothing to protect, so the
+   * returned release is a no-op.
    */
   pin(filePath: string, graceMs: number): () => void
   /**
@@ -126,8 +130,13 @@ export function createDecompressCache(
   // over 50KB files is 100k entries, measured at 78ms of BLOCKING event-loop time per pass (3.9ms at
   // 5k, 17ms at 20k) versus 0.055ms for the ordered walk. `record()` can start a pass from inside a
   // range read, so that was latency on the read path.
-  const entries = new Map<string, { size: number; lastAccess: number }>()
+  const entries = new Map<string, { size: number; lastAccess: number; generation: number }>()
   let totalCacheSize = 0
+  /**
+   * Distinguishes successive cache files at the SAME path, so a pin cannot outlive the file it was taken for.
+   * Monotonic and never reused; see `pin`.
+   */
+  let nextGeneration = 0
 
   // Concurrency guard: prevents multiple simultaneous decompressions of the same file
   const inflightDecompressions = new Map<string, Promise<void>>()
@@ -151,22 +160,35 @@ export function createDecompressCache(
    * never-consumed item would pin its entry for the life of the process and quietly exempt it from the
    * size budget, which is the same class of leak as the untracked orphan this cache already guards.
    */
-  const pins = new Map<string, number>()
-  /** Every live pin's forced release, in acquisition order, so the oldest can be dropped at the cap. */
-  const pinExpiries = new Map<number, () => void>()
-  let nextPinId = 0
+  const pins = new Map<string, Map<number, number>>()
 
   function pin(filePath: string, graceMs: number): () => void {
-    pins.set(filePath, (pins.get(filePath) ?? 0) + 1)
-    const pinId = nextPinId++
+    // Bound to the tracked entry's GENERATION, not just to the path. A path can hold a succession of
+    // different cache files — `forget()` when a store promotes it to primary content, `remove()` on a delete,
+    // then a later inflation recording a new one — and a path-keyed pin outlived its own file, so a pin taken
+    // for one generation went on protecting whatever landed at that path next. That silently exempted an
+    // entry nobody was reading from the size budget for the rest of the grace window.
+    //
+    // No entry means nothing to protect, so the pin is a no-op rather than a promise about a path: eviction
+    // only ever walks tracked entries, and the caller (an ordinary raw-primary read) pays nothing.
+    const generation = entries.get(filePath)?.generation
+    if (generation === undefined) return () => undefined
+
+    const forPath = pins.get(filePath) ?? new Map<number, number>()
+    forPath.set(generation, (forPath.get(generation) ?? 0) + 1)
+    pins.set(filePath, forPath)
+
     let released = false
     const release = (): void => {
       if (released) return
       released = true
-      pinExpiries.delete(pinId)
-      const remaining = (pins.get(filePath) ?? 1) - 1
-      if (remaining > 0) pins.set(filePath, remaining)
-      else pins.delete(filePath)
+      const held = pins.get(filePath)
+      if (held) {
+        const remaining = (held.get(generation) ?? 1) - 1
+        if (remaining > 0) held.set(generation, remaining)
+        else held.delete(generation)
+        if (held.size === 0) pins.delete(filePath)
+      }
       // RELEASING A PIN IS AN EVICTION TRIGGER. Passes were driven only by admissions and the interval, so
       // the pass that ran on the LAST admission of a burst saw every entry still pinned, freed nothing, and
       // nothing re-ran it: a burst of range reads left every derived file on disk until the next timer tick,
@@ -183,18 +205,16 @@ export function createDecompressCache(
     const expiry = setTimeout(release, graceMs)
     // Never keep the process alive for a pin; the cache is a disk-space optimisation, not work in flight.
     expiry.unref?.()
-    const releaseNow = (): void => {
-      clearTimeout(expiry)
-      release()
-    }
-    pinExpiries.set(pinId, releaseNow)
 
     // DELIBERATELY NOT CAPPED. Force-releasing the oldest pin at a cap was tried and reverted: it hands the
     // budget back its accuracy by re-exposing a reader to the ENOENT its pin exists to prevent, and failing
     // a read of content that is present — a 5xx, per the read contract — is strictly worse than holding more
     // disk than the budget for a few seconds. What bounds the exposure instead is how long a pin can live
     // (`graceMs`), which is why that window is short. See `pin`'s caller for the resulting bound.
-    return releaseNow
+    return () => {
+      clearTimeout(expiry)
+      release()
+    }
   }
 
   let activeInflations = 0
@@ -252,7 +272,7 @@ export function createDecompressCache(
   // scan and this delete — unlinking then would destroy the only copy of the new content.
   async function evictEntry(
     filePath: string,
-    entry: { size: number; lastAccess: number },
+    entry: { size: number; lastAccess: number; generation: number },
     /**
      * The entry's `lastAccess` when the pass selected it. A pass takes its snapshot and then awaits
      * an unlink per entry, so by the time this runs the entry may have been TOUCHED by a read that
@@ -294,7 +314,7 @@ export function createDecompressCache(
    */
   async function evictEntrySafely(
     filePath: string,
-    entry: { size: number; lastAccess: number },
+    entry: { size: number; lastAccess: number; generation: number },
     expectedLastAccess?: number
   ): Promise<boolean> {
     try {
@@ -385,7 +405,7 @@ export function createDecompressCache(
         // soon as another lands, and 20 concurrent reads of present gzip-only ids produced a spurious
         // ENOENT — content that was never missing, surfaced to the caller as a 5xx by the read contract.
         // `continue`, not `break`: a pinned entry must not shield the older ones behind it from eviction.
-        if (pins.has(filePath)) continue
+        if (pins.get(filePath)?.has(entry.generation)) continue
         attemptedAnEviction = true
         if (await evictEntrySafely(filePath, entry, entry.lastAccess)) evictedThisPass++
       }
@@ -428,6 +448,18 @@ export function createDecompressCache(
       .catch((error) => logger.warn(`Cache eviction failed: ${error}`))
       .finally(() => {
         inflightEviction = undefined
+        // CONSUME a request that arrived while this pass was running. `runEviction`'s own re-arm sits after
+        // the stall check, so a pass that took the stall return dropped `evictionRequestedAgain` on the floor
+        // — and a pass can complete SYNCHRONOUSLY (an unproductive one hits no await), which means the
+        // admissions right behind it all find `inflightEviction` still set and can only set that flag. The
+        // result was a burst that scheduled no pass at all: nothing was ever reclaimed.
+        //
+        // Gated on the stall having been cleared, which the admission and pin-release paths only do when
+        // something genuinely changed — so a damaged mount still backs off instead of spinning here.
+        if (evictionRequestedAgain && totalCacheSize > options.maxSize && !evictionStalled) {
+          evictionRequestedAgain = false
+          void evict()
+        }
       })
     return inflightEviction
   }
@@ -473,7 +505,7 @@ export function createDecompressCache(
       // without subtracting its old size would inflate the total permanently and make the size
       // budget evict content that is not actually over it.
       forget(filePath)
-      entries.set(filePath, { size, lastAccess: Date.now() })
+      entries.set(filePath, { size, lastAccess: Date.now(), generation: nextGeneration++ })
       totalCacheSize += size
       // The budget was previously consulted ONLY by the periodic sweep, so it bounded nothing between
       // ticks: a burst of range requests over distinct gzip-only ids (a sync or backfill pass is
