@@ -234,7 +234,10 @@ describe('folder-based review regressions', () => {
 
   const logs = async () => createLogComponent({})
   const shardOf = (base: string): string => path.join(base, '9584')
-  const realFs = (): IFileSystemComponent => createFsComponent()
+  // Return type INFERRED rather than annotated as `IFileSystemComponent`: that annotation widened away
+  // `existPath`, which the interface now only declares optionally (it is deprecated and unused by the
+  // library), while the bundled component still provides it. The assertions below call it directly.
+  const realFs = () => createFsComponent()
 
   afterEach(async () => {
     await storage?.stop?.()
@@ -702,27 +705,69 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
-  describe('and an ancestor of the shard stops being a directory', () => {
+  describe('and an ancestor of an id path is another id content file', () => {
     let obstructed: IContentStorageComponent
+    let flatRoot: string
 
     beforeEach(async () => {
-      // ENOTDIR from the PARENT probe means a hard obstruction above the shard; it used to be
-      // lumped in with "this shard was never created" and answered as a miss.
-      const flatRoot = mkdtempSync(path.join(os.tmpdir(), 'obstructed-'))
+      // Flat mode, so ids share one namespace directory and `a/b/c/d` really does sit under `a/b`.
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'obstructed-'))
       obstructed = await createFolderBasedFileSystemContentStorage(
         { fs: createFsComponent(), logs: await createLogComponent({}) },
         flatRoot,
         { disablePrefixHash: true }
       )
+      // Creates the directory `a` and the FILE `a/b`, so `a/b/c` can never be a directory.
       await obstructed.storeStream('a/b', bufferToStream(Buffer.from('content')))
     })
 
     afterEach(async () => {
       await obstructed.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
     })
 
-    it('should reject a read nested under the obstruction', async () => {
-      await expect(obstructed.exist('a/b/c/d')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    // THIS EXPECTATION WAS FLIPPED DELIBERATELY. It used to assert a bare ENOTDIR rejection, on the
+    // reasoning that an obstruction above a shard is a hard fault. The rejection was the wrong answer for
+    // THIS shape: a filesystem cannot hold a file and a directory at one path, so no file can exist at
+    // `a/b/c/d` while `a/b` is a regular file — the id is provably absent, exactly as an over-long name
+    // is. Rejecting made the three surfaces contradict each other (see the assertions below) and let one
+    // such id destroy a whole batch. What still rejects is damage this instance can PROVE: a directory it
+    // observed that stops being one, which the sibling describes above cover.
+    it('should report the nested id as absent rather than rejecting', async () => {
+      expect(await obstructed.exist('a/b/c/d')).toBe(false)
+      expect(await obstructed.retrieve('a/b/c/d')).toBeUndefined()
+      expect(await obstructed.fileInfo('a/b/c/d')).toBeUndefined()
+    })
+
+    it('should agree with delete, which already resolved for such an id', async () => {
+      await expect(obstructed.delete(['a/b/c/d'])).resolves.toBeUndefined()
+      expect(await obstructed.exist('a/b/c/d')).toBe(false)
+    })
+
+    it('should not lose the answers for every other id in a batch', async () => {
+      // The whole batch used to reject on the obstructed id, so a GC or availability sweep learned
+      // nothing about the ids around it — and got a 5xx for a question with a provable answer.
+      const answers = await obstructed.existMultiple(['a/b', 'a/b/c/d'])
+      expect(answers.get('a/b')).toBe(true)
+      expect(answers.get('a/b/c/d')).toBe(false)
+    })
+
+    it('should still refuse to STORE the id, with the typed error', async () => {
+      // A read asks a question whose true answer is "nothing"; a store asks to CREATE something no
+      // filesystem can hold. Only the latter is a caller error, so only it rejects.
+      await expect(obstructed.storeStream('a/b/c/d', bufferToStream(Buffer.from('nope')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    })
+
+    it('should still reject when the obstructed directory is one this instance observed', async () => {
+      // The `knownDirectories` gate, which is what keeps real damage loud: `a` was created by the store
+      // above, so replacing it with a file is a directory this instance owns ceasing to be one.
+      await obstructed.storeStream('a2/b', bufferToStream(Buffer.from('content')))
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+      await nodeFs.writeFile(path.join(flatRoot, 'a2'), 'not a directory')
+
+      await expect(obstructed.exist('a2/b')).rejects.toMatchObject({ code: 'ENOTDIR' })
     })
   })
 

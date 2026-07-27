@@ -517,6 +517,59 @@ describe('when allFileIds walks a directory', () => {
       expect(small.listed.sort()).toEqual(large.listed.filter((id) => !id.startsWith('pad-')).sort())
     })
   })
+
+  describe('and it holds more COMPRESSED entries than the gzip-name set can hold', () => {
+    // The set of compressed names was unbounded, so the two-read path retained one string per compressed
+    // entry — the memory the fallback exists to avoid. Measured before the cap, in flat mode: 19.5MB
+    // retained for 50k compressed entries, 44MB for 150k, growing linearly. Capping it means a raw entry
+    // MISSING from the set no longer proves the sibling is absent, so the walk has to ask the filesystem;
+    // these pin that the answers did not change in either direction.
+    /** More compressed entries than the cap, so the set provably overflows. */
+    const overflowingGzips = (count: number): string[] =>
+      Array.from({ length: count }, (_, i) => `pad-${String(i).padStart(6, '0')}.gzip`)
+
+    it('should still hide a raw whose compressed sibling exists but was evicted from the set', async () => {
+      // `zz` sorts last, so its `.gzip` is the one the capped set drops — and it is a real file on disk,
+      // so the confirming stat finds it. Yielding `zz` here would report the decompression CACHE as a
+      // second id, which is what the dedup exists to prevent.
+      const names = [...overflowingGzips(MAX_BUFFERED_DIRECTORY_ENTRIES + 10), 'zz', 'zz.gzip']
+
+      const { listed } = await walk(names)
+
+      expect(listed.filter((id) => id === 'zz')).toEqual(['zz'])
+    })
+
+    it('should still yield a raw that has no compressed sibling at all', async () => {
+      // The direction that must never regress: absence from a CAPPED set is not evidence of absence on
+      // disk, so treating it as one would drop a legitimate raw-only id from the enumeration entirely —
+      // an id yielded ZERO times, which under-reports the node's content to a GC or sync sweep.
+      const names = [...overflowingGzips(MAX_BUFFERED_DIRECTORY_ENTRIES + 10), 'raw-only']
+
+      const { listed } = await walk(names)
+
+      expect(listed).toContain('raw-only')
+    })
+
+    it('should yield every id exactly once', async () => {
+      const names = [...overflowingGzips(MAX_BUFFERED_DIRECTORY_ENTRIES + 10), 'zz', 'zz.gzip', 'raw-only']
+
+      const { listed } = await walk(names)
+
+      expect(new Set(listed).size).toBe(listed.length)
+    })
+  })
+
+  describe('and it holds only raw entries, more than can be buffered', () => {
+    it('should not stat a single one of them', async () => {
+      // The cap costs a `stat` per raw entry only once the gzip set has OVERFLOWED. This is the shape that
+      // must stay free: a flat-mode root of raw-only content has no compressed names at all, so the set
+      // cannot overflow and the walk keeps deciding every entry from the listing. Paying a syscall per id
+      // here would be one per id on the largest roots this surface accepts.
+      const { statted } = await walk(padTo(MAX_BUFFERED_DIRECTORY_ENTRIES + 1))
+
+      expect(statted.filter((target) => target.includes('pad-'))).toEqual([])
+    })
+  })
 })
 
 describe('when the reserved directory on disk is cased differently from the configured name', () => {

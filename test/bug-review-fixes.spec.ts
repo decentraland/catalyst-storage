@@ -776,4 +776,74 @@ describe('bug review fixes', () => {
       await expect(settleOrHang(second)).resolves.not.toBe('never settled')
     })
   })
+
+  describe('when a range read runs while the storage is shutting down', () => {
+    let storage: IContentStorageComponent
+    let root: string
+    let range: { start: number; end: number }
+    let writesOpened: string[]
+
+    beforeEach(async () => {
+      // A closed cache refuses to publish a derived file, so a range read of gzip-only content cannot be
+      // served and REJECTS — "cannot be read right now", not "not here", because the content is on disk.
+      // The guard implementing that asserted the premise instead of checking it.
+      root = mkdtempSync(path.join(os.tmpdir(), 'shutdown-range-'))
+      range = { start: 0, end: 9 }
+      writesOpened = []
+      const base = createFsComponent()
+      const observed: IFileSystemComponent = {
+        ...base,
+        createWriteStream: ((target: any, ...rest: any[]) => {
+          writesOpened.push(String(target))
+          return (base.createWriteStream as any)(target, ...rest)
+        }) as IFileSystemComponent['createWriteStream']
+      }
+      storage = await createFolderBasedFileSystemContentStorage({ fs: observed, logs: await logs() }, root, {
+        disablePrefixHash: true
+      })
+      await storage.start?.({} as never)
+      await storage.storeStreamAndCompress('gz-id', bufferToStream(Buffer.from('z'.repeat(30_000))))
+      await storage.stop?.()
+      writesOpened.length = 0
+    })
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('should report an absent id as absent rather than as a storage fault', async () => {
+      // The guard's premise is "the id's gzip is present", which is FALSE here: an id with no gzip returns
+      // from the inflation early, having discarded nothing. Every range read of an unknown id answered 5xx
+      // for as long as the cache stayed closed, with a message claiming the content was intact — for content
+      // `exist()` simultaneously reported absent.
+      await expect(storage.retrieve('never-stored', range)).resolves.toBeUndefined()
+    })
+
+    it('should agree with exist about the absent id', async () => {
+      expect(await storage.exist('never-stored')).toBe(false)
+    })
+
+    it('should still reject for gzip-only content that IS present', async () => {
+      // The other direction, which must not regress: this content is on disk and simply cannot be served as
+      // a range while shutting down. Answering `undefined` here would hand the caller a 404 for content
+      // `exist()` reports present.
+      await expect(storage.retrieve('gz-id', range)).rejects.toThrow(/shutting down/)
+    })
+
+    it('should still serve a range of raw-primary content', async () => {
+      await storage.storeStream('raw-id', bufferToStream(Buffer.from('r'.repeat(100))))
+
+      expect((await storage.retrieve('raw-id', range))?.size).toBe(10)
+    })
+
+    it('should not inflate anything it is going to discard', async () => {
+      // The token is born invalidated once the cache is closed, so the commit would unlink whatever this
+      // produced — after paying an inflation slot, the gzip CPU and up to `decompressMaxFileSize` of staged
+      // write, twice, since `retrieve` retries. No staged file should be opened at all.
+      await storage.retrieve('gz-id', range).catch(() => undefined)
+
+      expect(writesOpened).toEqual([])
+    })
+  })
 })
