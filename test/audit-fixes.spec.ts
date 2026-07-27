@@ -1,5 +1,11 @@
 import { createHash } from 'crypto'
-import { mkdtempSync, rmSync, createReadStream, promises as nodeFsPromises } from 'fs'
+import {
+  mkdtempSync,
+  rmSync,
+  createReadStream,
+  readFileSync as nodeFsReadFileSync,
+  promises as nodeFsPromises
+} from 'fs'
 import os from 'os'
 import path from 'path'
 import { Readable, Writable } from 'stream'
@@ -1679,5 +1685,164 @@ describe('when a range read observes a cache file another read materialized betw
     await streamToBuffer(await pressure!.asStream())
 
     expect((await streamToBuffer(await item!.asStream())).length).toBe(10)
+  })
+})
+
+describe('when an id aliases the reserved staging directory through trailing dots or spaces', () => {
+  // Win32 path semantics (NTFS, any SMB/CIFS mount) strip trailing dots and spaces from a segment, so
+  // `.tmp-writes./x` resolves ONTO the reserved directory. The containment check was case-folded but not
+  // tail-folded: the prefix matched and the next character was `.` rather than a separator, so it answered
+  // "not reserved" for a path the filesystem puts squarely inside — where `allFileIds()` cannot see it
+  // (enumeration skips the reserved directory by its real on-disk name) and the startup sweep may act on it.
+  let root: string
+  let storage: IContentStorageComponent
+
+  beforeEach(async () => {
+    root = mkdtempSync(path.join(os.tmpdir(), 'reserved-alias-'))
+    storage = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      root,
+      // Flat mode: ids resolve directly under the root, which is what makes the reserved directory
+      // reachable as an id's first segment at all.
+      { disablePrefixHash: true }
+    )
+  })
+
+  afterEach(async () => {
+    await storage.stop?.()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it.each([
+    '.tmp-writes/x',
+    '.tmp-writes./x',
+    '.tmp-writes /x',
+    '.tmp-writes.../x',
+    '.tmp-writes. . /x',
+    '.TMP-WRITES./x',
+    '.tmp-writes.',
+    '.tmp-writes '
+  ])('should refuse to store %j', async (id: string) => {
+    await expect(storage.storeStream(id, bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+      PathNotContainedError
+    )
+  })
+
+  it.each(['.tmp-writes-backup/x', '.tmp-writesX/x', '.tmp-writes.backup/x'])(
+    'should still accept %j, which no filesystem folds onto the reserved name',
+    async (id: string) => {
+      await expect(storage.storeStream(id, bufferToStream(Buffer.from('x')))).resolves.toBeUndefined()
+    }
+  )
+
+  it('should keep enumeration and the id rules in agreement about what is reserved', async () => {
+    await storage.storeStream('.tmp-writes-backup/x', bufferToStream(Buffer.from('x')))
+
+    // The accepted ids are enumerable; nothing that folds onto the reserved name could have been stored.
+    expect(await collectIds(storage)).toEqual(['.tmp-writes-backup/x'])
+  })
+
+  it('should follow a configured tempDirectoryName rather than the default', async () => {
+    const configuredRoot = mkdtempSync(path.join(os.tmpdir(), 'reserved-alias-cfg-'))
+    const configured = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      configuredRoot,
+      { disablePrefixHash: true, tempDirectoryName: 'staging' }
+    )
+    try {
+      await expect(configured.storeStream('staging. /x', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    } finally {
+      await configured.stop?.()
+      rmSync(configuredRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('when a store is handed a source that has already errored', () => {
+  // The guard rethrows the stream's OWN error rather than converting it to a premature close: the stream
+  // already knows what went wrong, and replacing that with a generic code discards the only useful
+  // diagnosis. Pinned because the README now states the three refusal shapes separately.
+  let storage: IContentStorageComponent
+  let source: Readable
+  let failure: Error
+
+  beforeEach(async () => {
+    storage = createInMemoryStorage()
+    failure = Object.assign(new Error('the upstream connection dropped'), { code: 'ECONNRESET' })
+    source = new Readable({ read() {} })
+    source.destroy(failure)
+    await new Promise((resolve) => source.once('error', resolve))
+  })
+
+  it('should reject with the stream own error rather than a premature close', async () => {
+    await expect(storage.storeStream('errored', source)).rejects.toBe(failure)
+  })
+
+  it('should not relabel the error code', async () => {
+    await expect(storage.storeStream('errored', source)).rejects.toMatchObject({ code: 'ECONNRESET' })
+  })
+})
+
+describe('when the filesystem component returns read streams with no lazy-open phase', () => {
+  // The pin waits for 'open' only when the stream SAYS it is pending. Treating `undefined` as "probably
+  // lazy" made any non-fs stream — anything a custom filesystem component returns — hold its pin until
+  // 'close'/'error' or the grace timer, waiting for an event that never arrives. An item whose stream is
+  // opened but never drained emits neither, so the pin stuck for the whole grace window and its entry could
+  // not be reclaimed.
+  let root: string
+  let storage: IContentStorageComponent
+
+  beforeEach(async () => {
+    root = mkdtempSync(path.join(os.tmpdir(), 'no-pending-'))
+    const realFs = createFsComponent()
+    const eagerFs: IFileSystemComponent = {
+      ...realFs,
+      // Returns a plain Readable: no `pending`, and no 'open' event, which is what a non-fs adapter looks like.
+      createReadStream: ((target: any, options?: any) => {
+        const whole = nodeFsReadFileSync(String(target))
+        const start = options?.start ?? 0
+        const end = options?.end === undefined ? whole.length - 1 : options.end
+        return Readable.from([whole.subarray(start, end + 1)])
+      }) as IFileSystemComponent['createReadStream']
+    }
+    storage = await createFolderBasedFileSystemContentStorage(
+      { fs: eagerFs, logs: await createLogComponent({}) },
+      root,
+      {
+        disablePrefixHash: true,
+        // Smaller than one inflated file, so the second entry admitted is always over budget.
+        decompressCacheMaxSize: 1_000,
+        decompressCacheEvictionInterval: 60_000
+      }
+    )
+    await storage.storeStreamAndCompress('first', bufferToStream(Buffer.alloc(30_000, 0x41)))
+    await storage.storeStreamAndCompress('second', bufferToStream(Buffer.alloc(30_000, 0x42)))
+  })
+
+  afterEach(async () => {
+    await storage.stop?.()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('should let an undrained read entry be reclaimed rather than pinning it for the grace window', async () => {
+    const undrained = await storage.retrieve('first', { start: 0, end: 9 })
+    // Opened but deliberately NOT consumed, so neither 'close' nor 'error' ever releases the pin: the only
+    // thing that can is the `pending` decision itself.
+    await undrained!.asStream()
+
+    // A second id gives the LRU walk a candidate — it never evicts the most recent entry — and pushes the
+    // cache over budget.
+    const other = await storage.retrieve('second', { start: 0, end: 9 })
+    await streamToBuffer(await other!.asStream())
+
+    // Well under the pin grace, so passing means the pin was released rather than timed out.
+    const firstIsGone = async (): Promise<boolean> =>
+      await nodeFsPromises
+        .stat(path.join(root, 'first'))
+        .then(() => false)
+        .catch(() => true)
+    expect(await waitFor(firstIsGone, 2_000)).toBe(true)
   })
 })

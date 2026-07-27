@@ -463,6 +463,19 @@ export async function createFolderBasedFileSystemContentStorage(
    * the write through into the staging namespace, where it is invisible to `allFileIds()` and makes the
    * NEXT construction refuse to start over a file "this storage did not create".
    *
+   * TRAILING DOTS AND SPACES are folded away too, for exactly the same reason and on exactly the same
+   * filesystems as the reserved `.gzip` suffix (see `assertStorableContentId`). Win32 path semantics — so
+   * NTFS, and any SMB/CIFS mount — discard them from the end of a segment, which makes `.tmp-writes./x` and
+   * `.tmp-writes /x` resolve ONTO the reserved directory. Case folding alone let those through: the prefix
+   * matched, but the character after it was `.` rather than a separator, so the check answered "not
+   * reserved" for a path the filesystem puts squarely inside. A caller-supplied id could then land content in
+   * the staging namespace, where `allFileIds()` cannot see it (enumeration skips the reserved directory by
+   * its real on-disk name) and where the startup sweep and reconciliation may act on it.
+   *
+   * Consuming a RUN and then requiring a boundary is what keeps this from over-matching: `.tmp-writes.backup`
+   * has its dot in the middle, so Win32 keeps it distinct and so does this — the run is consumed but `b` is
+   * neither a separator nor the end, so the answer is "not reserved". Same for `.tmp-writes-backup`.
+   *
    * Anchored on the ROOT-relative path rather than on a bare name, so a same-named directory deeper in
    * the tree (reachable via a slash-containing id in flat mode) is still enumerated — the reservation
    * covers one directory, not a filename.
@@ -473,7 +486,11 @@ export async function createFolderBasedFileSystemContentStorage(
   function isInsideReservedTempDir(candidate: string): boolean {
     if (candidate.length < tempDir.length) return false
     if (candidate.slice(0, tempDir.length).toLowerCase() !== tempDirLower) return false
-    return candidate.length === tempDir.length || candidate[tempDir.length] === path.sep
+    let boundary = tempDir.length
+    while (boundary < candidate.length && (candidate[boundary] === '.' || candidate[boundary] === ' ')) {
+      boundary++
+    }
+    return boundary === candidate.length || candidate[boundary] === path.sep
   }
 
   /**
@@ -998,10 +1015,16 @@ export async function createFolderBasedFileSystemContentStorage(
           throw err
         }
         // `pending` is false once the descriptor is open; a non-fs stream has no such phase.
-        if ((stream as Readable & { pending?: boolean }).pending === false) {
-          releasePin()
-        } else {
+        // Waits for 'open' only when the stream SAYS it is still opening. `pending` is an `fs.ReadStream`
+        // property, so treating `undefined` as "probably lazy" made every non-fs stream — anything a custom
+        // filesystem component returns — hold its pin until 'close'/'error' or the grace timer, for a stream
+        // that has no open phase to wait for and may never emit the event at all. Positive evidence only: an
+        // `fs.ReadStream` mid-open reports `true` and is waited on; everything else is released now, which is
+        // what the pre-`pending` behaviour already was for those streams.
+        if ((stream as Readable & { pending?: boolean }).pending === true) {
           stream.once('open', releasePin)
+        } else {
+          releasePin()
         }
         stream.once('error', releasePin)
         stream.once('close', releasePin)
