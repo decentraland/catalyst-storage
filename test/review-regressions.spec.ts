@@ -20,6 +20,7 @@ import { assertAddressableContentId } from '../src/content-id'
 import { PathNotContainedError } from '../src/folder-based/errors'
 import { intentNameFor } from './file-system-utils'
 import { createDecompressCache } from '../src/folder-based/decompress-cache'
+import { MAX_BUFFERED_DIRECTORY_ENTRIES } from '../src/folder-based-storage-component'
 
 /**
  * Regression tests for the defects found in the deep review. Each block names the failure it pins,
@@ -938,6 +939,107 @@ describe('when a shard directory is destroyed underneath a running instance', ()
 
       it('should still serve the id it committed', async () => {
         expect(await repaired.exist('a2')).toBe(true)
+      })
+    })
+  })
+
+  describe('when enumeration recovers an id from a file path', () => {
+    // Slicing the path is only the inverse of storing when the file is where this storage would have put it.
+    // A foreign file in the wrong shard yielded an id whose own shard is elsewhere, so `exist()` answered
+    // false for something enumeration had just reported — and a GC consumer acting on the pair would delete
+    // the REAL id from its own shard while leaving the foreign file behind.
+    const shardOfId = (id: string): string => createHash('sha1').update(id).digest('hex').substring(0, 4)
+    let storage: IContentStorageComponent
+    let storageRoot: string
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      if (storageRoot) rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    describe('and the file sits in a shard that is not the one its id hashes to', () => {
+      let listed: string[]
+
+      beforeEach(async () => {
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'enum-noncanonical-'))
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          storageRoot
+        )
+        await storage.storeStream('a/b', bufferToStream(Buffer.from('x')))
+        const observed = path.join(storageRoot, shardOfId('a/b'), 'a')
+        rmSync(observed, { recursive: true, force: true })
+        await nodeFs.writeFile(observed, 'foreign')
+        listed = []
+        for await (const id of storage.allFileIds()) listed.push(id)
+      })
+
+      it('should not yield the derived id', async () => {
+        expect(listed).not.toContain('a')
+      })
+
+      it('should agree with the point lookup, which cannot serve it', async () => {
+        // The round-trip contract: enumeration must only ever yield ids the point lookups accept.
+        expect(await storage.exist('a')).toBe(false)
+      })
+    })
+
+    describe('and the file spells a name no id can have', () => {
+      let listed: string[]
+
+      beforeEach(async () => {
+        // `x.gzip.gzip` is the compressed representation of `x.gzip`, and no id may end in that suffix — so
+        // this is a name nothing storable produces. It used to be yielded as `x.gzip`, whose `exist()` then
+        // THREW `PathNotContainedError`, the same shape as the empty-id case this walk already guards.
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'enum-reserved-'))
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          storageRoot,
+          { disablePrefixHash: true }
+        )
+        await nodeFs.writeFile(path.join(storageRoot, 'x.gzip.gzip'), 'foreign')
+        await storage.storeStream('real', bufferToStream(Buffer.from('x')))
+        listed = []
+        for await (const id of storage.allFileIds()) listed.push(id)
+      })
+
+      it('should not yield it', () => {
+        expect(listed).not.toContain('x.gzip')
+      })
+
+      it('should still yield the ids that are real', () => {
+        expect(listed).toEqual(['real'])
+      })
+    })
+
+    describe('and the root is heavy with SUBDIRECTORIES rather than files', () => {
+      let listed: string[]
+      let expected: string[]
+
+      beforeEach(async () => {
+        // Past the buffered cap the walk streams, and it used to collect every subdirectory NAME before
+        // descending — one string per top-level directory, which is the same unbounded shape as holding one
+        // per entry. It now descends inline. This pins the behaviour that change had to preserve: every id
+        // still comes out exactly once.
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'enum-dirheavy-'))
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          storageRoot,
+          { disablePrefixHash: true }
+        )
+        expected = []
+        for (let i = 0; i < MAX_BUFFERED_DIRECTORY_ENTRIES + 20; i++) {
+          const id = `d${String(i).padStart(6, '0')}/x`
+          await nodeFs.mkdir(path.join(storageRoot, path.dirname(id)), { recursive: true })
+          await nodeFs.writeFile(path.join(storageRoot, id), 'x')
+          expected.push(id)
+        }
+        listed = []
+        for await (const id of storage.allFileIds()) listed.push(id)
+      })
+
+      it('should yield every id exactly once', () => {
+        expect(listed.slice().sort()).toEqual(expected.slice().sort())
       })
     })
   })

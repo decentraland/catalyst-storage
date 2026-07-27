@@ -333,6 +333,21 @@ export async function createFolderBasedFileSystemContentStorage(
     const compressed = spelled.endsWith(GZIP_EXTENSION)
     const id = compressed ? spelled.slice(0, -GZIP_EXTENSION.length) : spelled
     if (id.length === 0) return false
+    // FLAT MODE needs no resolve. The containment directory IS the root, so `root + sep + id` is this very
+    // path by construction — there is no shard to match and, since these segments come from a real listing,
+    // nothing for `path.normalize` to change. All that remains is whether the name spells an id this storage
+    // would accept, which is the one way a listing can produce a non-canonical name here (`x.gzip.gzip`
+    // spells the compressed form of a reserved id). Skipping the resolve matters because it runs per
+    // enumerated entry: flat-mode enumeration measured 4.39 µs/id going through it against 2.9 µs/id here.
+    if (!USE_HASH_PREFIX) {
+      if (isInsideReservedTempDir(target)) return false
+      try {
+        assertValidContentId(id)
+        return true
+      } catch {
+        return false
+      }
+    }
     try {
       const canonical = await resolveFilePath(id)
       return target === (compressed ? gzipPathOf(canonical) : canonical)
@@ -691,11 +706,16 @@ export async function createFolderBasedFileSystemContentStorage(
     // We are sharding the files using the first 4 digits of its sha1 hash, because it generates collisions
     // for the file system to handle millions of files in the same directory.
     // This way, asuming that sha1 hash distribution is ~uniform we are reducing by 16^4 the max amount of files in a directory.
-    const hash = createHash('sha1').update(id).digest('hex').substring(0, 4)
-
+    //
+    // Hashed only WHEN SHARDING. Computing it unconditionally spent a sha1 per resolve in flat mode, where
+    // the result is discarded — and this runs on every operation, so it was the dominant cost of resolving
+    // there: flat-mode enumeration measured 5.12 µs/id with it and 2.9 µs/id without.
+    //
     // `root` is already normalized, and a 4-hex shard needs no normalizing, so this is a concatenation
     // rather than `path.normalize(path.join(...))` (measured 409 ns per call, on every operation).
-    const directoryPath = USE_HASH_PREFIX ? root + path.sep + hash : root
+    const directoryPath = USE_HASH_PREFIX
+      ? root + path.sep + createHash('sha1').update(id).digest('hex').substring(0, 4)
+      : root
 
     // What the id resolves to IF it needs no normalization, which is also the only shape an
     // addressable id may have.
@@ -1639,7 +1659,7 @@ export async function createFolderBasedFileSystemContentStorage(
      * from its single snapshot, the other with a confirming `stat` — and folding it in here silently
      * re-skipped the raw the confirmation had just decided to keep.
      */
-    const idForEntry = (name: string): string | undefined => {
+    const idForEntry = async (name: string): Promise<string | undefined> => {
       const entryPath = folder + path.sep + name
       const isGzip = name.endsWith(GZIP_EXTENSION)
       // A name that IS the suffix and nothing else leaves an empty remainder, which is not an addressable
@@ -1651,7 +1671,17 @@ export async function createFolderBasedFileSystemContentStorage(
       // chooses to skip rather than fail on.
       if (isGzip && name.length === GZIP_EXTENSION.length) return undefined
       const id = idOf(isGzip ? entryPath.slice(0, -GZIP_EXTENSION.length) : entryPath)
-      return prefix && !id.startsWith(prefix) ? undefined : id
+      if (prefix && !id.startsWith(prefix)) return undefined
+      // THE ID MUST RESOLVE BACK TO THIS FILE, which is the same round trip `isCanonicalContentPath` asks of a
+      // file that breaks an ancestor chain — one definition, so the two cannot drift.
+      //
+      // Recovering an id by slicing the path is only the inverse of storing it when the file is where this
+      // storage would have put it. With hash prefixes it often is not: a foreign file at `<root>/3ec6/a`
+      // yields the id `a`, whose own shard is `sha1('a')` — a different directory — so `exist('a')` answers
+      // false for an id enumeration just reported. A GC consumer acting on that pair deletes the REAL `a`
+      // from its own shard and leaves the foreign file behind. It also catches names no id can spell at all,
+      // such as `x.gzip.gzip`, which was yielded as `x.gzip` and made `exist()` throw.
+      return (await isCanonicalContentPath(entryPath)) ? id : undefined
     }
 
     const subdirectories: string[] = []
@@ -1682,7 +1712,7 @@ export async function createFolderBasedFileSystemContentStorage(
         // A raw whose `.gzip` is in this same snapshot is that gzip's decompressed cache, not a second
         // id — and the gzip entry, also in this snapshot, is the one that yields it.
         if (!entry.name.endsWith(GZIP_EXTENSION) && gzipNames.has(entry.name + GZIP_EXTENSION)) continue
-        const id = idForEntry(entry.name)
+        const id = await idForEntry(entry.name)
         if (id !== undefined) yield id
       }
       buffered = undefined
@@ -1696,8 +1726,15 @@ export async function createFolderBasedFileSystemContentStorage(
       // — the common shape — free of the per-entry `stat` that answering it any other way would cost.
       for await (const entry of await components.fs.opendir(folder, { bufferSize: 4000 })) {
         if (entry.isDirectory()) {
-          if (isInsideReservedTempDir(folder + path.sep + entry.name)) continue
-          subdirectories.push(entry.name)
+          const entryPath = folder + path.sep + entry.name
+          if (isInsideReservedTempDir(entryPath)) continue
+          // DESCENDED INTO IMMEDIATELY, rather than collected for later. This branch exists because the
+          // directory is too large to hold, and holding one name per SUBDIRECTORY has the same shape as
+          // holding one per entry: a flat-mode root of `d000001/x`, `d000002/x`, … retains a string per
+          // top-level directory. Recursing here keeps nothing, at the cost of holding this directory's own
+          // handle open across the recursion — bounded by nesting depth, not by directory size. The buffered
+          // branch above still collects, because its cap already bounds it.
+          yield* allFileIdsRec(entryPath, USE_HASH_PREFIX && folder === root ? entryPath : idBase, prefix)
           continue
         }
         // CONFIRMED, not assumed — the price of deciding from a listing read BEFORE this one.
@@ -1728,12 +1765,13 @@ export async function createFolderBasedFileSystemContentStorage(
         if (!entry.name.endsWith(GZIP_EXTENSION) && gzipNames.has(entry.name + GZIP_EXTENSION)) {
           if (await gzipCounterpartStillExists(folder + path.sep + entry.name + GZIP_EXTENSION)) continue
         }
-        const id = idForEntry(entry.name)
+        const id = await idForEntry(entry.name)
         if (id !== undefined) yield id
       }
     }
 
-    // Descended into after this directory's own entries are done, so its buffer is released first.
+    // Only the buffered branch collects; the streaming one descended inline. Done after this directory's own
+    // entries so its buffer is released first.
     for (const name of subdirectories) {
       const entryPath = folder + path.sep + name
       // With hash prefixes the SHARD is the id namespace root, so ids nested inside it are relative
