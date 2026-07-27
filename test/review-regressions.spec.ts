@@ -841,6 +841,102 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
+  describe('and an observed directory deeper in the tree is REMOVED', () => {
+    let removed: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      // The same hole in the same shape, one branch over: the ENOENT parent probe also decided damage from
+      // `knownDirectories.has(dirname)` alone, so a removed observed directory stayed loud for its immediate
+      // child and went silent for every deeper descendant. Removal and replacement-by-a-file are one
+      // question — "did a directory this instance observed stop being usable?" — so they must answer alike.
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'removed-deep-'))
+      removed = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      // Records `<root>/a2` as a directory this instance created...
+      await removed.storeStream('a2/b', bufferToStream(Buffer.from('content')))
+      // ...which is then removed outright, so the parent probe fails ENOENT rather than ENOTDIR.
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+    })
+
+    afterEach(async () => {
+      await removed.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should reject for the immediate child of the removed directory', async () => {
+      await expect(removed.exist('a2/b')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    // Each of these is the FIRST read this instance performs, so no earlier call can have invalidated the
+    // entry the report is derived from — the reviewed defect is reachable from a cold instance.
+    it('should reject when a deeper descendant is the first id read', async () => {
+      await expect(removed.exist('a2/b/c')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    it('should reject when a descendant several levels below is the first id read', async () => {
+      await expect(removed.exist('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    it('should reject retrieve of a deeper descendant as the first read', async () => {
+      await expect(removed.retrieve('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    it('should reject fileInfo of a deeper descendant as the first read', async () => {
+      await expect(removed.fileInfo('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    it('should give the same answer every time the id is asked about', async () => {
+      const answers: string[] = []
+      for (let attempt = 0; attempt < 3; attempt++) {
+        answers.push(
+          await removed
+            .exist('a2/b/c')
+            .then(() => 'resolved')
+            .catch(() => 'rejected')
+        )
+      }
+
+      expect(answers).toEqual(['rejected', 'rejected', 'rejected'])
+    })
+
+    it('should let the FIRST write after the damage report recreate the directory', async () => {
+      // The two contracts that pull in opposite directions once a directory breaks, and the reason the
+      // observation is held in a second set rather than dropped from the mkdir-skip cache: a read has to keep
+      // rejecting (evidence must survive) while a write has to recreate the tree on its next attempt (the
+      // mkdir must not be skipped). Serving both from one flag meant breaking one of them.
+      await expect(removed.exist('a2/b')).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await expect(removed.storeStream('a2/b', bufferToStream(Buffer.from('again')))).resolves.toBeUndefined()
+    })
+
+    it('should let a write heal the directory after a DEEPER read reported the damage', async () => {
+      // The report can name an ANCESTOR of the id's own parent, and it is THAT path which has to leave the
+      // mkdir-skip cache. Reading the immediate child cannot show this, because there the damaged path and
+      // `dirname` coincide and the plain `forgetDirectory(dirname)` covers it either way; reading `a2/b/c`
+      // makes them differ, so only moving the named path out of the cache lets the write recreate the tree.
+      await expect(removed.exist('a2/b/c')).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await expect(removed.storeStream('a2/b', bufferToStream(Buffer.from('again')))).resolves.toBeUndefined()
+    })
+
+    it('should serve the id again once a write has repaired the directory, clearing the damage', async () => {
+      await expect(removed.exist('a2/b')).rejects.toMatchObject({ code: 'ENOENT' })
+      await removed.storeStream('a2/b', bufferToStream(Buffer.from('again')))
+
+      expect(await removed.exist('a2/b')).toBe(true)
+    })
+
+    it('should still report an id under a shard that was never created as absent', async () => {
+      // The ordinary miss, which must stay a miss: nothing on `<root>/never/...` was ever observed, so there
+      // is no damage to report even though a removed observed directory exists elsewhere in this root.
+      expect(await removed.exist('never/stored/here')).toBe(false)
+    })
+  })
+
   describe('and the parent directory cannot be probed at all', () => {
     let unreadable: IContentStorageComponent
 
