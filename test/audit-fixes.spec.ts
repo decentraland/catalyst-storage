@@ -23,6 +23,30 @@ import { createFakeS3Client } from './fake-s3-client'
 /** The real detector is ESM-only and reached through an import Jest's registry does not own. */
 const undetectingLoader: FileTypeLoader = async () => ({ fileTypeFromBuffer: async () => undefined })
 
+/**
+ * Polls `predicate` until it holds, returning whether it ever did.
+ *
+ * For asserting on eviction, which is deliberately fire-and-forget — `record` starts a pass it cannot await,
+ * because the pass needs the path lock the committing read still holds. A snapshot taken the instant the
+ * reads finish is therefore a race, and a fixed sleep is the same race with a different constant: this waits
+ * for the state to arrive and gives up loudly if it never does.
+ */
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return true
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return predicate()
+}
+
+/** Drains `allFileIds` into an array, so a rejection mid-enumeration surfaces as a rejected promise. */
+async function collectIds(storage: IContentStorageComponent, prefix?: string): Promise<string[]> {
+  const ids: string[] = []
+  for await (const id of storage.allFileIds(prefix)) ids.push(id)
+  return ids
+}
+
 describe('when a store is handed a source something has already read from', () => {
   // The four state flags the guard used to rely on describe a FINISHED stream and all flip a tick after
   // the read that made the source unusable, so a caller that hashed, sniffed or measured a body first
@@ -244,7 +268,7 @@ describe('when content is deleted between retrieve and the consumer opening the 
     rmSync(root, { recursive: true, force: true })
   })
 
-  it('should not raise an unhandled error event when the stream is piped without an error handler', async () => {
+  it('should not raise an unhandled error event for a consumer that pipes without an error handler', async () => {
     const item = await storage.retrieve('plain')
     await storage.delete(['plain'])
     const stream = await item!.asStream()
@@ -256,8 +280,12 @@ describe('when content is deleted between retrieve and the consumer opening the 
     }
     process.on('uncaughtException', onUncaught)
     try {
-      stream.pipe(new Writable({ write: (_chunk, _encoding, callback) => callback() }))
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      const sink = new Writable({ write: (_chunk, _encoding, callback) => callback() })
+      stream.pipe(sink)
+      // Awaits the stream's own terminal event instead of a fixed delay. A `setTimeout` here made an
+      // assertion of ABSENCE pass vacuously whenever the ENOENT landed after the window, and would also
+      // capture any unrelated async error raised in it.
+      await new Promise((resolve) => stream.once('close', resolve))
     } finally {
       process.off('uncaughtException', onUncaught)
     }
@@ -319,10 +347,7 @@ describe('when a directory sits at the path a never-stored id resolves to', () =
     })
 
     it('should agree with enumeration, which never listed it', async () => {
-      const ids: string[] = []
-      for await (const id of storage.allFileIds()) ids.push(id)
-
-      expect(ids).toEqual(['a/b'])
+      expect(await collectIds(storage)).toEqual(['a/b'])
     })
   })
 
@@ -372,6 +397,7 @@ describe('when an id has a path segment longer than a directory entry can hold',
 
   afterEach(async () => {
     await folderStorage.stop?.()
+    await s3Storage.stop?.()
     rmSync(root, { recursive: true, force: true })
   })
 
@@ -387,10 +413,12 @@ describe('when an id has a path segment longer than a directory entry can hold',
     )
   })
 
-  it('should reject the store with the typed error on the S3 backend', async () => {
-    await expect(s3Storage.storeStream(overLongId, bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
-      PathNotContainedError
-    )
+  it('should still accept it on the S3 backend, whose keys are documented as opaque', async () => {
+    // Deliberately NOT enforced for S3: keys are opaque to S3, a bucket may already hold keys these rules
+    // reject, and refusing them would make that content unwritable while reads still serve it. README,
+    // "Id validation". An earlier revision of this change enforced it here for cross-backend parity, which
+    // is the wrong trade.
+    await expect(s3Storage.storeStream(overLongId, bufferToStream(Buffer.from('x')))).resolves.toBeUndefined()
   })
 
   it('should still report it absent from the read path, which no file of that name can occupy', async () => {
@@ -418,8 +446,8 @@ describe('when an id ends in the reserved gzip suffix followed by characters a f
     storage = createInMemoryStorage()
   })
 
-  it.each(['foo.gzip', 'foo.GZIP', 'foo.gzip ', 'foo.gzip.', 'foo.gzip\t', 'foo.gzip  ..'])(
-    'should reject %j',
+  it.each(['foo.gzip', 'foo.GZIP', 'foo.gzip ', 'foo.gzip.', 'foo.gzip  ..'])(
+    'should reject a store of %j',
     async (id: string) => {
       await expect(storage.storeStream(id, bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
         PathNotContainedError
@@ -429,6 +457,94 @@ describe('when an id ends in the reserved gzip suffix followed by characters a f
 
   it('should still accept an id that merely contains the suffix without ending in it', async () => {
     await expect(storage.storeStream('foo.gzip.txt', bufferToStream(Buffer.from('x')))).resolves.toBeUndefined()
+  })
+
+  it.each(['foo.gzip\t', 'foo.gzip\n', 'foo.gzip '])(
+    'should accept %j, because no filesystem folds that character away',
+    async (id: string) => {
+      await expect(storage.storeStream(id, bufferToStream(Buffer.from('x')))).resolves.toBeUndefined()
+    }
+  )
+})
+
+describe('when a stored id would only be rejected by the store-side rules', () => {
+  // The store-side rules must NOT reach the read path. Content a previous version legitimately stored
+  // under a name the folded reserved-suffix rule now refuses to CREATE has to stay readable, deletable and
+  // consistent with enumeration — otherwise a GC sweep enumerates the id and then fails its own delete
+  // batch on it, forever.
+  let root: string
+  let storage: IContentStorageComponent
+  let legacyPath: string
+
+  beforeEach(async () => {
+    root = mkdtempSync(path.join(os.tmpdir(), 'legacy-name-'))
+    storage = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      root,
+      { disablePrefixHash: true }
+    )
+    // Written directly: this models a file a previous version of the library accepted.
+    legacyPath = path.join(root, 'legacy.gzip.')
+    await nodeFsPromises.writeFile(legacyPath, 'LEGACY CONTENT')
+  })
+
+  afterEach(async () => {
+    await storage.stop?.()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('should still report it as present', async () => {
+    expect(await storage.exist('legacy.gzip.')).toBe(true)
+  })
+
+  it('should still serve its content', async () => {
+    const item = await storage.retrieve('legacy.gzip.')
+
+    expect((await streamToBuffer(await item!.asStream())).toString()).toBe('LEGACY CONTENT')
+  })
+
+  it('should still enumerate it', async () => {
+    expect(await collectIds(storage)).toEqual(['legacy.gzip.'])
+  })
+
+  it('should still delete it rather than stranding it on disk', async () => {
+    await storage.delete(['legacy.gzip.'])
+
+    await expect(nodeFsPromises.stat(legacyPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('should not fail a batch that includes it', async () => {
+    await expect(storage.existMultiple(['legacy.gzip.', 'other'])).resolves.toEqual(
+      new Map([
+        ['legacy.gzip.', true],
+        ['other', false]
+      ])
+    )
+  })
+})
+
+describe('when an id contains a backslash on a platform where that is an ordinary filename character', () => {
+  // Splitting the id on backslash under-counted segment lengths on POSIX: two 200-byte halves looked
+  // storable while the real filename was 401 bytes, so the store failed the commit rename with a bare
+  // ENAMETOOLONG — verbatim the outcome the segment rule exists to remove.
+  let storage: IContentStorageComponent
+  let backslashId: string
+
+  beforeEach(() => {
+    storage = createInMemoryStorage()
+    backslashId = `${'x'.repeat(200)}\\${'y'.repeat(200)}`
+  })
+
+  it('should reject it as one over-long segment on POSIX', async () => {
+    if (path.sep === '\\') return
+
+    await expect(storage.storeStream(backslashId, bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+      PathNotContainedError
+    )
+  })
+
+  it('should still accept a short id containing a backslash', async () => {
+    await expect(storage.storeStream('a\\b', bufferToStream(Buffer.from('x')))).resolves.toBeUndefined()
   })
 })
 
@@ -476,6 +592,59 @@ describe('when a source emits string chunks rather than buffers', () => {
   })
 })
 
+describe('when a source is read in an encoding mode that does not round-trip as utf8', () => {
+  // Every backend turns string chunks back into bytes as utf8, so a latin1/hex/base64 source stored bytes
+  // that were not the bytes read — silent corruption under an id that is then never re-fetched.
+  let root: string
+  let payload: string
+  let folderStorage: IContentStorageComponent
+  let memoryStorage: IContentStorageComponent
+
+  beforeEach(async () => {
+    root = mkdtempSync(path.join(os.tmpdir(), 'encoding-mode-'))
+    payload = path.join(root, 'payload.bin')
+    // Bytes that are not valid utf8, so the round trip is provably lossy.
+    await nodeFsPromises.writeFile(payload, Buffer.from([0x41, 0xe9, 0xff, 0x42]))
+    folderStorage = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      path.join(root, 'store'),
+      { disablePrefixHash: true }
+    )
+    memoryStorage = createInMemoryStorage()
+  })
+
+  afterEach(async () => {
+    await folderStorage.stop?.()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('should refuse it on the folder-based backend rather than storing re-encoded bytes', async () => {
+    await expect(folderStorage.storeStream('latin1', createReadStream(payload, 'latin1'))).rejects.toThrow(
+      'encoding mode'
+    )
+  })
+
+  it('should refuse it on the in-memory backend too', async () => {
+    await expect(memoryStorage.storeStream('latin1', createReadStream(payload, 'latin1'))).rejects.toThrow(
+      'encoding mode'
+    )
+  })
+
+  it('should still accept a utf8 source, which round-trips exactly', async () => {
+    await folderStorage.storeStream('utf8', Readable.from('héllo', { encoding: 'utf8' }))
+    const item = await folderStorage.retrieve('utf8')
+
+    expect((await streamToBuffer(await item!.asStream())).toString('utf8')).toBe('héllo')
+  })
+
+  it('should still store the same bytes when read in binary mode', async () => {
+    await folderStorage.storeStream('binary', createReadStream(payload))
+    const item = await folderStorage.retrieve('binary')
+
+    expect([...(await streamToBuffer(await item!.asStream()))]).toEqual([0x41, 0xe9, 0xff, 0x42])
+  })
+})
+
 describe('when streamToBuffer is given a size cap', () => {
   let source: Readable
 
@@ -487,7 +656,7 @@ describe('when streamToBuffer is given a size cap', () => {
     await expect(streamToBuffer(source, 15)).rejects.toThrow('Stream exceeded the maximum allowed size of 15 bytes')
   })
 
-  it('should resolve when the content fits', async () => {
+  it('should resolve for content that fits', async () => {
     expect((await streamToBuffer(source, 30)).length).toBe(30)
   })
 })
@@ -551,6 +720,7 @@ describe('when many concurrent cold range reads inflate gzip-only content', () =
   // budget. Separately, LRU protected only the single most-recent entry, so a reader's file could be
   // unlinked before it opened it — a spurious ENOENT on content that was never missing.
   const CONCURRENT_READS = 20
+  const BUDGET = 40_000
   let root: string
   let storage: IContentStorageComponent
   let ids: string[]
@@ -565,7 +735,9 @@ describe('when many concurrent cold range reads inflate gzip-only content', () =
         disablePrefixHash: true,
         // One inflated file (30_000 bytes of highly compressible content) does not fit the budget, so this
         // is also the case where the previously permanent stall latch applied.
-        decompressCacheMaxSize: 40_000,
+        decompressCacheMaxSize: BUDGET,
+        // Long enough that nothing here can be attributed to the periodic tick: every eviction this
+        // exercises is admission- or pin-release-driven.
         decompressCacheEvictionInterval: 60_000
       }
     )
@@ -598,25 +770,36 @@ describe('when many concurrent cold range reads inflate gzip-only content', () =
     )
   })
 
-  it('should keep the derived files on disk close to the budget rather than one per read', async () => {
-    // Without the admission bound this settled at CONCURRENT_READS x 30_000; the pins are released as each
-    // consumer opens its stream, so eviction can then reclaim down towards the budget.
-    const shard = await nodeFsPromises.readdir(root, { withFileTypes: true })
-    const derived = shard.filter((entry) => entry.isFile() && !entry.name.endsWith('.gzip'))
+  it('should converge on the budget rather than retaining one derived file per read', async () => {
+    // Asserted against the BUDGET, not merely "fewer than one per read": at 30_000 bytes a file and a 40_000
+    // byte budget, `< CONCURRENT_READS` still passed at 19 files — 570 KB against 40 KB, i.e. the very
+    // overshoot this describe exists to pin. The bound that matters is `maxSize` plus the inflations that can
+    // be in flight, so allow a generous multiple of it and no more. Awaited rather than sampled, because
+    // eviction is fire-and-forget; before the fix this never converged, so the wait expires and fails.
+    const withinBudget = async (): Promise<boolean> => {
+      const shard = await nodeFsPromises.readdir(root, { withFileTypes: true })
+      const derived = shard.filter((entry) => entry.isFile() && !entry.name.endsWith('.gzip'))
+      return derived.length * 30_000 <= BUDGET * 4
+    }
 
-    expect(derived.length).toBeLessThan(CONCURRENT_READS)
+    expect(await waitFor(withinBudget)).toBe(true)
   })
 })
 
 describe('when a previous run left decompressed cache files untracked', () => {
-  // The tracker is in memory only. A clean stop() evicts what it knows about, but an unclean exit left one
-  // decompressed copy per range-read id that the next boot knew nothing about: invisible to eviction and to
-  // evictAll(), and no longer counted against the budget.
+  // CHARACTERIZATION of a documented limitation, not of a fix. A startup sweep that adopted "any raw file
+  // with a .gzip sibling" was written and then removed: that inference cannot be acted on destructively,
+  // because the same shape is produced by a quarantined mixed state (raw = new primary), by a store
+  // committing during the walk, and by foreign files under the root — and adopting any of those made
+  // eviction delete live content. See the note above `allFileIdsRec`. What is pinned here is that a
+  // subsequent boot leaves both files ALONE, which is the safe behaviour; the cost is disk, not
+  // correctness.
   let root: string
   let orphanPath: string
+  let second: IContentStorageComponent
 
   beforeEach(async () => {
-    root = mkdtempSync(path.join(os.tmpdir(), 'cache-adopt-'))
+    root = mkdtempSync(path.join(os.tmpdir(), 'cache-orphan-'))
     const first = await createFolderBasedFileSystemContentStorage(
       { fs: createFsComponent(), logs: await createLogComponent({}) },
       root,
@@ -627,38 +810,71 @@ describe('when a previous run left decompressed cache files untracked', () => {
     await first.retrieve('compressible', { start: 0, end: 9 })
     orphanPath = path.join(root, 'compressible')
     // No stop(): this models the unclean exit that leaves the copy behind untracked.
+    second = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      root,
+      { disablePrefixHash: true }
+    )
+    await second.start?.({} as any)
+    await second.stop?.()
   })
 
   afterEach(() => {
     rmSync(root, { recursive: true, force: true })
   })
 
-  it('should have left the derived copy on disk to begin with', async () => {
+  it('should leave the untracked derived copy on disk rather than guessing it is reclaimable', async () => {
     await expect(nodeFsPromises.stat(orphanPath)).resolves.toMatchObject({ size: 20_000 })
   })
 
-  it('should re-adopt it so a clean shutdown reclaims it', async () => {
-    const second = await createFolderBasedFileSystemContentStorage(
-      { fs: createFsComponent(), logs: await createLogComponent({}) },
-      root,
-      { disablePrefixHash: true }
-    )
-    await second.start?.({} as any)
-    await second.stop?.()
-
-    await expect(nodeFsPromises.stat(orphanPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  it('should leave the compressed primary intact', async () => {
+    await expect(nodeFsPromises.stat(`${orphanPath}.gzip`)).resolves.toBeDefined()
   })
 
-  it('should leave the compressed primary intact', async () => {
-    const second = await createFolderBasedFileSystemContentStorage(
+  it('should still serve the id correctly across the restart', async () => {
+    const third = await createFolderBasedFileSystemContentStorage(
       { fs: createFsComponent(), logs: await createLogComponent({}) },
       root,
       { disablePrefixHash: true }
     )
-    await second.start?.({} as any)
-    await second.stop?.()
+    const item = await third.retrieve('compressible')
+    const bytes = (await streamToBuffer(await item!.asStream())).length
+    await third.stop?.()
 
-    await expect(nodeFsPromises.stat(`${orphanPath}.gzip`)).resolves.toBeDefined()
+    expect(bytes).toBe(20_000)
+  })
+})
+
+describe('when a store is rejected because its source is unusable', () => {
+  // Validating the id before the source put the side-effecting `getFilePath` (which mkdir -p's) ahead of
+  // the source check, so every store rejected for a bad source permanently created its directory tree —
+  // an unbounded empty-tree leak per rejected upload for caller-supplied nested ids.
+  let root: string
+  let storage: IContentStorageComponent
+  let source: Readable
+
+  beforeEach(async () => {
+    root = mkdtempSync(path.join(os.tmpdir(), 'no-dirs-'))
+    storage = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      root,
+      { disablePrefixHash: true }
+    )
+    source = Readable.from([Buffer.from('AAAA'), Buffer.from('BBBB')])
+    // Partially consumed, so the source check rejects it.
+    await source[Symbol.asyncIterator]().next()
+    await storage.storeStream('attacker/controlled/deep/nested/id', source).catch(() => undefined)
+  })
+
+  afterEach(async () => {
+    await storage.stop?.()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('should not have created the id directory tree', async () => {
+    const entries = await nodeFsPromises.readdir(root)
+
+    expect(entries.filter((entry) => entry !== '.tmp-writes')).toEqual([])
   })
 })
 
@@ -672,20 +888,42 @@ describe('when the filesystem adapter is a class instance whose methods need the
     root = mkdtempSync(path.join(os.tmpdir(), 'class-adapter-'))
     const base = createFsComponent()
 
+    // PROTOTYPE methods, not arrow-function class properties. Arrow properties are bound to the instance at
+    // construction, so `const { rename } = components.fs` never loses its receiver and the test passes even
+    // against the unfixed code — it proved nothing. Prototype methods are the shape that actually breaks:
+    // detached, `this` is undefined and reading `this.delegate` throws.
     class ClassBasedFs {
       private readonly delegate = base
-      createReadStream: IFileSystemComponent['createReadStream'] = (...args: any[]) =>
-        (this.delegate.createReadStream as any)(...args)
-      createWriteStream: IFileSystemComponent['createWriteStream'] = (...args: any[]) =>
-        (this.delegate.createWriteStream as any)(...args)
-      opendir: IFileSystemComponent['opendir'] = (...args: any[]) => (this.delegate.opendir as any)(...args)
-      stat: IFileSystemComponent['stat'] = (...args: any[]) => (this.delegate.stat as any)(...args)
-      unlink: IFileSystemComponent['unlink'] = (...args: any[]) => (this.delegate.unlink as any)(...args)
-      rename: IFileSystemComponent['rename'] = (...args: any[]) => (this.delegate.rename as any)(...args)
-      mkdir: IFileSystemComponent['mkdir'] = (...args: any[]) => (this.delegate.mkdir as any)(...args)
-      readdir: IFileSystemComponent['readdir'] = (...args: any[]) => (this.delegate.readdir as any)(...args)
-      readFile: IFileSystemComponent['readFile'] = (...args: any[]) => (this.delegate.readFile as any)(...args)
-      existPath: IFileSystemComponent['existPath'] = (target: string) => this.delegate.existPath(target)
+      createReadStream(...args: any[]): any {
+        return (this.delegate.createReadStream as any)(...args)
+      }
+      createWriteStream(...args: any[]): any {
+        return (this.delegate.createWriteStream as any)(...args)
+      }
+      opendir(...args: any[]): any {
+        return (this.delegate.opendir as any)(...args)
+      }
+      stat(...args: any[]): any {
+        return (this.delegate.stat as any)(...args)
+      }
+      unlink(...args: any[]): any {
+        return (this.delegate.unlink as any)(...args)
+      }
+      rename(...args: any[]): any {
+        return (this.delegate.rename as any)(...args)
+      }
+      mkdir(...args: any[]): any {
+        return (this.delegate.mkdir as any)(...args)
+      }
+      readdir(...args: any[]): any {
+        return (this.delegate.readdir as any)(...args)
+      }
+      readFile(...args: any[]): any {
+        return (this.delegate.readFile as any)(...args)
+      }
+      existPath(target: string): Promise<boolean> {
+        return this.delegate.existPath(target)
+      }
     }
 
     storage = await createFolderBasedFileSystemContentStorage(
@@ -774,17 +1012,18 @@ describe('when an S3 endpoint returns a continuation token it has already issued
     requests = 0
   })
 
-  it('should stop instead of enumerating forever', async () => {
-    const ids: string[] = []
-    for await (const id of storage.allFileIds()) ids.push(id)
+  afterEach(() => {
+    s3.destroy()
+  })
 
-    expect(ids).toEqual(['a-key', 'a-key'])
+  it('should reject rather than enumerating forever', async () => {
+    // Rejecting, not ending early: a silently short listing is the failure the relaxed stop condition
+    // exists to avoid, and a GC sweep acting on a partial view could delete content it never saw.
+    await expect(collectIds(storage)).rejects.toThrow('the endpoint returned the same continuation token twice')
   })
 
   it('should stop after re-requesting the repeated token only once', async () => {
-    for await (const _id of storage.allFileIds()) {
-      // drained for its side effect on the request count
-    }
+    await collectIds(storage).catch(() => undefined)
 
     expect(requests).toBe(2)
   })
@@ -806,11 +1045,12 @@ describe('when an S3 listing contains an entry with no key', () => {
     })
   })
 
-  it('should skip it rather than yielding undefined into a caller sweep', async () => {
-    const ids: string[] = []
-    for await (const id of storage.allFileIds()) ids.push(id)
+  afterEach(() => {
+    s3.destroy()
+  })
 
-    expect(ids).toEqual(['first', 'second'])
+  it('should skip it rather than yielding undefined into a caller sweep', async () => {
+    expect(await collectIds(storage)).toEqual(['first', 'second'])
   })
 })
 
@@ -829,30 +1069,110 @@ describe('when an S3 object is replaced between the metadata read and the stream
     await storage.storeStream('an-id', bufferToStream(Buffer.alloc(100, 0x41)))
   })
 
+  afterEach(() => {
+    s3.destroy()
+  })
+
   it('should fail the read loudly rather than serving mismatched bytes and length', async () => {
     const item = await storage.retrieve('an-id', { start: 90, end: 99 })
-    // The replacement changes the object's ETag, which the GetObject precondition is pinned to.
-    s3.objects.set('an-id', { body: Buffer.alloc(95, 0x42) })
-    s3.on('GetObjectCommand', ({ Key, IfMatch }) => {
-      const found = s3.objects.get(Key)!
-      if (IfMatch !== undefined && IfMatch !== `"${Key}-v2"`) {
-        throw Object.assign(new Error('PreconditionFailed'), {
-          name: 'PreconditionFailed',
-          $metadata: { httpStatusCode: 412 }
-        })
-      }
-      return { Body: Readable.from([found.body]), ContentLength: found.body.length }
-    })
+    // A genuine replacement: shorter body AND a new ETag, which is what the precondition is pinned to. The
+    // fake enforces `IfMatch` itself, so nothing here has to stand in for the service.
+    s3.objects.set('an-id', { body: Buffer.alloc(95, 0x42), etag: '"an-id-v2"' })
 
     await expect(item!.asStream()).rejects.toMatchObject({ name: 'PreconditionFailed' })
   })
 
-  it('should pass the precondition through when the object has not changed', async () => {
+  it('should not advertise a length it cannot serve', async () => {
+    // The point of the precondition: before it, this returned 5 bytes under an advertised size of 10.
+    const item = await storage.retrieve('an-id', { start: 90, end: 99 })
+    s3.objects.set('an-id', { body: Buffer.alloc(95, 0x42), etag: '"an-id-v2"' })
+    const served = await item!.asStream().then(
+      (stream) => streamToBuffer(stream),
+      () => undefined
+    )
+
+    expect(served === undefined || served.length === item!.size).toBe(true)
+  })
+
+  it('should pass the precondition through for an unchanged object', async () => {
     const item = await storage.retrieve('an-id', { start: 90, end: 99 })
 
     expect((await streamToBuffer(await item!.asStream())).length).toBe(10)
   })
+
+  it('should still serve a whole-object read after a byte-identical re-store', async () => {
+    // A re-store that does not change the ETag must NOT start failing reads — the content-addressed case.
+    const item = await storage.retrieve('an-id')
+    await storage.storeStream('an-id', bufferToStream(Buffer.alloc(100, 0x41)))
+
+    expect((await streamToBuffer(await item!.asStream())).length).toBe(100)
+  })
 })
+
+describe('when the S3 backend is configured with a partSize', () => {
+  // Unvalidated, every way of getting this wrong failed late: below 5 MiB every store rejected with a bare
+  // SDK `EntityTooSmall`, `0`/`NaN` were swallowed by lib-storage so the option silently did nothing, and a
+  // non-integer passed lib-storage's own guard and then killed any multi-part upload after the bytes had
+  // crossed the wire.
+  let s3: ReturnType<typeof createFakeS3Client>
+  let logs: Awaited<ReturnType<typeof createLogComponent>>
+
+  beforeEach(async () => {
+    s3 = createFakeS3Client()
+    logs = await createLogComponent({})
+  })
+
+  afterEach(() => {
+    s3.destroy()
+  })
+
+  it.each([
+    ['below S3 minimum', 1024],
+    ['zero', 0],
+    ['negative', -1],
+    ['non-integer', 5 * 1024 * 1024 + 0.5],
+    ['NaN', Number.NaN],
+    ['above S3 maximum', 6 * 1024 * 1024 * 1024]
+  ])('should refuse to construct with a %s partSize', async (_label: string, partSize: number) => {
+    await expect(
+      createS3BasedFileSystemContentStorage({ logs }, s3, {
+        Bucket: 'a-bucket',
+        fileTypeLoader: undetectingLoader,
+        partSize
+      })
+    ).rejects.toThrow('partSize')
+  })
+
+  it('should construct with a valid partSize', async () => {
+    await expect(
+      createS3BasedFileSystemContentStorage({ logs }, s3, {
+        Bucket: 'a-bucket',
+        fileTypeLoader: undetectingLoader,
+        partSize: 64 * 1024 * 1024
+      })
+    ).resolves.toBeDefined()
+  })
+
+  it('should still store and read content back with a valid partSize', async () => {
+    const storage = await createS3BasedFileSystemContentStorage({ logs }, s3, {
+      Bucket: 'a-bucket',
+      fileTypeLoader: undetectingLoader,
+      partSize: 8 * 1024 * 1024
+    })
+    await storage.storeStream('an-id', bufferToStream(Buffer.from('content')))
+    const item = await storage.retrieve('an-id')
+
+    expect((await streamToBuffer(await item!.asStream())).toString()).toBe('content')
+  })
+})
+
+// NOT covered here on purpose: the `instanceof AbortMultipartUploadCommand` exemption and the
+// `isCreateMultipartUpload` input-shape fallback. Both exist for a build whose bundler has MANGLED class
+// names, and lib-storage constructs those commands internally, so reproducing that would mean mutating a
+// shared SDK class's `name` from a test — which leaks into every other suite in the process. The existing
+// multipart cancellation coverage (`s3-based-storage-component.spec.ts`, "When the abort lands
+// mid-multipart" and "S3 Storage multipart cleanup") proves the path with unmangled names, and both
+// additions are strictly additive: they can only make the match succeed where it previously failed.
 
 describe('when a gzip placed under a shard has more than one member', () => {
   // `asStream()` decodes every member because zlib does, while the trailer read only ever sees the LAST

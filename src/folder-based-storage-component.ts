@@ -51,12 +51,18 @@ const DEFAULT_MAX_CONCURRENT_INFLATIONS = 4
 /**
  * How long a ranged read keeps its decompressed cache file protected from LRU eviction.
  *
- * Covers the gap between `retrieve` returning and the consumer opening the lazy stream — microseconds in
- * any real consumer, so this is generous. Bounded rather than indefinite because a consumer is free to
- * drop the item without ever reading it, and a pin that outlived that would exempt the entry from the
- * size budget for good.
+ * Covers the gap between `retrieve` returning and the consumer opening the lazy stream, which is
+ * microseconds in any real consumer — the pin is normally released the instant the stream is created, and
+ * this is only the backstop for an item that is never read at all.
+ *
+ * SHORT on purpose, because this window is what bounds the cache's overshoot. A pinned entry is exempt from
+ * LRU, so pins accumulating faster than consumers open their streams is the one way the size budget stops
+ * being enforceable: at 30 seconds, a caller holding items unopened retained 40 derived files against a
+ * budget that fits one. Five seconds is far beyond any real consumer's gap and keeps the worst case to
+ * roughly `admission rate × 5s × decompressMaxFileSize` on top of `decompressCacheMaxSize`, with
+ * `decompressMaxConcurrentInflations` bounding that admission rate.
  */
-const CACHE_PIN_GRACE_MS = 30_000
+const CACHE_PIN_GRACE_MS = 5_000
 
 /** @public */
 export type FolderStorageOptions = {
@@ -571,10 +577,17 @@ export async function createFolderBasedFileSystemContentStorage(
    * Resolves an id AND ensures its parent directory exists. For WRITE paths only — see
    * `resolveFilePath` for why reads must not create anything.
    */
-  async function getFilePath(id: string): Promise<string> {
-    const finalPath = await resolveFilePath(id)
-    // recursively creates the directory structure if needed
-    const dirname = path.dirname(finalPath)
+  /**
+   * Creates the directory a write is about to land in.
+   *
+   * Split out of `getFilePath` because it is the one SIDE EFFECT in resolving an id, and a store has to be
+   * able to run every check that can reject BEFORE it happens. Ordering the id check ahead of the source
+   * check put this `mkdir` first, so a store refused for an unusable source still created its tree — and
+   * for a nested, caller-supplied id that is an unbounded empty-directory leak per rejected upload,
+   * exactly the hazard `resolveFilePath` documents reads being changed to avoid.
+   */
+  async function ensureDirectoryFor(filePath: string): Promise<void> {
+    const dirname = path.dirname(filePath)
 
     if (!knownDirectories.has(dirname)) {
       if (!(await components.fs.existPath(dirname))) {
@@ -582,8 +595,6 @@ export async function createFolderBasedFileSystemContentStorage(
       }
       rememberDirectory(dirname)
     }
-
-    return finalPath
   }
 
   /**
@@ -826,11 +837,14 @@ export async function createFolderBasedFileSystemContentStorage(
     // An id no directory entry can hold is not storable, and this backend used to say so with a raw
     // ENAMETOOLONG from the commit rename rather than the typed error every other id rejection uses.
     assertStorableContentId(id)
-    const filePath = await getFilePath(id)
+    // Resolved (which validates) but NOT yet created: every rejecting check runs before the one side
+    // effect. See `ensureDirectoryFor`.
+    const filePath = await resolveFilePath(id)
     // A source that cannot supply content must be refused, not stored: piping an already-consumed
     // stream writes zero bytes and RESOLVES, so this committed an empty object under the id and
     // reported success. See `assertStorableStream`.
     assertStorableStream(stream)
+    await ensureDirectoryFor(filePath)
     // Stage the write in the reserved temp dir under a random name, then atomically rename it into
     // place. A direct write to the final path leaves a truncated/zero-byte file if the process dies
     // mid-write (OOM-kill, eviction, crash); since `exist()` only checks for the path, that partial
@@ -954,18 +968,24 @@ export async function createFolderBasedFileSystemContentStorage(
       // cached file nor its result — the second attempt re-reads the id's current representation
       // instead of returning a spurious undefined for a valid id.
       for (let attempt = 0; attempt < 2 && !contentItem && range; attempt++) {
-        // Pinned across the inflation AND the probe that turns it into an item, so the size-eviction pass
-        // this very inflation can trigger cannot unlink the file this read is about to open. Released as
-        // soon as it is known that no item came out of the attempt; otherwise the pin's own expiry
-        // releases it once the consumer has had its chance to open the returned stream.
+        // Deduplicated across concurrent callers of the same path, and handed the invalidation token
+        // that says whether the gzip this inflation started from is still the current version.
+        await cache.deduplicateInflation(baseFilePath, (token) =>
+          materializeRangeCacheFromGzip(id, baseFilePath, token)
+        )
+
+        // Pinned AFTER the inflation, not around it. The pin exists to cover one window — from the entry
+        // being recorded to the consumer opening the stream — and stretching it over the inflation made it
+        // also cover the wait for an inflation SLOT, which is unbounded in the number of callers: 50
+        // concurrent range reads took all 50 pins before any inflation began, so no entry was ever
+        // evictable and the burst settled 31x over budget with eviction reclaiming nothing. Scoped this
+        // way, the pinned set is bounded by what is actually in flight.
+        //
+        // The gap between `record` (inside the inflation's own path lock) and this line is microtasks with
+        // no I/O, and across it the just-recorded entry is the most recent one, which the LRU walk already
+        // refuses to evict.
         const releasePin = cache.pin(baseFilePath, CACHE_PIN_GRACE_MS)
         try {
-          // Deduplicated across concurrent callers of the same path, and handed the invalidation token
-          // that says whether the gzip this inflation started from is still the current version.
-          await cache.deduplicateInflation(baseFilePath, (token) =>
-            materializeRangeCacheFromGzip(id, baseFilePath, token)
-          )
-
           // Serve range from the cached uncompressed file (undefined when the gzip didn't exist or
           // the decompression was discarded; the loop then retries once)
           contentItem = await retrieveWithEncoding(id, null, range, true, false, baseFilePath)
@@ -976,11 +996,15 @@ export async function createFolderBasedFileSystemContentStorage(
         if (!contentItem) {
           releasePin()
         } else {
-          // Released the moment the consumer actually opens the stream, which is the event the pin exists
-          // to wait for. Leaving it to the timer instead made the pin defeat the size budget it was added
-          // alongside: a burst of range reads would hold every one of its entries un-evictable for the
-          // whole grace period, measured at 37x over budget with the eviction pass unable to touch
-          // anything. The timer stays as the backstop for an item that is never read at all.
+          // Released once the consumer's stream has its DESCRIPTOR, not merely once the stream object
+          // exists. `fs.createReadStream` opens lazily, so releasing when the creator returned was too
+          // early: the pin dropped, an eviction pass unlinked the file, and the still-pending open then
+          // failed ENOENT — the very race the pin exists to prevent, reintroduced by releasing at the wrong
+          // moment (measured 1 failure in 50 concurrent reads). Once the fd is open, an unlink cannot
+          // disturb the reader: the inode survives until the descriptor closes.
+          //
+          // 'error' and 'close' release too, so an open that never succeeds cannot hold the pin, and the
+          // grace timer remains the backstop for an item that is never read at all. `release` is idempotent.
           //
           // Wrapped over `asRawStream` with the inner item's own encoding (always `null` here — this is
           // the decompressed cache file, read through a byte range), so `asStream`'s decoding behaviour
@@ -988,11 +1012,22 @@ export async function createFolderBasedFileSystemContentStorage(
           const inner = contentItem
           contentItem = new SimpleContentItem(
             async () => {
+              let stream: Readable
               try {
-                return await inner.asRawStream()
-              } finally {
+                stream = await inner.asRawStream()
+              } catch (err) {
                 releasePin()
+                throw err
               }
+              // `pending` is false once the descriptor is open; a non-fs stream has no such phase.
+              if ((stream as Readable & { pending?: boolean }).pending === false) {
+                releasePin()
+              } else {
+                stream.once('open', releasePin)
+              }
+              stream.once('error', releasePin)
+              stream.once('close', releasePin)
+              return stream
             },
             inner.size,
             inner.encoding,
@@ -1085,70 +1120,37 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   /**
-   * Re-adopts decompressed range-cache files that a previous run left behind, so they count against the
-   * size budget again and eviction can reclaim them.
+   * KNOWN LIMITATION — decompressed range-cache files do not survive an unclean exit as TRACKED files.
    *
-   * The tracker is in MEMORY only. A clean `stop()` evicts everything it knows about, but an unclean exit
-   * (SIGKILL, OOM, a crash) leaves one decompressed copy per id that was range-read that boot, and the
-   * next boot knows nothing about them: `reconcile()` and the temp-file sweep only inspect the reserved
-   * directory, and `allFileIds()` deliberately hides a raw file that has a `.gzip` sibling. So they were
-   * invisible to TTL and LRU eviction AND to `evictAll()`, stopped counting against
-   * `decompressCacheMaxSize`, and were reclaimed only if that exact id happened to be stored or deleted
-   * again — disk growing across restarts, up to the whole gzip-only working set, with the budget silently
-   * unenforced.
+   * The tracker is in memory only. A clean `stop()` evicts everything it knows about, but a SIGKILL, OOM
+   * or crash leaves one decompressed copy per id that was range-read that boot, and the next boot knows
+   * nothing about them: `reconcile()` and the temp-file sweep only inspect the reserved directory, and
+   * `allFileIds()` deliberately hides a raw file that has a `.gzip` sibling. Such a copy is invisible to
+   * TTL and LRU eviction and to `evictAll()`, stops counting against `decompressCacheMaxSize`, and is
+   * reclaimed only when its id is next stored or deleted. Disk can therefore grow across unclean
+   * restarts, bounded by the gzip-only working set. It costs disk, never correctness: the copy is a
+   * faithful decompression of its gzip, so reads stay correct.
    *
-   * A raw file with a `.gzip` sibling IS such a copy: a committed version of an id is raw-only or
-   * gzip-only, never both, so the pair can only mean "gzip is primary, raw is its derived cache".
+   * A startup sweep that adopted "any raw file with a `.gzip` sibling" has been tried and withdrawn TWICE
+   * now — see the README's own note under this limitation, which predates this one. That inference is not
+   * safe enough to act on destructively:
    *
-   * Two STREAMING passes per directory, the same shape `allFileIdsRec` uses for a large one: only gzip
-   * names are held, never the whole listing. Best-effort and detached from startup — a failure here costs
-   * the budget its accuracy, never correctness.
+   * - A QUARANTINED mixed state (a commit whose counterpart unlink failed) has both representations with
+   *   the RAW as the new primary. Adopting it made the raw evictable, so `evictAll()` on shutdown deleted
+   *   committed content and left the stale gzip — after which every subsequent construction refused to
+   *   start, since the intent's committed representation no longer existed.
+   * - A store committing DURING the walk could have its brand-new primary adopted (the sibling check was
+   *   made before the lock, the existence re-check after it), so a store that resolved successfully lost
+   *   its content on the next shutdown.
+   * - A foreign `x` + `x.gzip` pair under the root is indistinguishable from the real thing. `allFileIds`
+   *   makes the same inference but only to HIDE such a file; escalating it to a delete contradicts this
+   *   module's rule that it never destroys what it cannot prove it owns.
+   *
+   * Reclaiming these safely needs the tracker to be durable (a manifest under the reserved directory,
+   * written where the inflation commits) rather than a heuristic re-derived from the tree. Until then an
+   * operator can reclaim them by deleting any raw file that has a `.gzip` sibling while the storage is
+   * STOPPED, which is the same inference made where it cannot race a commit.
    */
-  async function adoptOrphanedCacheFiles(folder: string): Promise<number> {
-    let adopted = 0
-    const gzipNames = new Set<string>()
-    const subdirectories: string[] = []
-    try {
-      for await (const entry of await components.fs.opendir(folder, { bufferSize: 4000 })) {
-        if (entry.isDirectory()) {
-          const subdirectory = folder + path.sep + entry.name
-          if (!isInsideReservedTempDir(subdirectory)) subdirectories.push(subdirectory)
-        } else if (entry.name.endsWith(GZIP_EXTENSION)) {
-          gzipNames.add(entry.name)
-        }
-      }
-      // Nothing compressed here means nothing derived here; skip the second pass entirely, which is the
-      // steady state for a root of raw-primary content.
-      if (gzipNames.size > 0) {
-        for await (const entry of await components.fs.opendir(folder, { bufferSize: 4000 })) {
-          if (entry.isDirectory() || entry.name.endsWith(GZIP_EXTENSION)) continue
-          if (!gzipNames.has(entry.name + GZIP_EXTENSION)) continue
-          const filePath = folder + path.sep + entry.name
-          if (cache.isTracked(filePath)) continue
-          try {
-            const stat = await components.fs.stat(filePath)
-            if (!stat.isFile()) continue
-            // Under the path lock, like every other admission: a store or delete for this id may be
-            // committing right now, and re-checking inside settles the race in its favour.
-            await withPathLock(filePath, async () => {
-              if (cache.isTracked(filePath)) return
-              if (!(await existsForInvariant(filePath))) return
-              cache.record(filePath, stat.size)
-              adopted++
-            })
-          } catch {
-            // A file that vanished or cannot be statted is not adoptable; the next boot will try again.
-          }
-        }
-      }
-    } catch {
-      // An unreadable directory costs only the adoption of whatever is inside it.
-    }
-    for (const subdirectory of subdirectories) {
-      adopted += await adoptOrphanedCacheFiles(subdirectory)
-    }
-    return adopted
-  }
 
   const allFileIdsRec = async function* (folder: string, idBase: string, prefix?: string): AsyncIterable<string> {
     // `idBase` is always an ancestor of `folder`, and an entry name never contains a separator or a
@@ -1408,10 +1410,12 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   const doStoreStreamAndCompress = async (id: string, stream: Readable, signal?: AbortSignal): Promise<void> => {
-    // See `doStoreStream` for both checks and for why the id is validated before the source.
+    // See `doStoreStream` for both checks, for why the id is validated before the source, and for why the
+    // directory is created only once nothing can still reject.
     assertStorableContentId(id)
-    const filePath = await getFilePath(id)
+    const filePath = await resolveFilePath(id)
     assertStorableStream(stream)
+    await ensureDirectoryFor(filePath)
     // Fully staged: both the raw bytes and their gzip are produced in the operation-owned staging
     // area — the compression reads the PRIVATE staged raw, so no concurrent store/delete can
     // supersede or fail it — and the id transitions in ONE locked commit to either the gzip-only
@@ -1560,20 +1564,6 @@ export async function createFolderBasedFileSystemContentStorage(
           if (removed > 0) logger.info(`Removed ${removed} orphaned temp file(s) at startup`)
         })
         .catch((error) => logger.warn(`Orphaned temp-file sweep failed: ${error}`))
-        // Chained onto the same tracked promise (rather than started in parallel) so `stop()` still awaits
-        // exactly one thing and two starts cannot run two walks at once. Detached for the same reason as
-        // the sweep above: it walks the content tree, which on a large root is real I/O that startup must
-        // not wait for.
-        .then(() => adoptOrphanedCacheFiles(root))
-        .then((adopted) => {
-          if (adopted > 0) {
-            logger.info(
-              `Re-adopted ${adopted} decompressed cache file(s) left by a previous run; they now count ` +
-                `against the cache budget again`
-            )
-          }
-        })
-        .catch((error) => logger.warn(`Orphaned decompressed-cache adoption failed: ${error}`))
     },
     async stop() {
       if (evictionTimer) {
@@ -1610,38 +1600,49 @@ export async function createFolderBasedFileSystemContentStorage(
         // Locked so an in-flight decompression can never resurrect the id by renaming its staged
         // bytes onto the canonical path after these unlinks.
         await withPathLock(filePath, async () => {
-          // Invalidated FIRST, not last. This delete holds the path lock for its whole body, so an
-          // inflation that started before it can only commit once this releases — and it re-checks its
-          // token at that point. Invalidating at the END meant every step below (the repair, the two
-          // verifications, the journal check) could throw first and leave the token VALID, so a failed
-          // delete was followed by the in-flight inflation renaming its output onto the canonical path:
-          // the id came back readable, as a cache-tracked file a later TTL pass would silently unlink,
-          // so it flickered out of existence. Invalidating early has no cost — a delete that ends up
-          // failing has nothing to gain from a decompression of what it was trying to remove.
-          cache.invalidateInflight(filePath)
-          // A pending intent (a failed counterpart cleanup earlier) must not outlive its id: an
-          // orphaned journal whose id has neither a staged file nor any representation would refuse
-          // the next construction even though this delete was intentional. Repair first (throws if
-          // impossible), which discharges the journal; a crash mid-delete afterwards leaves at
-          // worst a partial delete with NO journal, which construction accepts.
-          await journal.repairPendingIntent(id)
-          // Every removal below is verified: a delete that resolves while ANY representation
-          // survives (cached raw, primary raw, or gzip) would leave the id readable after a
-          // "successful" delete. Failures abort before touching the next representation, so a
-          // failed delete always leaves a complete, readable version behind and rejects loudly.
-          const wasCached = await cache.remove(filePath)
-          if (!wasCached) {
-            await noFailUnlink(filePath)
-            if (await existsForInvariant(filePath)) {
-              throw new Error(`Failed to delete ${id}: its raw representation could not be removed`)
+          // Invalidated in a `finally`, so it runs on EVERY exit — but still only AFTER the removals
+          // below, which is load-bearing in a way that is easy to get backwards.
+          //
+          // At the end, the invalidation is airtight BY CONSTRUCTION: the gzip is already unlinked and
+          // verified gone, so an inflation that registers its token afterwards finds no source to inflate
+          // and returns without committing anything. Moving it to the START of this section — to cover the
+          // failure paths — instead opened a much wider hole on the SUCCESS path: an inflation registering
+          // during the rest of this body (four awaits, milliseconds on network-backed storage) got a
+          // FRESH, un-invalidated token, still saw the gzip, inflated, blocked on this lock, and renamed
+          // its output onto the canonical path once the delete released. A delete that RESOLVED then left
+          // the id readable and enumerable, and the resurrected file was cache-tracked, so it later
+          // vanished on an eviction pass with nothing having deleted it.
+          //
+          // The `finally` is what the early position was reaching for: a delete that throws at the repair,
+          // either verification or the journal check still discards an inflation whose output would land
+          // on a path this delete has already started dismantling.
+          try {
+            // A pending intent (a failed counterpart cleanup earlier) must not outlive its id: an
+            // orphaned journal whose id has neither a staged file nor any representation would refuse
+            // the next construction even though this delete was intentional. Repair first (throws if
+            // impossible), which discharges the journal; a crash mid-delete afterwards leaves at
+            // worst a partial delete with NO journal, which construction accepts.
+            await journal.repairPendingIntent(id)
+            // Every removal below is verified: a delete that resolves while ANY representation
+            // survives (cached raw, primary raw, or gzip) would leave the id readable after a
+            // "successful" delete. Failures abort before touching the next representation, so a
+            // failed delete always leaves a complete, readable version behind and rejects loudly.
+            const wasCached = await cache.remove(filePath)
+            if (!wasCached) {
+              await noFailUnlink(filePath)
+              if (await existsForInvariant(filePath)) {
+                throw new Error(`Failed to delete ${id}: its raw representation could not be removed`)
+              }
             }
+            await noFailUnlink(gzipPathOf(filePath))
+            if (await existsForInvariant(gzipPathOf(filePath))) {
+              throw new Error(`Failed to delete ${id}: its gzip representation could not be removed`)
+            }
+            // Defensive: repairPendingIntent already discharged any journal; verify none remains.
+            await journal.assertNoIntent(id, `Deleted ${id} but could not remove its intent journal`)
+          } finally {
+            cache.invalidateInflight(filePath)
           }
-          await noFailUnlink(gzipPathOf(filePath))
-          if (await existsForInvariant(gzipPathOf(filePath))) {
-            throw new Error(`Failed to delete ${id}: its gzip representation could not be removed`)
-          }
-          // Defensive: repairPendingIntent already discharged any journal; verify none remains.
-          await journal.assertNoIntent(id, `Deleted ${id} but could not remove its intent journal`)
         })
       })
     },

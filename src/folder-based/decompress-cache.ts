@@ -99,6 +99,17 @@ export type DecompressCacheOptions = {
 /** Used when `maxConcurrentInflations` is not given. The storage component supplies its own default. */
 const DEFAULT_MAX_CONCURRENT_INFLATIONS_FALLBACK = 4
 
+/**
+ * How long a stalled eviction waits before an admission may retry it.
+ *
+ * A stall means the last pass freed nothing while over budget — either a failing unlink, or nothing
+ * evictable but protected entries. The first is worth retrying rarely (it needs the underlying fault to be
+ * fixed), the second as soon as a new candidate exists. One second serves both: it keeps a degraded mount
+ * from re-running a full failing pass per inflation, and is far below the eviction interval, so a burst
+ * still converges without waiting for the timer.
+ */
+const STALL_RETRY_INTERVAL_MS = 1_000
+
 export function createDecompressCache(
   components: { logger: ILoggerComponent.ILogger; fsInvariants: FsInvariants },
   options: DecompressCacheOptions
@@ -141,24 +152,49 @@ export function createDecompressCache(
    * size budget, which is the same class of leak as the untracked orphan this cache already guards.
    */
   const pins = new Map<string, number>()
+  /** Every live pin's forced release, in acquisition order, so the oldest can be dropped at the cap. */
+  const pinExpiries = new Map<number, () => void>()
+  let nextPinId = 0
 
   function pin(filePath: string, graceMs: number): () => void {
     pins.set(filePath, (pins.get(filePath) ?? 0) + 1)
+    const pinId = nextPinId++
     let released = false
     const release = (): void => {
       if (released) return
       released = true
+      pinExpiries.delete(pinId)
       const remaining = (pins.get(filePath) ?? 1) - 1
       if (remaining > 0) pins.set(filePath, remaining)
       else pins.delete(filePath)
+      // RELEASING A PIN IS AN EVICTION TRIGGER. Passes were driven only by admissions and the interval, so
+      // the pass that ran on the LAST admission of a burst saw every entry still pinned, freed nothing, and
+      // nothing re-ran it: a burst of range reads left every derived file on disk until the next timer tick,
+      // measured at 31x over budget with no tick due for a minute. A release is the moment a candidate
+      // becomes evictable, so it is exactly when the budget is worth re-checking. `evict()` deduplicates, so
+      // a wave of releases schedules one pass; the stall is cleared because the state it described (nothing
+      // evictable) is precisely what just changed.
+      if (totalCacheSize > options.maxSize) {
+        if (!stalledOnEvictionFailure) evictionStalled = false
+        if (inflightEviction) evictionRequestedAgain = true
+        else if (!evictionStalled) void evict()
+      }
     }
     const expiry = setTimeout(release, graceMs)
     // Never keep the process alive for a pin; the cache is a disk-space optimisation, not work in flight.
     expiry.unref?.()
-    return () => {
+    const releaseNow = (): void => {
       clearTimeout(expiry)
       release()
     }
+    pinExpiries.set(pinId, releaseNow)
+
+    // DELIBERATELY NOT CAPPED. Force-releasing the oldest pin at a cap was tried and reverted: it hands the
+    // budget back its accuracy by re-exposing a reader to the ENOENT its pin exists to prevent, and failing
+    // a read of content that is present — a 5xx, per the read contract — is strictly worse than holding more
+    // disk than the budget for a few seconds. What bounds the exposure instead is how long a pin can live
+    // (`graceMs`), which is why that window is short. See `pin`'s caller for the resulting bound.
+    return releaseNow
   }
 
   let activeInflations = 0
@@ -170,13 +206,22 @@ export function createDecompressCache(
       activeInflations++
       return
     }
+    // The slot is TRANSFERRED, so the waiter does not increment on resume — see `releaseInflationSlot`.
     await new Promise<void>((resolve) => inflationQueue.push(resolve))
-    activeInflations++
   }
 
   function releaseInflationSlot(): void {
+    // HAND THE SLOT OVER without dropping it, rather than decrement-then-resolve. A waiter's continuation
+    // runs a microtask after its resolve, so decrementing first left `activeInflations` below the limit for
+    // that gap and a caller arriving inside it took the slot too — measured at 2 concurrent inflations with
+    // a limit of 1. Keeping the count unchanged while the queue is non-empty means the limit holds across
+    // the handoff, and only a release with nobody waiting actually frees a slot.
+    const next = inflationQueue.shift()
+    if (next) {
+      next()
+      return
+    }
     activeInflations--
-    inflationQueue.shift()?.()
   }
 
   const pathLocks = new Map<string, Promise<unknown>>()
@@ -220,16 +265,17 @@ export function createDecompressCache(
      * Omitted by `evictAll`, which is shutdown and must not be deferred by concurrent activity.
      */
     expectedLastAccess?: number
-  ): Promise<void> {
-    await withPathLock(filePath, async () => {
-      if (entries.get(filePath) !== entry) return
-      if (expectedLastAccess !== undefined && entry.lastAccess !== expectedLastAccess) return
+  ): Promise<boolean> {
+    return await withPathLock(filePath, async () => {
+      if (entries.get(filePath) !== entry) return false
+      if (expectedLastAccess !== undefined && entry.lastAccess !== expectedLastAccess) return false
       await noFailUnlink(filePath)
       // Keep the tracking when the file survives the unlink, so the next eviction tick retries it
       // instead of leaving an untracked (unaccounted, never-retried) cache file on disk.
-      if (await existsForInvariant(filePath)) return
+      if (await existsForInvariant(filePath)) return false
       totalCacheSize -= entry.size
       entries.delete(filePath)
+      return true
     })
   }
 
@@ -250,13 +296,14 @@ export function createDecompressCache(
     filePath: string,
     entry: { size: number; lastAccess: number },
     expectedLastAccess?: number
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
-      await evictEntry(filePath, entry, expectedLastAccess)
+      return await evictEntry(filePath, entry, expectedLastAccess)
     } catch (error) {
       logger.warn(`Could not evict the cached decompressed file at ${filePath}; it stays tracked for a later retry`, {
         error: error instanceof Error ? error.message : String(error)
       })
+      return false
     }
   }
 
@@ -265,30 +312,52 @@ export function createDecompressCache(
   /** Set when a pass ends over budget having freed nothing, so retries wait for the timer. */
   let evictionStalled = false
   /**
-   * How many entries were tracked when the stall was recorded.
+   * Admissions counted since this cache was created. MONOTONIC — never decreases.
    *
-   * The stall exists to stop admission-triggered passes from spinning on a failing unlink, but it was
-   * cleared ONLY by `evict()`, which admission never reaches while stalled — so the only thing that could
-   * clear it was the interval installed by `start()`, and a storage used without `start()` lost on-disk
-   * bounding permanently (measured: 5 of 5 decompressed copies retained against a 10-byte budget, versus
-   * 1 of 5 with the timer running). The FIRST pass is routinely unproductive — a single entry over budget
-   * has nothing evictable but the protected MRU entry — so this was reachable on an ordinary config.
-   *
-   * Comparing the entry count is what distinguishes the two stall causes without conflating them: a new
-   * admission means a new eviction candidate exists (the entry protected as most-recent no longer is), so
-   * a retry can now make progress; a failing unlink with no new entries still waits for the timer.
+   * The stall latch needs to distinguish "retrying could now make progress" from "retrying will fail the
+   * same way", and it must not be fooled by the tracker SHRINKING. Comparing `entries.size` did both
+   * wrongly: `forget`/`remove` (an ordinary store or delete) lower it below the value recorded at stall
+   * time, after which `entries.size > stalledAtEntryCount` is permanently false and admission-triggered
+   * eviction never runs again — measured at 400 bytes retained against a 10-byte budget with four
+   * evictable entries and a working unlink.
    */
-  let stalledAtEntryCount = 0
+  let admissionsSeen = 0
+  /** `admissionsSeen` when the stall was recorded, so a NEW admission can be recognised. */
+  let stalledAtAdmission = 0
+  /** When the stall was recorded, for the backoff that applies to a FAILING stall. */
+  let stalledAt = 0
+  /**
+   * Whether the stalled pass actually TRIED to evict something and failed, as opposed to finding nothing
+   * evictable at all.
+   *
+   * The two causes need opposite retry policies, and conflating them broke the latch in both directions.
+   * "Tried and failed" is a damaged mount: retrying per admission re-runs a whole failing pass, and a
+   * warning per entry, for every inflation that lands — the spin the latch exists to prevent. "Nothing to
+   * try" is the ordinary burst, where every candidate was protected or pinned: the next admission IS a new
+   * candidate, retrying is cheap and productive, and rate-limiting it instead let a burst of range reads
+   * settle far over budget because no pass could run until the backoff expired.
+   */
+  let stalledOnEvictionFailure = false
 
   async function runEviction() {
     const now = Date.now()
-    const before = totalCacheSize
+    // Whether any entry was actually handed to `evictEntrySafely` this pass. See `stalledOnEvictionFailure`.
+    let attemptedAnEviction = false
+    // How many entries this pass actually REMOVED.
+    //
+    // Counted, not inferred from the total. `freedSomething = totalCacheSize < before` compared against a
+    // snapshot taken at pass start, and every admission landing DURING the pass raises the total past it — so
+    // a pass that had evicted perfectly well concluded it freed nothing, stalled, and stopped enforcing the
+    // budget. That is what made a burst settle 34x over: 50 admissions arrive while the first pass is on its
+    // first `await`, and the pass then measured 14.7 MB against a 600 KB snapshot and gave up.
+    let evictedThisPass = 0
 
     // TTL eviction. Entries are visited oldest-first, so the first one still inside its TTL means
     // every entry behind it is too — no need to walk the rest of the tracker.
     for (const [filePath, entry] of entries) {
       if (now - entry.lastAccess <= options.ttl) break
-      await evictEntrySafely(filePath, entry, entry.lastAccess)
+      attemptedAnEviction = true
+      if (await evictEntrySafely(filePath, entry, entry.lastAccess)) evictedThisPass++
     }
 
     // Size eviction (LRU)
@@ -317,7 +386,8 @@ export function createDecompressCache(
         // ENOENT — content that was never missing, surfaced to the caller as a 5xx by the read contract.
         // `continue`, not `break`: a pinned entry must not shield the older ones behind it from eviction.
         if (pins.has(filePath)) continue
-        await evictEntrySafely(filePath, entry, entry.lastAccess)
+        attemptedAnEviction = true
+        if (await evictEntrySafely(filePath, entry, entry.lastAccess)) evictedThisPass++
       }
     }
 
@@ -327,10 +397,12 @@ export function createDecompressCache(
     // tick. Only re-run while progress is being made: a pass that frees nothing (an unlinkable file,
     // or nothing evictable left besides the protected MRU entry) would otherwise spin on every
     // admission, retrying a failing unlink and logging each time.
-    const freedSomething = totalCacheSize < before
+    const freedSomething = evictedThisPass > 0
     if (totalCacheSize > options.maxSize && !freedSomething) {
       evictionStalled = true
-      stalledAtEntryCount = entries.size
+      stalledAtAdmission = admissionsSeen
+      stalledAt = Date.now()
+      stalledOnEvictionFailure = attemptedAnEviction
       return
     }
     evictionStalled = false
@@ -410,9 +482,18 @@ export function createDecompressCache(
       // an eviction immediately. `evict()` deduplicates itself, so a burst schedules one pass, not
       // one per entry; it is deliberately not awaited — `record` runs inside a commit holding this
       // path's lock, and the eviction it starts needs that same lock.
-      // A stall that was recorded with FEWER entries than are tracked now is no longer good evidence that
-      // a pass would be unproductive: this admission is itself a fresh candidate. See `stalledAtEntryCount`.
-      if (evictionStalled && entries.size > stalledAtEntryCount) {
+      admissionsSeen++
+      // A stall recorded before this admission is no longer good evidence that a pass would be
+      // unproductive: this admission is itself a fresh eviction candidate (whatever was protected as
+      // most-recent or pinned no longer is). Whether that justifies retrying NOW depends on why the pass
+      // freed nothing — see `stalledOnEvictionFailure`. A pass that found nothing to try retries
+      // immediately, so a burst converges; one whose unlinks failed backs off, so a damaged mount does not
+      // re-run a whole failing pass per inflation.
+      if (
+        evictionStalled &&
+        admissionsSeen > stalledAtAdmission &&
+        (!stalledOnEvictionFailure || Date.now() - stalledAt >= STALL_RETRY_INTERVAL_MS)
+      ) {
         evictionStalled = false
       }
       if (totalCacheSize > options.maxSize && !evictionStalled) {

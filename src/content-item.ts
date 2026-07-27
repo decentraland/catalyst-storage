@@ -213,7 +213,29 @@ export function assertStorableStream(stream: Readable): void {
   // source AND for a live-but-empty one (so an empty body is still storable, as it must be), and
   // `true` the instant anything has been pulled — which is precisely when this source can no longer
   // supply the content it is being asked to store.
+  //
+  // KNOWN OVER-REJECTION: `readableDidRead` records that a read HAPPENED, and nothing un-records it, so a
+  // caller that sniffs a head and then `unshift()`s it back — the documented way to un-consume optimistically
+  // pulled data, and a source that really does still hold the whole body — is refused too. That is
+  // deliberate: there is no signal that distinguishes "read and put back" from "read and kept", and the two
+  // failure modes are not comparable. Refusing a restored source costs a loud, actionable rejection; storing
+  // a partially consumed one silently commits wrong bytes under an id that is then never re-fetched. A
+  // caller in that position should hand over a fresh source (re-open the file, or buffer the body and use
+  // `bufferToStream`) rather than a rewound one.
   if (stream.readableDidRead) throw prematureClose()
+  // A source in a NON-UTF8 encoding mode yields strings, and every backend turns those back into bytes as
+  // utf8 (the folder-based one by piping into an `fs.WriteStream`, whose default encoding that is; S3 and the
+  // in-memory backend via `Buffer.from`). For `latin1`/`hex`/`base64` that round trip is lossy, so the bytes
+  // stored are not the bytes read — silent corruption under an id that is then never re-fetched, which is the
+  // failure class this guard exists for. `utf8` round-trips exactly and stays allowed, as does the ordinary
+  // case of no encoding set at all.
+  const encoding = stream.readableEncoding
+  if (encoding !== null && encoding !== 'utf8' && encoding !== 'utf-8') {
+    throw new Error(
+      `Cannot store a stream in '${encoding}' encoding mode: its string chunks would be re-encoded as utf8, ` +
+        `which does not round-trip. Read the source in binary mode (no encoding) instead.`
+    )
+  }
 }
 
 /**

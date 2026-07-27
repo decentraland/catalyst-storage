@@ -499,11 +499,16 @@ export async function createIntentJournal(
       // metadata can be journaled while the intent file's data blocks are not. A zero-length intent
       // beside a genuinely mixed on-disk state then reads as "never started" and the id keeps serving
       // two versions, one per read path, with nothing anywhere saying so.
+      // Logged AFTER the removal is proven, not before: `removeIntentOrThrow` can throw, and announcing the
+      // discard first produced a log line saying the journal WAS discarded immediately followed by a
+      // `Refusing to start` saying it was kept. `byteLength`, not `body.length`, because `body` is a decoded
+      // utf8 string and code units are the wrong unit precisely for the torn/zero-length write this
+      // diagnoses.
+      await removeIntentOrThrow(intentPath, 'Discarding a malformed intent journal failed')
       logger.warn(`Discarded a malformed intent journal; if content for this id reads inconsistently, repair it`, {
         intent: path.basename(intentPath),
-        bytes: body.length
+        bytes: Buffer.byteLength(body, 'utf8')
       })
-      await removeIntentOrThrow(intentPath, 'Discarding a malformed intent journal failed')
       return
     }
     const stagedPath = path.join(tempDir, staged)
@@ -640,13 +645,18 @@ export async function createIntentJournal(
       onCounterpartRemoved?.()
     }
     if (hadCounterpart) {
-      await noFailUnlink(counterpartPath)
+      const unlinked = await noFailUnlink(counterpartPath)
       let counterpartGone: boolean
       try {
         counterpartGone = !(await existsForInvariant(counterpartPath))
       } catch (verifyErr) {
         // Possibly mixed and unprovable: quarantine so reads repair-or-refuse instead of serving it.
         unreconciledIds.add(id)
+        // The unlink may well have SUCCEEDED and only the verification failed (an EIO/EACCES on the shard),
+        // in which case the counterpart really is gone and the caller's bookkeeping for it is stale. Without
+        // this the decompress cache kept counting a deleted file's bytes against its budget until an
+        // eviction pass happened to retry that path — and if the same shard fault kept failing, forever.
+        if (unlinked) onCounterpartRemoved?.()
         throw verifyErr
       }
       if (!counterpartGone) {
@@ -746,10 +756,14 @@ export async function createIntentJournal(
 
     async ensureReconciled(id: string): Promise<boolean> {
       if (!unreconciledIds.has(id)) return true
-      // Inside the try that makes this method's documented "never throws" true. `resolveFilePath` can
-      // reject — a `tempDirectoryName` or `disablePrefixHash` change between runs makes an id that
-      // resolved at store time stop resolving — and from here that escaped into `assertNotQuarantined`,
-      // past the repair gate whose whole purpose is to answer with a boolean.
+      // Inside the try that makes this method's documented "never throws" true.
+      //
+      // Belt and braces rather than a reachable path: `unreconciledIds` never survives a restart, so an id
+      // is only ever quarantined by a commit in THIS process, which already resolved it — and
+      // `resolveFilePath` is deterministic for a live instance's configuration. Kept because the guarantee
+      // this method advertises should not depend on that reasoning staying true, and because if it ever did
+      // throw, the escape turned the repair gate's boolean answer into a rejection out of
+      // `assertNotQuarantined`.
       let filePath: string
       try {
         filePath = await resolveFilePath(id)

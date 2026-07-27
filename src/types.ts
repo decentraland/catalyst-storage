@@ -19,7 +19,13 @@ export type IContentStorageComponent = IBaseComponent & {
    *
    * The source must be one nothing has read from yet. A stream that has already been consumed — even
    * partially, as when a caller hashes or sniffs the body first — is REFUSED rather than stored, because
-   * what it can still supply is not the content.
+   * what it can still supply is not the content. `unshift`-ing the bytes back does not make it storable
+   * again; hand over a fresh source instead.
+   *
+   * A REJECTED store consumes the source: it is destroyed on the way out, so a caller retrying after
+   * correcting the id must supply a new stream. Without that, a service passing untrusted ids leaked one
+   * descriptor — or one undrained request socket — per rejected call, since nothing had piped the stream and
+   * so nothing would ever close it.
    *
    * @param signal Optional cancellation signal. When it aborts, the store stops consuming the
    * stream, tears down any in-flight transport (e.g. the S3 upload), and rejects with the

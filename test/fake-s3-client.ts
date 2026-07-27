@@ -4,8 +4,14 @@ import { Readable } from 'stream'
 type CommandHandler = (input: any, options?: any) => Promise<any> | any
 
 export type FakeS3Client = S3Client & {
-  /** The stored objects, keyed by S3 key — assertable from tests. */
-  objects: Map<string, { body: Buffer; contentType?: string }>
+  /**
+   * The stored objects, keyed by S3 key — assertable from tests.
+   *
+   * `etag` is optional: when absent, one is derived from the key, which is what a plain re-store produces.
+   * Set it explicitly to model an object whose ETag changed (a new version, or an SSE-KMS bucket where the
+   * ETag is not a digest of the body), which is what `IfMatch` is checked against.
+   */
+  objects: Map<string, { body: Buffer; contentType?: string; etag?: string }>
   /** Overrides the handler for one command (by class name), e.g. to make HeadObject fail. */
   on: (commandName: string, handler: CommandHandler) => void
   /** Makes the given command hang until `release()` is called, to model an in-flight request. */
@@ -14,6 +20,13 @@ export type FakeS3Client = S3Client & {
 
 function notFound(): Error {
   return Object.assign(new Error('NotFound'), { name: 'NotFound', $metadata: { httpStatusCode: 404 } })
+}
+
+function preconditionFailed(): Error {
+  return Object.assign(new Error('At least one of the pre-conditions you specified did not hold'), {
+    name: 'PreconditionFailed',
+    $metadata: { httpStatusCode: 412 }
+  })
 }
 
 function abortError(): Error {
@@ -42,7 +55,8 @@ async function bodyToBuffer(body: unknown): Promise<Buffer> {
  * genuine `Upload.abort()` path rather than a hand-rolled stand-in for it.
  */
 export function createFakeS3Client(): FakeS3Client {
-  const objects = new Map<string, { body: Buffer; contentType?: string }>()
+  const objects = new Map<string, { body: Buffer; contentType?: string; etag?: string }>()
+  const etagOf = (key: string, stored: { etag?: string }): string => stored.etag ?? `"${key}"`
   const parts = new Map<string, Map<number, Buffer>>()
   const overrides = new Map<string, CommandHandler>()
   const hangs = new Map<string, { promise: Promise<void>; release: () => void; started: () => void }>()
@@ -51,11 +65,14 @@ export function createFakeS3Client(): FakeS3Client {
     HeadObjectCommand: ({ Key }) => {
       const found = objects.get(Key)
       if (!found) throw notFound()
-      return { ETag: `"${Key}"`, ContentLength: found.body.length, ContentType: found.contentType }
+      return { ETag: etagOf(Key, found), ContentLength: found.body.length, ContentType: found.contentType }
     },
-    GetObjectCommand: ({ Key, Range }) => {
+    GetObjectCommand: ({ Key, Range, IfMatch }) => {
       const found = objects.get(Key)
       if (!found) throw notFound()
+      // ENFORCED, like the real service. Ignoring it made any test of the read's `IfMatch` pin vacuous: it
+      // passed whether the header was sent, omitted, or sent with a wrong value.
+      if (IfMatch !== undefined && IfMatch !== etagOf(Key, found)) throw preconditionFailed()
       let body = found.body
       if (Range) {
         const [, start, end] = /bytes=(\d+)-(\d+)?/.exec(Range) ?? []

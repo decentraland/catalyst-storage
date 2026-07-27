@@ -21,7 +21,6 @@ import {
   validateRange
 } from './types'
 import { assertStorableStream, contentCodingOf, normalizeContentEncoding, SimpleContentItem } from './content-item'
-import { assertStorableContentId } from './content-id'
 import { isAbortError, runStoreWithSignal } from './cancellation'
 import { destroyQuietly } from './stream-teardown'
 import { forEachWithConcurrency, mapWithConcurrency } from './concurrency'
@@ -100,6 +99,10 @@ export type S3ContentStorageOptions = {
 /** S3's hard per-request limit for `DeleteObjects`; the SDK does not split a larger list. */
 const DELETE_OBJECTS_MAX_KEYS = 1000
 
+/** S3's own bounds for a multipart part, which `partSize` is checked against at construction. */
+const S3_MIN_PART_SIZE = 5 * 1024 * 1024
+const S3_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
+
 /**
  * How many `DeleteObjects` requests a single `delete()` may have in flight. Each carries up to 1000
  * keys, so this is already 8000 keys of work at once — well clear of the SDK's default socket pool while
@@ -120,7 +123,7 @@ export async function createAwsS3BasedFileSystemContentStorage(
   components: Pick<AppComponents, 'config' | 'logs'>,
   bucket: string,
   /** Forwarded to {@link createS3BasedFileSystemContentStorage}; see the options documented there. */
-  options?: Pick<S3ContentStorageOptions, 'fileTypeLoader' | 'report403AsAbsent'>
+  options?: Pick<S3ContentStorageOptions, 'fileTypeLoader' | 'report403AsAbsent' | 'partSize'>
 ): Promise<IContentStorageComponent> {
   const { config, logs } = components
 
@@ -136,7 +139,10 @@ export async function createAwsS3BasedFileSystemContentStorage(
     storage = await createS3BasedFileSystemContentStorage({ logs }, s3, {
       Bucket: bucket,
       fileTypeLoader: options?.fileTypeLoader,
-      report403AsAbsent: options?.report403AsAbsent
+      report403AsAbsent: options?.report403AsAbsent,
+      // Forwarded explicitly, like every other option: a caller using the owned-client factory otherwise
+      // had no way to raise the ~50 GiB per-store ceiling `partSize` exists to lift.
+      partSize: options?.partSize
     })
   } catch (error) {
     s3.destroy()
@@ -310,6 +316,24 @@ export async function createS3BasedFileSystemContentStorage(
 ): Promise<IContentStorageComponent> {
   const logger = components.logs.getLogger('s3-based-content-storage')
   const Bucket = options.Bucket
+
+  // Validated at CONSTRUCTION, like every numeric option the folder-based backend takes, because every way
+  // of getting it wrong fails late and confusingly otherwise: below S3's 5 MiB minimum every store rejects
+  // with a bare `EntityTooSmall` from the SDK; `0` and `NaN` are swallowed by lib-storage's `partSize || …`
+  // so the option silently does nothing; and a NON-INTEGER passes lib-storage's own guard and then kills any
+  // upload that needs more than one part with a part-size mismatch — i.e. it survives small-object tests and
+  // fails in production after the bytes have crossed the wire.
+  if (options.partSize !== undefined) {
+    if (!Number.isSafeInteger(options.partSize)) {
+      throw new Error(`partSize must be a safe integer, got: ${String(options.partSize)}`)
+    }
+    if (options.partSize < S3_MIN_PART_SIZE || options.partSize > S3_MAX_PART_SIZE) {
+      throw new Error(
+        `partSize must be between ${S3_MIN_PART_SIZE} and ${S3_MAX_PART_SIZE} bytes (S3's own limits), ` +
+          `got: ${options.partSize}`
+      )
+    }
+  }
 
   // Warm the ESM loader now rather than on the first store, so a resolution problem shows up in the
   // logs before traffic arrives instead of silently degrading every object's content type.
@@ -602,7 +626,12 @@ export async function createS3BasedFileSystemContentStorage(
                 })
               }
             }
-          } else if (multipartCreateIssued) {
+            // Gated on this having been OUR cancellation. `multipartCreateIssued` alone is true for any
+            // failed create — a 403 AccessDenied, a 503 SlowDown, a NoSuchBucket — and reporting those as
+            // "cancelled while it was being created … a stale multipart upload may remain listed" both
+            // misattributed the cause and sent operators hunting an orphan S3 provably never created, on the
+            // most common multipart failure there is.
+          } else if (multipartCreateIssued && abortedUpload && isAbortError(error)) {
             // The create was issued but never answered — the abort tore it down in flight. S3 may still
             // have processed the request, in which case a multipart upload exists that NOTHING can abort:
             // its id only ever existed in the response that was discarded.
@@ -640,12 +669,13 @@ export async function createS3BasedFileSystemContentStorage(
       // 0-byte object under the id and resolved. Same rule the folder-based and in-memory backends
       // apply — see `assertStorableStream`.
       //
-      // The id is checked FIRST, as on the other two backends: one bad call must not produce a different
-      // typed error depending on which backend is behind it. An S3 key has no per-segment limit of its
-      // own, so this rule is enforced purely to keep the id namespace identical across backends — an id
-      // this accepted and the folder-based backend cannot store is the divergence these shared checks
-      // exist to prevent.
-      assertStorableContentId(id)
+      // No ID validation here, deliberately. Keys are opaque to S3 and an existing bucket may already hold
+      // keys the folder-based rules would reject, so refusing them would make that content unwritable while
+      // the read path still serves it — the documented contract (README, "Id validation") is that this
+      // backend validates ids not at all and a service spanning backends applies the rules itself. An
+      // earlier revision of this patch enforced the segment-length rule here for cross-backend parity; that
+      // is the wrong trade, because S3 keys have no per-segment limit and a >255-byte segment is a key this
+      // bucket may already be serving.
       assertStorableStream(stream)
       // Inspect only the head for MIME detection, then stream the body straight to S3 so large
       // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
@@ -865,13 +895,18 @@ export async function createS3BasedFileSystemContentStorage(
     }
 
     let output: ListObjectsV2CommandOutput
-    // Every token this enumeration has already followed. Relaxing the stop condition to `IsTruncated
-    // !== false` (see below) traded a guaranteed termination for one that depends on the server issuing a
-    // FRESH token each page — and the endpoints that relaxation exists for are exactly the ones where that
-    // is not guaranteed: a gateway echoing the request's `ContinuationToken` back as
-    // `NextContinuationToken` made this loop re-request the same page forever, re-yielding the same ids on
-    // every pass, so a GC or sync sweep never terminated and kept deleting the same ids.
-    const followedTokens = new Set<string>()
+    // The token this enumeration last followed. Relaxing the stop condition to `IsTruncated !== false` (see
+    // below) traded a guaranteed termination for one that depends on the server issuing a FRESH token each
+    // page — and the endpoints that relaxation exists for are exactly the ones where that is not guaranteed:
+    // a gateway echoing the request's `ContinuationToken` back as `NextContinuationToken` made this loop
+    // re-request the same page forever, re-yielding the same ids on every pass, so a GC or sync sweep never
+    // terminated and kept deleting the same ids.
+    //
+    // Only the PREVIOUS token is kept, not every token seen. A repeat can only manifest as an immediate one
+    // (the server hands back what it was just given), and retaining the whole set cost one token per page for
+    // the life of the enumeration — tens of megabytes on a bucket with 100M objects — to detect a condition
+    // the last value already answers.
+    let previousToken: string | undefined
     do {
       output = await s3.send(new ListObjectsV2Command(params))
       if (output.Contents) {
@@ -890,15 +925,18 @@ export async function createS3BasedFileSystemContentStorage(
         }
       }
       const nextToken = output.NextContinuationToken
-      if (nextToken !== undefined && followedTokens.has(nextToken)) {
-        logger.warn(
-          'Stopping enumeration: the endpoint returned a continuation token it had already issued, which ' +
-            'would repeat the same page indefinitely. The listing may be incomplete.',
-          { bucket: Bucket, prefix: prefix ?? '', pagesListed: followedTokens.size }
+      if (nextToken !== undefined && nextToken === previousToken) {
+        // THROWS rather than returning. Ending the iterator normally would hand the caller a silently short
+        // listing, which is precisely the failure the relaxed stop condition below exists to avoid — a GC or
+        // sync sweep would act on a partial view of the bucket and could delete content it simply never saw.
+        // A rejection makes the incomplete enumeration impossible to mistake for a complete one.
+        throw new Error(
+          `Cannot enumerate ${Bucket}: the endpoint returned the same continuation token twice, so paging ` +
+            `cannot advance and the listing would repeat the same page indefinitely. This enumeration is ` +
+            `incomplete and must not be treated as the full bucket contents.`
         )
-        return
       }
-      if (nextToken !== undefined) followedTokens.add(nextToken)
+      previousToken = nextToken
       params.ContinuationToken = nextToken
       // Continue on any continuation token unless the server explicitly said this page was the last.
       //
