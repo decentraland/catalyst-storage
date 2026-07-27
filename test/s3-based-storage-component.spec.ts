@@ -385,11 +385,23 @@ describe('S3 Storage enumeration', () => {
     })
 
     it('should reject rather than following the cycle forever', async () => {
+      await expect(async () => {
+        for await (const _each of storage.allFileIds()) {
+          // drain the iterator so the pagination failure surfaces
+        }
+      }).rejects.toThrow('returned continuation token')
+    })
+
+    it('should not emit the page whose cursor it is about to reject', async () => {
+      // The cursor is validated BEFORE the page is yielded, so a caller streaming ids never processes the
+      // repeated page. Previously the third page — a duplicate of one already seen — reached the consumer and
+      // only then did the iterator reject, so a GC or sync sweep acted on repeats.
       const listed: string[] = []
       await expect(async () => {
         for await (const each of storage.allFileIds()) listed.push(each)
       }).rejects.toThrow('returned continuation token')
-      expect(listed).toEqual(['first', 'second', 'third'])
+
+      expect(listed).toEqual(['first', 'second'])
     })
 
     it('should stop when the repeated older token is observed', async () => {
@@ -423,11 +435,22 @@ describe('S3 Storage enumeration', () => {
     })
 
     it('should reject rather than completing a partial listing', async () => {
+      await expect(async () => {
+        for await (const _each of storage.allFileIds()) {
+          // drain the iterator so the pagination failure surfaces
+        }
+      }).rejects.toThrow('truncated listing without a continuation token')
+    })
+
+    it('should not emit the page it cannot continue from', async () => {
+      // Same reason as the token-cycle case: an enumeration that cannot be completed refuses before handing
+      // the caller anything from the page that proved it.
       const listed: string[] = []
       await expect(async () => {
         for await (const each of storage.allFileIds()) listed.push(each)
       }).rejects.toThrow('truncated listing without a continuation token')
-      expect(listed).toEqual(['only-key'])
+
+      expect(listed).toEqual([])
     })
 
     it('should stop after the page it could not continue from', async () => {

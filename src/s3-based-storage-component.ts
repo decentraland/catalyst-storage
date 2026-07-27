@@ -922,6 +922,46 @@ export async function createS3BasedFileSystemContentStorage(
     const seenContinuationTokens = new Set<string>()
     do {
       output = await s3.send(new ListObjectsV2Command(params))
+
+      // THE CURSOR IS VALIDATED BEFORE THE PAGE IS YIELDED. Both checks below reject an enumeration that
+      // cannot be completed, so running them afterwards meant a streaming caller had already consumed the
+      // page — and for the token-repeat case that page is a DUPLICATE of one it has seen, so a consumer
+      // processing ids as they arrive acted on repeats before the iterator rejected. Deciding first means
+      // nothing is emitted from a page this enumeration is about to refuse to continue past.
+      //
+      // Only consulted when the endpoint says there is more to come: a FINAL page is allowed to carry a
+      // stale or repeated token, which no longer means anything, and rejecting it would fail a listing that
+      // is in fact complete.
+      const nextToken = output.NextContinuationToken
+      const saysThereIsMore = output.IsTruncated !== false
+      if (saysThereIsMore) {
+        if (output.IsTruncated === true && (typeof nextToken !== 'string' || nextToken.length === 0)) {
+          // THROWS rather than returning. The endpoint explicitly said there are more keys, but did not give a
+          // usable cursor to reach them. Ending the iterator normally would hand the caller a silently short
+          // listing, so a GC or sync sweep could act on a partial bucket view as if it were complete.
+          throw new Error(
+            `Cannot enumerate ${Bucket}: the endpoint reported a truncated listing without a continuation ` +
+              `token, so paging cannot advance. This enumeration is incomplete and must not be treated as ` +
+              `the full bucket contents.`
+          )
+        }
+        if (nextToken !== undefined) {
+          if (seenContinuationTokens.has(nextToken)) {
+            // THROWS rather than returning. Ending the iterator normally would hand the caller a silently
+            // short listing, which is precisely the failure the relaxed stop condition below exists to avoid
+            // — a GC or sync sweep would act on a partial view of the bucket and could delete content it
+            // simply never saw. A rejection makes the incomplete enumeration impossible to mistake for a
+            // complete one.
+            throw new Error(
+              `Cannot enumerate ${Bucket}: the endpoint returned continuation token '${nextToken}' more than ` +
+                `once, so paging cannot advance safely and the listing may cycle indefinitely. This ` +
+                `enumeration is incomplete and must not be treated as the full bucket contents.`
+            )
+          }
+          seenContinuationTokens.add(nextToken)
+        }
+      }
+
       if (output.Contents) {
         for (const content of output.Contents) {
           // The SDK types `Key` as optional and it flows straight into a caller's sweep, where
@@ -937,32 +977,8 @@ export async function createS3BasedFileSystemContentStorage(
           yield content.Key
         }
       }
-      const nextToken = output.NextContinuationToken
-      if (output.IsTruncated === true && (typeof nextToken !== 'string' || nextToken.length === 0)) {
-        // THROWS rather than returning. The endpoint explicitly said there are more keys, but did not give a
-        // usable cursor to reach them. Ending the iterator normally would hand the caller a silently short
-        // listing, so a GC or sync sweep could act on a partial bucket view as if it were complete.
-        throw new Error(
-          `Cannot enumerate ${Bucket}: the endpoint reported a truncated listing without a continuation ` +
-            `token, so paging cannot advance. This enumeration is incomplete and must not be treated as ` +
-            `the full bucket contents.`
-        )
-      }
-      if (nextToken !== undefined) {
-        if (seenContinuationTokens.has(nextToken)) {
-          // THROWS rather than returning. Ending the iterator normally would hand the caller a silently short
-          // listing, which is precisely the failure the relaxed stop condition below exists to avoid — a GC or
-          // sync sweep would act on a partial view of the bucket and could delete content it simply never saw.
-          // A rejection makes the incomplete enumeration impossible to mistake for a complete one.
-          throw new Error(
-            `Cannot enumerate ${Bucket}: the endpoint returned continuation token '${nextToken}' more than once, ` +
-              `so paging cannot advance safely and the listing may cycle indefinitely. This enumeration is ` +
-              `incomplete and must not be treated as the full bucket contents.`
-          )
-        }
-        seenContinuationTokens.add(nextToken)
-      }
-      params.ContinuationToken = nextToken
+
+      params.ContinuationToken = saysThereIsMore ? nextToken : undefined
       // Continue on any continuation token unless the server explicitly said this page was the last.
       //
       // Both halves matter, in opposite directions. Requiring a TOKEN stops the infinite loop a
