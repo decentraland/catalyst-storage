@@ -299,7 +299,8 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   /**
-   * Discards the damage evidence for a path a successful store now OWNS as this storage's own content.
+   * Discards the damage evidence for a path a successful store now OWNS as content, AND for everything
+   * beneath it.
    *
    * A directory that broke and an id that legitimately occupies the same path are different states, and the
    * evidence for the first has to stop applying once the second is true. Without this, a store of `a2` after
@@ -308,12 +309,26 @@ export async function createFolderBasedFileSystemContentStorage(
    * `delete` resolves for it. The whole point of this contract is that those three agree, and `a2/b` under a
    * legitimately occupied prefix is the provably-absent case this PR exists to report as absent.
    *
+   * AT OR BELOW, not just the path itself. Damage is recorded against the directory this instance OBSERVED,
+   * which is the store's own `dirname` and can be far deeper than the ancestor that actually broke: a store
+   * of `a2/b/c` records `<root>/a2/b`, so removing `<root>/a2` files the damage under `<root>/a2/b` and
+   * clearing only the committed path left it behind. A later store of `a2` then owned the prefix while reads
+   * of `a2/b/c` still rejected — the same disagreement one level down. Recording against the real broken
+   * ancestor instead would mean walking and statting the chain to find it; superseding the whole subtree is
+   * the same answer without the syscalls, and it is exactly what a store of that prefix proves.
+   *
    * Keyed on the id's canonical RAW path for both commit shapes, because that is the path a directory
    * occupied: a gzip-only commit leaves nothing at it, but the id exists either way, so a read below it is
    * "nothing stored here" rather than a fault.
    */
-  function forgetDamagedDirectory(target: string): void {
-    damagedDirectories.delete(target)
+  function forgetDamagedDirectoriesUnder(target: string): void {
+    // Normally EMPTY — damage is rare — so an ordinary store pays one size check and no iteration at all.
+    // When there is damage the scan is bounded by how many directories actually broke, not by the tree.
+    if (damagedDirectories.size === 0) return
+    const prefix = target + path.sep
+    for (const damaged of damagedDirectories) {
+      if (damaged === target || damaged.startsWith(prefix)) damagedDirectories.delete(damaged)
+    }
   }
 
   /** Moves a broken directory's observation out of the mkdir-skip cache; see `damagedDirectories`. */
@@ -1357,9 +1372,10 @@ export async function createFolderBasedFileSystemContentStorage(
         throw err
       }
     })
-    // This id now owns the path, so any damage evidence naming it as a lost DIRECTORY no longer applies.
-    // Only after the store has fully succeeded: a failed one owns nothing. See `forgetDamagedDirectory`.
-    forgetDamagedDirectory(filePath)
+    // This id now owns the path, so damage evidence naming it — or anything BENEATH it — as a lost
+    // directory no longer applies. Only after the store has fully succeeded: a failed one owns nothing.
+    // See `forgetDamagedDirectoriesUnder`.
+    forgetDamagedDirectoriesUnder(filePath)
   }
 
   // Concurrent-read contract: reads do NOT hold a write's lock for the duration of that write, and never
@@ -2018,8 +2034,8 @@ export async function createFolderBasedFileSystemContentStorage(
     // stays fully intact; a process killed at any point leaves only sweepable staged files.
     await writingUnder(filePath, () => storeCompressedStaged(id, filePath, stream, rename, signal))
     // As in `doStoreStream`, and keyed on the same raw path even when the commit went to the gzip: the id
-    // exists, so a read below its path is "nothing stored here". See `forgetDamagedDirectory`.
-    forgetDamagedDirectory(filePath)
+    // exists, so a read below its path is "nothing stored here". See `forgetDamagedDirectoriesUnder`.
+    forgetDamagedDirectoriesUnder(filePath)
   }
 
   /** The fully-staged compressed store. Separated so the directory-cache healing wraps it whole. */

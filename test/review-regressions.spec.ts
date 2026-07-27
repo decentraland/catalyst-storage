@@ -779,12 +779,19 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     let repaired: IContentStorageComponent
     let flatRoot: string
 
-    const damageThenStore = async (compressed: boolean): Promise<void> => {
-      // Observes `<root>/a2` as a directory, then destroys it, then reports the damage once — which is what
-      // moves the observation into the damaged set.
-      await repaired.storeStream('a2/b', bufferToStream(Buffer.from('nested')))
+    /**
+     * Observes a directory under `a2`, destroys `<root>/a2`, reports the damage once — which is what moves
+     * the observation into the damaged set — then stores the id `a2` so it owns the prefix.
+     *
+     * `nestedId` sets HOW DEEP the observed directory is, and that is the point of parameterising it: damage
+     * is recorded against the store's own `dirname`, so `a2/b` files it under `<root>/a2` — the same path the
+     * later store commits — while `a2/b/c` files it under `<root>/a2/b`, a DESCENDANT of that path. Clearing
+     * only the committed path fixed the first and left the second rejecting.
+     */
+    const damageThenStore = async (compressed: boolean, nestedId: string): Promise<void> => {
+      await repaired.storeStream(nestedId, bufferToStream(Buffer.from('nested')))
       rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
-      await expect(repaired.exist('a2/b')).rejects.toBeDefined()
+      await expect(repaired.exist(nestedId)).rejects.toBeDefined()
       // The id `a2` now legitimately owns that path — as a file for a raw store, or as `a2.gzip` for a
       // compressed one. Both shapes must clear the evidence: the id exists either way.
       const body = compressed ? Buffer.alloc(3000, 'A') : Buffer.from('content of a2')
@@ -808,7 +815,7 @@ describe('when a shard directory is destroyed underneath a running instance', ()
 
     describe('and the store committed the raw representation', () => {
       beforeEach(async () => {
-        await damageThenStore(false)
+        await damageThenStore(false, 'a2/b')
       })
 
       it('should report a read under the occupied prefix as absent rather than a fault', async () => {
@@ -824,9 +831,86 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       })
     })
 
+    describe('and the damage was recorded against a DESCENDANT of the committed path', () => {
+      // The store's own `dirname` is what gets recorded, so a deeper id files the damage below the path the
+      // later store commits: `a2/b/c` records `<root>/a2/b` while the store of `a2` owns `<root>/a2`. Clearing
+      // only the committed path left this rejecting — the same disagreement one level down.
+      beforeEach(async () => {
+        await damageThenStore(false, 'a2/b/c')
+      })
+
+      it('should report the deeper read as absent rather than a fault', async () => {
+        expect(await repaired.exist('a2/b/c')).toBe(false)
+      })
+
+      it('should agree with retrieve', async () => {
+        expect(await repaired.retrieve('a2/b/c')).toBeUndefined()
+      })
+
+      it('should report the intermediate path as absent too', async () => {
+        expect(await repaired.exist('a2/b')).toBe(false)
+      })
+
+      it('should still serve the id that now owns the prefix', async () => {
+        expect(await repaired.exist('a2')).toBe(true)
+      })
+
+      it('should still refuse to STORE the shadowed id, with the typed error', async () => {
+        // The asymmetry the read answer is derived from: nothing can be created under a path a file occupies,
+        // so the store is a caller error while the read has a provable answer.
+        await expect(repaired.storeStream('a2/b/c', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+    })
+
+    describe('and the damage was recorded against a descendant, with a compressed commit', () => {
+      beforeEach(async () => {
+        await damageThenStore(true, 'a2/b/c')
+      })
+
+      it('should report the deeper read as absent rather than a fault', async () => {
+        expect(await repaired.exist('a2/b/c')).toBe(false)
+      })
+    })
+
+    describe('and an UNRELATED directory is damaged when the store commits', () => {
+      // The other half of the rule: a store supersedes the damage it actually owns, and nothing else. Clearing
+      // the whole set on any successful store would be simpler and wrong — one write anywhere in the root
+      // would silence every outstanding damage report, so a destroyed directory elsewhere would go back to
+      // reading as an ordinary miss, which is the failure this evidence exists to prevent.
+      beforeEach(async () => {
+        await repaired.storeStream('x1/b', bufferToStream(Buffer.from('nested')))
+        rmSync(path.join(flatRoot, 'x1'), { recursive: true, force: true })
+        await expect(repaired.exist('x1/b')).rejects.toBeDefined()
+        // Commits somewhere else entirely; it owns nothing under `<root>/x1`.
+        await repaired.storeStream('y1', bufferToStream(Buffer.from('unrelated')))
+      })
+
+      it('should keep rejecting reads under the still-damaged directory', async () => {
+        await expect(repaired.exist('x1/b')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and a damaged sibling merely SHARES a string prefix with the committed path', () => {
+      // `<root>/a2extra` starts with `<root>/a2` as a string but is not beneath it as a path, so a store of
+      // `a2` must not supersede its damage. Matching on the bare prefix instead of a separator boundary is
+      // the same class of mistake the containment check in `resolveFilePath` guards against.
+      beforeEach(async () => {
+        await repaired.storeStream('a2extra/b', bufferToStream(Buffer.from('nested')))
+        rmSync(path.join(flatRoot, 'a2extra'), { recursive: true, force: true })
+        await expect(repaired.exist('a2extra/b')).rejects.toBeDefined()
+        await repaired.storeStream('a2', bufferToStream(Buffer.from('content of a2')))
+      })
+
+      it('should keep rejecting reads under the damaged sibling', async () => {
+        await expect(repaired.exist('a2extra/b')).rejects.toBeDefined()
+      })
+    })
+
     describe('and the store committed the compressed representation', () => {
       beforeEach(async () => {
-        await damageThenStore(true)
+        await damageThenStore(true, 'a2/b')
       })
 
       it('should report a read under the occupied prefix as absent rather than a fault', async () => {
