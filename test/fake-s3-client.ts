@@ -8,8 +8,8 @@ export type FakeS3Client = S3Client & {
    * The stored objects, keyed by S3 key — assertable from tests.
    *
    * `etag` is optional: when absent, one is derived from the key, which is what a plain re-store produces.
-   * Set it explicitly to model an object whose ETag changed (a new version, or an SSE-KMS bucket where the
-   * ETag is not a digest of the body), which is what `IfMatch` is checked against.
+   * Set it explicitly to model an object whose ETag changed — a new version, or an SSE-KMS bucket where the
+   * ETag is not a digest of the body, so identical bytes still rotate it.
    */
   objects: Map<string, { body: Buffer; contentType?: string; etag?: string; contentEncoding?: string }>
   /** Overrides the handler for one command (by class name), e.g. to make HeadObject fail. */
@@ -76,8 +76,11 @@ export function createFakeS3Client(): FakeS3Client {
     GetObjectCommand: ({ Key, Range, IfMatch }) => {
       const found = objects.get(Key)
       if (!found) throw notFound()
-      // ENFORCED, like the real service. Ignoring it made any test of the read's `IfMatch` pin vacuous: it
-      // passed whether the header was sent, omitted, or sent with a wrong value.
+      // ENFORCED, like the real service, even though this storage deliberately sends no precondition (see
+      // `retrieve` — an `IfMatch` pin was withdrawn because it fires on ETag changes rather than content
+      // changes). Kept because the fake IGNORING it is what made the tests of that pin vacuous while it
+      // existed: they passed whether the header was sent, omitted, or sent with a wrong value. If a
+      // precondition is ever reintroduced, its tests will be real from the start.
       if (IfMatch !== undefined && IfMatch !== etagOf(Key, found)) throw preconditionFailed()
       let body = found.body
       if (Range) {

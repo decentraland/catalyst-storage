@@ -760,29 +760,31 @@ export async function createS3BasedFileSystemContentStorage(
         ? `bytes=${requestedRange.start}-${clampedEnd ?? requestedRange.end}`
         : undefined
 
+      // METADATA AND BYTES CAN COME FROM DIFFERENT VERSIONS, and that window is documented rather than
+      // closed — the same position the folder-based backend takes for its own equivalent.
+      //
+      // `size`, `encoding` and `contentSize` above come from the HeadObject; this GetObject runs whenever the
+      // consumer opens the stream. An id overwritten with DIFFERENT content in between therefore serves the
+      // new bytes under the previous version's advertised length: a 100-byte object re-stored at 95 bytes
+      // answers a `{start:90,end:99}` range with 5 bytes under `size: 10`, and a shrink past `start` surfaces
+      // as a raw SDK `InvalidRange`.
+      //
+      // An `IfMatch: obj.ETag` precondition was added here and then REMOVED. It closed the window, but it
+      // fires on any ETag CHANGE rather than any content change, and the two are not the same: on a bucket
+      // where the ETag is not a digest of the body (SSE-KMS, SSE-C) or when two writers pick different
+      // multipart part boundaries — which the `partSize` option makes reachable across a rolling deploy —
+      // re-storing identical bytes rotates it. So it turned a rare wrong answer for usage this storage says
+      // does not happen into a routine 412 for usage that is entirely correct. Content is addressed by its
+      // own hash: an id is not overwritten with different content, and a caller that both allows it and
+      // forwards `size` as an HTTP Content-Length must re-check after streaming rather than trust the
+      // advertised value.
       return new SimpleContentItem(
         async () => {
           const output = await s3.send(
             new GetObjectCommand({
               Bucket,
               Key: id,
-              Range: rangeHeader,
-              // Pins the bytes to the VERSION the metadata above was read from. `size`, `encoding` and
-              // `contentSize` come from that HeadObject, while this GetObject runs whenever the consumer
-              // opens the stream — so a re-store in between served one version's bytes under another
-              // version's advertised length, with no error: a 100-byte object re-stored at 95 bytes
-              // answered a `{start:90,end:99}` range with 5 bytes under `size: 10`, which a caller
-              // forwarding `size` as Content-Length turns into a truncated response with a mismatched
-              // header. A shrink past `start` instead surfaced as a raw SDK `InvalidRange`.
-              //
-              // With the precondition the same race fails loudly as a 412 instead, which the read
-              // contract's "treat a failing stream as a retryable miss" already covers — and a retry
-              // re-heads the object and gets a consistent pair. The folder-based backend documents this
-              // same window as unavoidable for itself; S3 can actually close it, so it does.
-              //
-              // Omitted when the head returned no ETag (an S3-compatible endpoint that does not send one),
-              // which degrades to the previous behaviour rather than making every read fail.
-              IfMatch: obj.ETag
+              Range: rangeHeader
             })
           )
           // `Body` is optional in the v3 types and the runtime shape depends on the platform: in

@@ -1056,8 +1056,15 @@ describe('when an S3 listing contains an entry with no key', () => {
 })
 
 describe('when an S3 object is replaced between the metadata read and the stream being opened', () => {
-  // Metadata comes from HeadObject while the bytes come from a GetObject issued when the consumer opens the
-  // stream, so a re-store in between served one version's bytes under another version's advertised length.
+  // CHARACTERIZATION of a documented window, not of a fix. `size`/`encoding`/`contentSize` come from the
+  // HeadObject `retrieve()` issues; the bytes come from a GetObject issued when the consumer opens the lazy
+  // stream. An `IfMatch` precondition closed that window and was removed: it fires on any ETag CHANGE rather
+  // than any content change, so on a bucket where the ETag is not a digest of the body (SSE-KMS, SSE-C), or
+  // when two writers pick different multipart part boundaries, re-storing IDENTICAL bytes made in-flight
+  // reads fail. Content is addressed by its own hash, so an id is not overwritten with different content.
+  //
+  // What is pinned here is that a read is NOT rejected for a version change, and that the unchanged case —
+  // the only one this storage's model produces — is served exactly.
   let storage: IContentStorageComponent
   let s3: ReturnType<typeof createFakeS3Client>
 
@@ -1074,39 +1081,37 @@ describe('when an S3 object is replaced between the metadata read and the stream
     s3.destroy()
   })
 
-  it('should fail the read loudly rather than serving mismatched bytes and length', async () => {
-    const item = await storage.retrieve('an-id', { start: 90, end: 99 })
-    // A genuine replacement: shorter body AND a new ETag, which is what the precondition is pinned to. The
-    // fake enforces `IfMatch` itself, so nothing here has to stand in for the service.
-    s3.objects.set('an-id', { body: Buffer.alloc(95, 0x42), etag: '"an-id-v2"' })
-
-    await expect(item!.asStream()).rejects.toMatchObject({ name: 'PreconditionFailed' })
-  })
-
-  it('should not advertise a length it cannot serve', async () => {
-    // The point of the precondition: before it, this returned 5 bytes under an advertised size of 10.
-    const item = await storage.retrieve('an-id', { start: 90, end: 99 })
-    s3.objects.set('an-id', { body: Buffer.alloc(95, 0x42), etag: '"an-id-v2"' })
-    const served = await item!.asStream().then(
-      (stream) => streamToBuffer(stream),
-      () => undefined
-    )
-
-    expect(served === undefined || served.length === item!.size).toBe(true)
-  })
-
-  it('should pass the precondition through for an unchanged object', async () => {
+  it('should serve the range exactly when the object has not changed', async () => {
     const item = await storage.retrieve('an-id', { start: 90, end: 99 })
 
     expect((await streamToBuffer(await item!.asStream())).length).toBe(10)
   })
 
-  it('should still serve a whole-object read after a byte-identical re-store', async () => {
-    // A re-store that does not change the ETag must NOT start failing reads — the content-addressed case.
+  it('should not reject a read because the ETag rotated under a byte-identical re-store', async () => {
+    // The SSE-KMS / differing-part-boundary case: same bytes, new ETag. Sending a precondition made this a
+    // 412 for content that never differed, which is why it was removed.
+    const item = await storage.retrieve('an-id')
+    s3.objects.set('an-id', { body: Buffer.alloc(100, 0x41), etag: '"an-id-rotated"' })
+
+    expect((await streamToBuffer(await item!.asStream())).length).toBe(100)
+  })
+
+  it('should still serve a whole-object read after an ordinary re-store', async () => {
     const item = await storage.retrieve('an-id')
     await storage.storeStream('an-id', bufferToStream(Buffer.alloc(100, 0x41)))
 
     expect((await streamToBuffer(await item!.asStream())).length).toBe(100)
+  })
+
+  it('should serve the new bytes under the previous advertised length when content does change', async () => {
+    // The documented window, asserted so it is a decision on record rather than a surprise: a caller that
+    // both overwrites an id with different content AND forwards `size` as a Content-Length must re-check
+    // after streaming. Closing this needs a precondition whose cost falls on correct usage instead.
+    const item = await storage.retrieve('an-id', { start: 90, end: 99 })
+    s3.objects.set('an-id', { body: Buffer.alloc(95, 0x42), etag: '"an-id-v2"' })
+    const served = await streamToBuffer(await item!.asStream())
+
+    expect({ advertised: item!.size, served: served.length }).toEqual({ advertised: 10, served: 5 })
   })
 })
 
