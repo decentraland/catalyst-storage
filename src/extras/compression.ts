@@ -111,19 +111,12 @@ async function gzipCompressFile(
   try {
     try {
       source = fs.createReadStream(input)
-      // ABSORBED FROM THE MOMENT IT EXISTS, not only once the teardown below runs. A read stream reports a
-      // failed `open(2)` asynchronously, and the very next line AWAITS — so for the whole of that await the
-      // source has no 'error' listener, and an emit landing inside it is an unhandled 'error' event, which
-      // terminates the process by default. The comment here used to claim the teardown's handler covered
-      // this; it does not, because the teardown does not run until the await has already settled.
-      //
-      // Reachable with no adapter and no corruption: `compressContentFile` over a MISSING input fails both
-      // the open and the probe, and which one lands first is a race decided by load. It surfaced as an
-      // intermittent uncaught ENOENT — twice in this repo's own suite, attributed by Jest to whichever test
-      // was running, and 40/40 green when that test ran alone. In production the same window is a crash.
-      //
-      // An extra listener does not displace `pipeline`'s own, so the error still reaches the pipeline and
-      // still rejects it; this only guarantees someone is listening the whole time.
+      // ABSORBED FROM THE MOMENT IT EXISTS, not only once the teardown below runs: a read stream reports a
+      // failed `open(2)` asynchronously and the very next line AWAITS, so an emit landing in that window is an
+      // unhandled 'error' event, which terminates the process by default. The teardown cannot cover it — it
+      // does not run until the await has settled. Reachable with no adapter and no corruption, since a MISSING
+      // input fails both the open and the probe and load decides which lands first; it surfaced twice here as
+      // an intermittent uncaught ENOENT. An extra listener does not displace `pipeline`'s own.
       source.on('error', ignoreStreamError)
       // Probed AFTER the source is constructed but BEFORE the destination, and both halves of that are
       // load-bearing:

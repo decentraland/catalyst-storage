@@ -17,34 +17,20 @@ import { destroyAllQuietly, destroyQuietly } from './stream-teardown'
 const pipe = promisify(pipeline)
 
 /**
- * How many entries of one directory `allFileIds()` will hold in memory — both the buffered listing that
- * lets it decide the directory from a SINGLE read, and, independently, the set of compressed names.
+ * How many entries of one directory `allFileIds()` holds in memory — the buffered listing that lets it
+ * decide the directory from a SINGLE read, and, separately, the set of compressed names. Above this it reads
+ * the directory twice instead: once for the compressed names, once to yield.
  *
- * Above this it falls back to reading the directory twice — once for the compressed names, once to yield.
+ * The two deployment shapes sit on opposite sides of the line, which is the point. With hash prefixes a
+ * shard holds total/65,536 entries, so a 268-million-id root still takes the one-read path — halving the
+ * `getdents` traffic of a full walk, the dominant cost of a GC sweep. Flat mode puts every id in one
+ * directory, so a large root overflows and keeps streaming; buffering that listing cost 47MB before the
+ * first id at 200k ids and ~290MB at a million.
  *
- * The two shapes this storage runs in sit on opposite sides of the line, which is the point:
- * - With hash prefixes (the default) a shard holds total/65,536 entries, so a root of 268 million ids
- *   still fits and every directory takes the one-read path. That halves the `getdents` traffic of a
- *   full walk — measured 34,510 `opendir` calls for 20,000 ids before, and it is the dominant cost of a
- *   GC or sync sweep over a sharded tree.
- * - In flat (`disablePrefixHash`) mode a single directory holds every id, so a large deployment
- *   overflows immediately and keeps the streaming behaviour it needs: buffering that listing retained
- *   ~300 bytes per entry, measured at 47MB before the first id came out for 200k ids and ~290MB for a
- *   million.
- *
- * 4,096 entries is ~160KB of names, which is nothing against the syscalls it saves.
- *
- * THE CAP BINDS THE COMPRESSED-NAME SET TOO, and that is not decoration. Dropping the buffered listing
- * bounded the OBJECTS but not the names: the gzip set was unbounded, so the fallback retained one string
- * per compressed entry and the claim that it "bounds its memory by `opendir`'s own buffer" was false in
- * exactly the deployment the fallback exists for. Measured in flat mode over a root of compressed
- * entries, retention at the first id (post-GC, so retained rather than merely allocated): 5.3MB at 50k,
- * 15.9MB at 150k and 31.2MB at 300k — linear at ~104 bytes per entry, so ~104MB for a million. With the
- * cap it is 1.0MB at all three.
- *
- * Capping costs NO syscalls: past the cap the snapshot is used one-sidedly, so a raw entry it does not hold
- * is yielded rather than probed. What that can cost is a DUPLICATE id, never an omission — see the yield
- * loop in `allFileIdsRec`, which explains why that is the direction this walk fails in.
+ * BOTH caps matter. Bounding only the listing left the name set unbounded, which retained ~104 bytes per
+ * compressed entry (31.2MB at 300k, ~104MB at a million) — the very memory the fallback exists to avoid.
+ * Capped, it is 1.0MB at any size, and costs no syscalls: past the cap the snapshot only ever suppresses,
+ * never proves absence, so an unrecorded raw entry is yielded rather than probed. See `allFileIdsRec`.
  *
  * @internal
  */
@@ -243,141 +229,65 @@ export async function createFolderBasedFileSystemContentStorage(
   )
   const { withPathLock } = cache
 
-  // Directories this instance has already created or observed. `getFilePath` runs on EVERY
-  // operation — including every read — and its directory check was one syscall per call (~30% of an
-  // `exist`, ~35% of a `retrieve`, which calls it twice). Caching is sound under the documented
-  // exclusive-root ownership: nothing else removes our directories. If one disappears anyway, the
-  // operation that needs it fails loudly and `forgetDirectory` lets the retry recreate it.
-  // Bounded by construction with hash prefixes (16^4 = 65,536 shards) and capped for flat mode,
-  // where slash-containing ids can nest arbitrarily.
-  const MAX_KNOWN_DIRECTORIES = 100_000
-  const knownDirectories = new Set<string>()
+  const MAX_TRACKED_DIRECTORIES = 100_000
 
   /**
-   * Directories this instance observed to exist and has since found BROKEN — removed, or replaced by
-   * something that is not a directory.
+   * The mkdir-skip cache: directories believed to exist RIGHT NOW.
    *
-   * A second set, because `knownDirectories` was one set doing two jobs that pull in opposite directions
-   * once a directory breaks. It is the mkdir-skip cache, so a write needs the entry GONE to recreate the
-   * tree on its next attempt; it is also the read path's only evidence of damage, so a read needs the
-   * observation to SURVIVE or it reports the same broken state as an ordinary absence. Serving both from
-   * one bit meant picking which contract to break: dropping the entry made the first read reject and every
-   * later one answer `false` over an unchanged disk, and keeping it made a write fail its commit rename
-   * with ENOENT instead of recreating the directory it skipped the `mkdir` for.
-   *
-   * So the evidence MOVES here instead of being destroyed. Reads treat membership exactly like
-   * `knownDirectories` when deciding damage, writes ignore it and therefore recreate the tree, and the
-   * first successful stat or `mkdir` clears it — see `rememberDirectory`, which is reached by both the read
-   * and write paths, so a repair heals the instance whichever one observes it first.
-   *
-   * Normally EMPTY: an entry appears only when a directory this instance observed actually broke.
+   * Purely an optimization — `ensureDirectoryFor` runs on every write, and its probe was one syscall per
+   * call. Nothing about correctness depends on it, which is why a write that fails ENOENT/ENOTDIR under an
+   * entry may simply drop it (`writingUnder`) and let the retry recreate the tree.
    */
-  const damagedDirectories = new Set<string>()
+  const presentDirectories = new Set<string>()
 
   /**
-   * Whether this instance has ever observed `dirname` to be a directory, INCLUDING one it has since found
-   * broken. That is the question a damage report turns on, and it is not the same as "is this in the
-   * mkdir-skip cache" — see `damagedDirectories`.
+   * The observation log: directories this instance has SEEN exist, at any point. Append-only, so it cannot
+   * go stale in the dangerous direction.
+   *
+   * It answers one question for the absence classifier — if a path is missing now, was it ever ours? — which
+   * distinguishes a destroyed tree from a shard nothing was stored in and is unknowable from the disk alone.
+   * Deliberately not the cache above: one set serving both meant a write-path invalidation erased evidence a
+   * read needed, and keeping that evidence blocked writes from recreating their directory.
    */
-  function wasObservedAsDirectory(dirname: string): boolean {
-    // THE ROOT IS PERMANENTLY OBSERVED, answered here rather than from a set. Construction `mkdir`s it, so
-    // this instance has provably seen it be a directory, and that fact cannot expire.
-    //
-    // Seeding it into `knownDirectories` is NOT enough, which is the whole reason this branch exists: that
-    // set is FIFO-bounded, and the root is inserted first, so it is the FIRST entry evicted once a flat-mode
-    // deployment observes more than MAX_KNOWN_DIRECTORIES directories — which nested ids reach in ordinary
-    // operation. `forgetDirectory(root)` reaches the same state far sooner and without any cap: a write that
-    // fails ENOTDIR under a root replaced by a file drops the entry, after which a destroyed root read as an
-    // ordinary miss again (measured: `exist()` answered `false`). Both routes lose an observation that is
-    // true by construction, so it is not stored as evidence that can be lost.
-    if (dirname === root) return true
-    return knownDirectories.has(dirname) || damagedDirectories.has(dirname)
-  }
+  const observedDirectories = new Set<string>()
 
   function forgetDirectory(dirname: string): void {
-    knownDirectories.delete(dirname)
+    presentDirectories.delete(dirname)
   }
 
-  /**
-   * Discards the damage evidence for a path a successful store now OWNS as content, AND for everything
-   * beneath it.
-   *
-   * A directory that broke and an id that legitimately occupies the same path are different states, and the
-   * evidence for the first has to stop applying once the second is true. Without this, a store of `a2` after
-   * `<root>/a2` had been observed as a directory and then destroyed left the damage entry in place, so reads
-   * of `a2/b` kept REJECTING — while the store side refuses that id as an ordinary prefix collision and
-   * `delete` resolves for it. The whole point of this contract is that those three agree, and `a2/b` under a
-   * legitimately occupied prefix is the provably-absent case this PR exists to report as absent.
-   *
-   * AT OR BELOW, not just the path itself. Damage is recorded against the directory this instance OBSERVED,
-   * which is the store's own `dirname` and can be far deeper than the ancestor that actually broke: a store
-   * of `a2/b/c` records `<root>/a2/b`, so removing `<root>/a2` files the damage under `<root>/a2/b` and
-   * clearing only the committed path left it behind. A later store of `a2` then owned the prefix while reads
-   * of `a2/b/c` still rejected — the same disagreement one level down. Recording against the real broken
-   * ancestor instead would mean walking and statting the chain to find it; superseding the whole subtree is
-   * the same answer without the syscalls, and it is exactly what a store of that prefix proves.
-   *
-   * Keyed on the id's canonical RAW path for both commit shapes, because that is the path a directory
-   * occupied: a gzip-only commit leaves nothing at it, but the id exists either way, so a read below it is
-   * "nothing stored here" rather than a fault.
-   */
-  function forgetDamagedDirectoriesUnder(target: string): void {
-    // Normally EMPTY — damage is rare — so an ordinary store pays one size check and no iteration at all.
-    // When there is damage the scan is bounded by how many directories actually broke, not by the tree.
-    if (damagedDirectories.size === 0) return
-    const prefix = target + path.sep
-    for (const damaged of damagedDirectories) {
-      if (damaged === target || damaged.startsWith(prefix)) damagedDirectories.delete(damaged)
-    }
-  }
-
-  /** Moves a broken directory's observation out of the mkdir-skip cache; see `damagedDirectories`. */
-  function rememberDamagedDirectory(dirname: string): void {
-    knownDirectories.delete(dirname)
-    if (damagedDirectories.has(dirname)) return
-    // Bounded like `knownDirectories`, and by the same FIFO rule, so a root that keeps breaking new
-    // directories cannot grow this without limit. Evicting only costs that directory its damage report.
-    while (damagedDirectories.size >= MAX_KNOWN_DIRECTORIES) {
-      const oldest = damagedDirectories.values().next()
-      if (oldest.done) break
-      damagedDirectories.delete(oldest.value)
-    }
-    damagedDirectories.add(dirname)
-  }
-
-  /**
-   * Records a directory this instance has observed to exist, so its later disappearance is
-   * recognizable as damage rather than as an id that was never stored.
-   *
-   * Written by both the write path (which creates the directory) and the read path (which only
-   * observes it) — "created or observed", as the cache is documented.
-   */
+  /** Records a directory as present AND as observed. Both paths that see one exist call this. */
   function rememberDirectory(dirname: string): void {
-    // A path that is provably a directory again is no longer damaged, whoever proved it — a successful stat
-    // on the read path or a `mkdir` on the write path. This is what makes the damage report clear itself
-    // after a repair instead of outliving it.
-    damagedDirectories.delete(dirname)
-    if (knownDirectories.has(dirname)) return
-    // Evict the OLDEST entry rather than clearing wholesale. The cost of a clear is not just the syscall
-    // the previous comment described: membership here is the SOLE evidence `statForRead` uses to tell a
-    // destroyed shard from one nothing was ever stored in, so a clear silently downgrades every cleared
-    // shard's damage report to an ordinary "absent" — the "broken storage looks like an empty node"
-    // answer this read contract exists to prevent. Sets iterate in insertion order, so the first key is
-    // the oldest, and one eviction per insertion past the cap keeps the guarantee for everything else.
-    // Unreachable in hash-prefix mode (16^4 shards < the cap) and bounded work in flat mode.
-    //
-    // FIFO, deliberately — insertion order, NOT recency. A frequently-read early-inserted shard can be
-    // evicted before a rarely-read later one, which for a true LRU would be wrong; here it only costs that
-    // shard one syscall to re-learn, and its damage report until it does. Recency would mean a `delete` plus
-    // an `add` on every HIT, and the early return above is what keeps this off the read path entirely: this
-    // set is touched by every successful stat and every classified miss. Not worth two mutations per read for
-    // a heuristic whose cap is unreachable in the default mode.
-    while (knownDirectories.size >= MAX_KNOWN_DIRECTORIES) {
-      const oldest = knownDirectories.values().next()
+    presentDirectories.add(dirname)
+    if (observedDirectories.has(dirname) || dirname === root) return
+    // FIFO past the cap: insertion order, so the first key is the oldest. Losing an entry only costs that
+    // directory its damage report. Unreachable with hash prefixes (65,536 shards < the cap); reachable in
+    // flat mode, where ids nest arbitrarily. The ROOT is never stored — see `wasObserved`.
+    while (observedDirectories.size >= MAX_TRACKED_DIRECTORIES) {
+      const oldest = observedDirectories.values().next()
       if (oldest.done) break
-      knownDirectories.delete(oldest.value)
+      observedDirectories.delete(oldest.value)
     }
-    knownDirectories.add(dirname)
+    observedDirectories.add(dirname)
+  }
+
+  /**
+   * Whether this instance ever saw `dirname` be a directory. The root is answered by construction —
+   * `mkdir(root)` at startup proves it — since storing it would make the one observation nothing else
+   * records the first the FIFO cap evicts.
+   */
+  function wasObserved(dirname: string): boolean {
+    return dirname === root || observedDirectories.has(dirname)
+  }
+
+  /**
+   * Depth of `target` below the root, in path segments, which is how a path that may hold CONTENT is told
+   * from one that may not: ids resolve under the shard with hash prefixes and under the root in flat mode, so
+   * a file at depth 1 is content in flat mode and foreign where a shard belongs in hash mode.
+   */
+  const MIN_CONTENT_DEPTH = USE_HASH_PREFIX ? 2 : 1
+  function depthBelowRoot(target: string): number {
+    if (target === root) return 0
+    return target.slice(root.length + 1).split(path.sep).length
   }
 
   /**
@@ -408,10 +318,7 @@ export async function createFolderBasedFileSystemContentStorage(
   }
 
   await components.fs.mkdir(root, { recursive: true })
-  // Seeded so a flat-mode store of a top-level id skips one `stat` on its first write. It is ONLY a cache
-  // warm: the damage evidence for the root does not live here, because this set is FIFO-bounded and the
-  // entry is therefore losable — `wasObservedAsDirectory` answers for the root directly, and that is what
-  // makes a destroyed root reject rather than read as an empty node.
+  // A cache warm only: `wasObserved` answers for the root by construction, so the observation cannot be lost.
   rememberDirectory(root)
 
   // Prepares (and refuses to start over an unsafe) staging area, so it must run after the root
@@ -437,67 +344,59 @@ export async function createFolderBasedFileSystemContentStorage(
   let tempFileSweep: Promise<void> = Promise.resolve()
 
   /**
-   * The DEEPEST directory on this path that this instance has created or observed, or `undefined`.
+   * Why a read found nothing at `filePath`: the path whose loss makes this a FAULT, or `undefined` when the
+   * id is provably absent.
    *
-   * Walks upward and stops at the storage root, which is itself a legitimate answer (in flat mode a store
-   * records the root as the directory it wrote into). Pure string work over a bounded path — with hash
-   * prefixes the chain is root/shard, so this is one or two lookups.
+   * DERIVED FROM THE DISK on each call, walking up from the id's parent until it finds a real directory. Two
+   * things end the walk, and they are the whole classification:
+   *
+   * - a CONTENT path holding a regular file: nothing can exist beneath a file, so the id is unstorable
+   *   (`ensureDirectoryFor` refuses it) and absence is accurate whatever this instance saw there before.
+   *   Depth is what makes it a content path — a file where a SHARD belongs is foreign, not an id.
+   * - a directory: everything below it is genuinely missing, so the id is absent unless one of those missing
+   *   paths is one this instance observed, which means a tree it owns was destroyed and the read must reject.
+   *
+   * Recomputing beats remembering. A recorded damage set was wrong four different reachable ways — consumed
+   * by its own report, keyed on one path while the break was at another, outliving a store that claimed the
+   * path, and stale for that path's descendants — and all four are questions about the CURRENT tree, which
+   * can simply be asked. Costs one `stat` per ancestor, only on a miss and only up to the first intact
+   * directory: in hash mode that is the shard, so a hit-shaped miss pays a single probe.
    */
-  function deepestObservedDirectory(dirname: string): string | undefined {
-    let candidate = dirname
+  async function faultBehindAbsence(filePath: string): Promise<string | undefined> {
+    const missing: string[] = []
+    let candidate = path.dirname(filePath)
     for (;;) {
-      if (wasObservedAsDirectory(candidate)) return candidate
-      if (candidate === root) return undefined
+      let occupant: Awaited<ReturnType<typeof statOccupant>>
+      try {
+        occupant = await statOccupant(candidate)
+      } catch {
+        // Unreadable, so nothing here can be proven either way. Fail closed: the alternative is reporting
+        // content absent on no evidence.
+        return candidate
+      }
+      if (occupant === 'directory') break
+      // Anything proven not to be a directory leaves the mkdir-skip cache, so the next write recreates the
+      // chain on its first attempt. Done here because the walk knows the whole broken chain; the caller only
+      // knows the id's own parent.
+      forgetDirectory(candidate)
+      // This storage SERVES a content path holding a file as an id, so ids under it are unstorable — which
+      // `ensureDirectoryFor` enforces and `delete` agrees with. Reading the current tree rather than the
+      // observation history is what keeps two nodes with identical disks answering alike.
+      if (occupant === 'file' && depthBelowRoot(candidate) >= MIN_CONTENT_DEPTH) {
+        // Absence is the answer, but the transition destroyed whatever was under it, so say so once.
+        if (wasObserved(candidate)) {
+          logger.warn(`${JSON.stringify(candidate)} was observed as a directory and now holds content`)
+        }
+        return undefined
+      }
+      missing.push(candidate)
+      if (candidate === root) break
       const parent = path.dirname(candidate)
-      // Defensive: `resolveFilePath` guarantees containment, so the root is always reached first.
-      if (parent === candidate || parent.length < root.length) return undefined
+      // Defensive: `resolveFilePath` guarantees containment, so the root always terminates the walk first.
+      if (parent === candidate || parent.length < root.length) break
       candidate = parent
     }
-  }
-
-  /**
-   * The directory this instance observed that is no longer a usable directory — removed, or replaced by
-   * something that is not one — or `undefined` when every directory it observed on this path is still
-   * intact, so nothing it owns was destroyed.
-   *
-   * Shared by BOTH absence-classification branches, because they ask one question in two spellings. A
-   * `dirname` that cannot be statted is either gone (ENOENT) or unreachable through a non-directory
-   * (ENOTDIR), and in both cases the answer turns on the same thing: was a directory this instance
-   * observed the thing that broke? If not, the id is PROVABLY ABSENT — nothing was ever stored under a
-   * shard that does not exist, and a filesystem cannot hold a file and a directory at one path. If so, the
-   * tree this instance owns was destroyed underneath it and the read must reject.
-   *
-   * `knownDirectories.has(dirname)` alone was not enough for either, and the gap was reachable in both:
-   * with `a2/b` stored (recording `<root>/a2`) and `<root>/a2` then removed OR replaced by a file,
-   * `exist('a2/b')` rejected while `exist('a2/b/c')` answered `false`, because the deeper id's `dirname` is
-   * `<root>/a2/b`, which was never recorded. One fault, two answers — the divergence this whole read
-   * contract exists to remove.
-   */
-  async function lostObservedDirectory(
-    dirname: string,
-    /** Whether `stat(dirname)` SUCCEEDED and returned a non-directory, i.e. the parent is the obstruction. */
-    immediateParentIsObstruction: boolean
-  ): Promise<string | undefined> {
-    // That stat succeeding PROVES every path above `dirname` is still a directory — a stat cannot traverse
-    // a file — so `dirname` itself is the only candidate and nothing more needs probing.
-    if (immediateParentIsObstruction) return wasObservedAsDirectory(dirname) ? dirname : undefined
-    // The parent probe FAILED, so the fault is at `dirname` or above it, and which one decides the answer.
-    // Only the DEEPEST observed directory has to be checked, because if it is still a directory then so is
-    // every ancestor of it (a stat cannot traverse a file, and cannot reach a path under a missing one),
-    // which puts the fault BELOW it at a path this instance never observed — the provably-absent case. At
-    // most one extra stat, on a path where two have already failed.
-    const observed = deepestObservedDirectory(dirname)
-    if (observed === undefined) return undefined
-    // `dirname` itself was observed as a directory and its stat just failed, so it is not a usable one now
-    // — no probe can add anything.
-    if (observed === dirname) return dirname
-    try {
-      return (await statOccupant(observed)) === 'directory' ? undefined : observed
-    } catch {
-      // Cannot tell. Fail closed: the alternative is reporting content absent on no evidence, which is the
-      // answer this contract refuses.
-      return observed
-    }
+    return missing.find(wasObserved)
   }
 
   /**
@@ -573,130 +472,29 @@ export async function createFolderBasedFileSystemContentStorage(
       // for an id that is provably absent, `existMultiple` lost the answers for every OTHER id in the batch,
       // and `delete` of the same id resolved — the exact disagreement the allowance above was added to end.
       if (err?.code === 'ENAMETOOLONG') return undefined
-      // A missing-file error here has two very different meanings, and only one of them is a miss.
-      // The parent directory decides which — and it must be proven to be a DIRECTORY, not merely
-      // present: an access check passes for a regular file left at the shard path, while every stat
-      // beneath it fails with ENOTDIR, so "present" alone would classify a corrupted tree as a miss.
+      // A missing file means one of two very different things, and the tree above it decides which: an
+      // ordinary miss, or a tree this instance owns having been destroyed underneath it. Reporting the
+      // second as absence is the "a broken store looks like an empty node" answer this contract refuses.
       //
-      // Costs one syscall, and only after a stat has already failed — hits, the hot path the
-      // directory cache exists for, are untouched.
+      // The common case is settled in ONE syscall: an intact parent means the id is simply not there, and
+      // observing it is what lets a LATER disappearance of the same directory be recognized as damage.
       const dirname = path.dirname(filePath)
       let parent: { isDirectory(): boolean } | undefined
-      let parentProbeFailure: unknown
       try {
         parent = await components.fs.stat(dirname)
-      } catch (probeErr: any) {
-        parentProbeFailure = probeErr
+      } catch {
+        // Absent, obstructed or unreadable — `faultBehindAbsence` classifies all of those.
       }
-
-      // An intact directory that simply does not contain this file: the ordinary miss. Remembered
-      // for the same reason as a successful stat above — it is proof this shard exists right now.
       if (parent?.isDirectory()) {
         rememberDirectory(dirname)
         return undefined
       }
 
-      const probeCode = (parentProbeFailure as { code?: string } | null)?.code
-
-      // AN ANCESTOR IS NOT A DIRECTORY, in either of the two shapes that says so: `parent` present and
-      // not a directory (the immediate parent is a file, a fifo, a device node), or the parent probe
-      // itself failing ENOTDIR (something further up is). BOTH go here, because two ids under one
-      // obstruction must not get different answers — the previous split answered the immediate-parent
-      // case one way and depth >= 2 the other.
-      //
-      // PROVABLY ABSENT, on the same grounds as the ENAMETOOLONG allowance above: a filesystem cannot
-      // hold a file and a directory at one path, so NO FILE CAN EXIST at `filePath` while this holds.
-      // Nor can the answer hide committed content — for `filePath` to have existed, `dirname` had to be
-      // a directory, so a file sitting there means that directory, and everything under it, is already
-      // gone.
-      //
-      // AN EARLIER ATTEMPT AT THIS WAS REVERTED, and the difference matters. That one justified itself
-      // with "the obstruction is inside the id namespace, so it must be another id's content", which is
-      // FALSE in the default hash-prefix mode: the shard is `sha1(the FULL id)`, so `a/b`'s parent path
-      // is `<root>/<sha1('a/b')>/a` while `a`'s content lives at `<root>/<sha1('a')>/a`. The proof above
-      // never asks what occupies the path, only what a filesystem can hold, so it holds in both modes
-      // and at every depth. The revert's other two objections are answered rather than reasoned away:
-      // this covers both shapes (above), and it keeps the `knownDirectories` damage signal (below).
-      //
-      // WHAT THIS ENDS. In flat mode an id whose parent path holds another id's content (`store('a')`
-      // then `a/b`, or `store('a.gzip/b')` after a compressed `store('a')`) is unstorable, and the three
-      // surfaces disagreed about it: `storeStream` rejected with the typed `PathNotContainedError`,
-      // `delete` RESOLVED (`existsForInvariant` already reads ENOTDIR as absent), and `exist`/`fileInfo`/
-      // `retrieve` rejected with a bare ENOTDIR — so a service answered 500 and paged an operator for a
-      // provably-absent id, and one such id in an `existMultiple` batch destroyed the answers for every
-      // other id in it. That is verbatim the damage the ENAMETOOLONG allowance above was added to end.
-      // The store keeps rejecting, which is right: a store asks to CREATE something that cannot be
-      // created, while a read asks a question whose true answer is "nothing".
-      if (parent || probeCode === 'ENOTDIR') {
-        // A FAULT when a directory this instance created or observed is the one that stopped being a
-        // directory: the tree it owns was destroyed underneath it, which is provable damage and has to be
-        // loud. Decided BEFORE the invalidation, or forgetting the entry would answer its own question —
-        // same evidence and same rule as the removed-directory case below. The gate is stronger than it
-        // looks: every successful stat and every classified miss calls `rememberDirectory`, so damage
-        // under a shard this instance is actually serving always rejects. Absence is reserved for an
-        // obstruction at a path it never observed as a directory, which is the same position the
-        // removed-directory case below already takes.
-        const damaged = await lostObservedDirectory(dirname, parent !== undefined)
-        // Nothing this instance observed was lost, so the obstruction is a name that can never hold a
-        // file. There is nothing to invalidate on this path either: `dirname` never having been observed
-        // is precisely what produced this answer.
-        if (damaged === undefined) return undefined
-        // The observation MOVES rather than being dropped — see `damagedDirectories`. Dropping it (a plain
-        // `forgetDirectory`, which is what this used to do) destroyed the evidence the report is derived
-        // from, so the first read of a damaged id rejected and every read after it answered `false` over an
-        // unchanged disk. Keeping it in the mkdir-skip cache instead made the next WRITE skip its `mkdir`
-        // and fail the commit rename. Moving it satisfies both: reads keep rejecting, and a write recreates
-        // the tree once whatever occupies the path is gone. (The obstruction itself is never removed here —
-        // destroying something this storage cannot prove it owns is what the reserved-namespace checks
-        // refuse to do.)
-        rememberDamagedDirectory(damaged)
-        forgetDirectory(dirname)
-        logger.warn(
-          `Refusing to report ${filePath} as absent: ${JSON.stringify(damaged)}, which this storage ` +
-            `observed as a directory, is no longer one`
-        )
-        throw err
-      }
-
-      // The parent could not be read at all. If the probe failed for a reason OTHER than the
-      // directory being absent (EACCES, EIO), this storage cannot answer the question and must not
-      // pretend the id is missing.
-      if (probeCode !== 'ENOENT') {
-        forgetDirectory(dirname)
-        logger.warn(`Refusing to report ${filePath} as absent: its parent directory could not be read`)
-        throw err
-      }
-
-      // The parent directory does not exist. Reads no longer create it (see `resolveFilePath`), so
-      // this is the normal answer for a shard nothing was ever stored in — the id is absent. It is a
-      // FAULT only when this instance created or observed a directory on this path, which means the tree
-      // it owns was destroyed underneath it, taking every id inside with it.
-      //
-      // THE SAME deepest-observed-ancestor rule as the not-a-directory branch above, because this branch
-      // had the identical hole in the identical shape: `knownDirectories.has(dirname)` answers only for the
-      // IMMEDIATE parent, so a removed observed directory stayed loud for its immediate child and went
-      // silent for every deeper descendant — with `<root>/a2` recorded by a store of `a2/b` and then
-      // removed, `exist('a2/b')` rejected while `exist('a2/b/c')` answered `false`, because `<root>/a2/b`
-      // was never recorded. One removal, two answers. Removal and replacement-by-a-file are the same
-      // question — "did a directory this instance observed stop being usable?" — so they get one rule and
-      // one helper, and `statOccupant` reporting `absent` for the removed case is what makes it fit.
-      //
-      // The ordinary miss stays cheap: the walk is pure string work, and it only reaches a `stat` when some
-      // ancestor of a NON-EXISTENT `dirname` is a recorded directory. In hash mode nothing records the root
-      // (a shard is what gets created), so a miss in an uncreated shard walks two Set lookups and stops.
-      const removed = await lostObservedDirectory(dirname, false)
-      if (removed === undefined) return undefined
-      // Moved, not dropped, for the reason the branch above gives at length: dropping it made the first read
-      // reject and every later one answer `false` over an unchanged on-disk state, while keeping it in the
-      // mkdir-skip cache stopped the next write from recreating the directory. That instability was
-      // pre-existing here rather than introduced by this change, and it is the same defect, so it gets the
-      // same answer.
-      rememberDamagedDirectory(removed)
-      forgetDirectory(dirname)
-      logger.warn(
-        `Refusing to report ${filePath} as absent: ${JSON.stringify(removed)}, which this storage observed ` +
-          `as a directory, was removed underneath us`
-      )
+      // Anything else goes to the classifier, which walks the tree rather than consulting remembered damage
+      // and drops every broken path from the mkdir-skip cache as it goes.
+      const fault = await faultBehindAbsence(filePath)
+      if (fault === undefined) return undefined
+      logger.warn(`Refusing to report ${filePath} as absent: ${JSON.stringify(fault)} is no longer a directory`)
       throw err
     }
   }
@@ -890,7 +688,7 @@ export async function createFolderBasedFileSystemContentStorage(
   async function ensureDirectoryFor(filePath: string): Promise<void> {
     const dirname = path.dirname(filePath)
 
-    if (!knownDirectories.has(dirname)) {
+    if (!presentDirectories.has(dirname)) {
       // `stat`, not `existPath`. F_OK|R_OK passes for a REGULAR FILE sitting at this path, so `mkdir` was
       // skipped and the failure surfaced several awaits later as a bare `ENOTDIR` from the commit rename.
       // That state needs no corruption to reach: nested ids are legal, so storing `a` and then `a/b` asks
@@ -1372,10 +1170,6 @@ export async function createFolderBasedFileSystemContentStorage(
         throw err
       }
     })
-    // This id now owns the path, so damage evidence naming it — or anything BENEATH it — as a lost
-    // directory no longer applies. Only after the store has fully succeeded: a failed one owns nothing.
-    // See `forgetDamagedDirectoriesUnder`.
-    forgetDamagedDirectoriesUnder(filePath)
   }
 
   // Concurrent-read contract: reads do NOT hold a write's lock for the duration of that write, and never
@@ -1574,17 +1368,11 @@ export async function createFolderBasedFileSystemContentStorage(
       // reported present; rejecting says "cannot be read right now", the 5xx the read contract reserves for
       // exactly this, and leaves the request retryable against a running instance.
       //
-      // THE PREMISE IS PROBED, NOT ASSUMED. "The id's gzip is present" is the whole justification for
-      // answering 5xx here, and it is not implied by the loop having produced nothing:
-      // `materializeRangeCacheFromGzip` returns early when the id has NO gzip at all, so an absent id
-      // reaches this line having discarded nothing. Every range read of an unknown id therefore answered
-      // 5xx for as long as the cache was closed, with a message asserting the content is intact that
-      // `exist()` simultaneously denied — a fault reported for provably absent content, which is the same
-      // error the rest of this contract exists to refuse, just in the other direction.
-      //
-      // `statForRead` without deferral: there is no later probe to inherit the classification, so a damaged
-      // shard must reject here rather than fall through to a silent `undefined`. Costs one stat, and only
-      // on the shutdown path.
+      // THE PREMISE IS PROBED, NOT ASSUMED. "The id's gzip is present" justifies the 5xx and is not implied
+      // by the loop producing nothing: `materializeRangeCacheFromGzip` returns early when there is no gzip, so
+      // an absent id reaches here having discarded nothing, and every range read of an unknown id answered 5xx
+      // while `exist()` denied it. `statForRead` without deferral, since no later probe inherits the
+      // classification — one stat, only during shutdown.
       if (!contentItem && requestedRange && !cache.isOpen()) {
         if ((await statForRead(gzipPathOf(baseFilePath))) !== undefined) {
           throw new Error(
@@ -1664,16 +1452,14 @@ export async function createFolderBasedFileSystemContentStorage(
    * against the filename let it match the `.gzip` extension of a compressed representation.
    */
   /**
-   * Whether an id's compressed representation is STILL on disk, used to confirm a skip rather than
-   * assume one. Absent only when provably so: any other fault means it may well be there, and the
-   * caller's safe response to that is to treat it as present (see `allFileIdsRec`).
+   * Whether an id's compressed representation is STILL on disk, used to confirm a skip rather than assume
+   * one. Absent only when provably so: any other fault means it may well be there, and treating it as
+   * present is the safe response (see `allFileIdsRec`).
    *
-   * `isFile()`, not merely "the stat succeeded". A DIRECTORY at `<id>.gzip` is not the compressed
-   * representation of `<id>` — it is another id's nesting, which `storeStream('a.gzip/b')` creates
-   * legitimately, since only an id ENDING in `.gzip` is reserved. Crediting it suppressed a raw file that
-   * is a valid id of its own: `a` was yielded ZERO times while the small-directory path, which records only
-   * non-directory entries in its snapshot, yielded it once. The two paths have to answer alike, and an id
-   * present throughout an enumeration must never be omitted.
+   * `isFile()`, not merely "the stat succeeded": a DIRECTORY at `<id>.gzip` is another id's nesting, which
+   * `storeStream('a.gzip/b')` creates legitimately since only an id ENDING in `.gzip` is reserved. Crediting
+   * it suppressed the valid raw id `a` entirely, while the buffered path — which records only non-directory
+   * entries — yielded it. The two paths must answer alike.
    */
   async function gzipCounterpartStillExists(gzipPath: string): Promise<boolean> {
     try {
@@ -1729,10 +1515,8 @@ export async function createFolderBasedFileSystemContentStorage(
     // directory, so the listing already contains the answer and it does not need one `access(2)` per
     // raw file to ask it.
     //
-    // CAPPED, for the reason spelled out on MAX_BUFFERED_DIRECTORY_ENTRIES: unbounded, this set was the
-    // memory the large-directory path was supposed to have stopped retaining. Beyond the cap it is a
-    // one-sided answer and is used as one — membership suppresses a raw entry (after a confirming stat),
-    // while absence never does; see the yield loop below for why that direction is the safe one.
+    // CAPPED — see MAX_BUFFERED_DIRECTORY_ENTRIES. Past the cap it is a one-sided answer and is used as one:
+    // membership suppresses a raw entry (after a confirming stat), absence never does.
     const gzipNames = new Set<string>()
     // The directory itself, retained ONLY while it is small enough to be worth retaining — see
     // MAX_BUFFERED_DIRECTORY_ENTRIES. Dropped the moment it is not.
@@ -1811,17 +1595,13 @@ export async function createFolderBasedFileSystemContentStorage(
       }
       buffered = undefined
     } else {
-      // LARGE DIRECTORY — a second, STREAMING pass, which is what a flat-mode root with hundreds of
-      // thousands of ids in one directory needs. Buffering the whole listing there retained ~300 bytes
-      // per entry: measured at 47MB before the first id came out for 200k ids, ~290MB for a million.
-      // Entries are yielded as they ARRIVE in this pass, so the ids do not accumulate.
+      // LARGE DIRECTORY — a second, STREAMING pass, for a flat-mode root with hundreds of thousands of ids in
+      // one place: buffering that listing retained ~300 bytes per entry (47MB before the first id at 200k).
+      // Ids are yielded as they arrive here, so they do not accumulate.
       //
-      // The FIRST id still waits for the first pass to drain, and that is inherent rather than an
-      // oversight: the sibling question is answered from a listing, so the listing has to complete. An
-      // earlier version of this comment claimed otherwise. Paying it is what keeps the common flat-mode
-      // shape — a root of raw-only content, where no gzip names exist at all — free of a per-entry
-      // `stat`, which is the alternative way to answer the same question and would cost one syscall per
-      // id on the largest roots this surface accepts.
+      // The FIRST id still waits for the first pass to drain, which is inherent: the sibling question is
+      // answered from a listing, so the listing has to complete. Paying it is what keeps a raw-only flat root
+      // — the common shape — free of the per-entry `stat` that answering it any other way would cost.
       for await (const entry of await components.fs.opendir(folder, { bufferSize: 4000 })) {
         if (entry.isDirectory()) {
           if (isInsideReservedTempDir(folder + path.sep + entry.name)) continue
@@ -1843,23 +1623,16 @@ export async function createFolderBasedFileSystemContentStorage(
         // confirming `stat` is treated as "still there" for the same reason — the gzip is then in this
         // listing and gets yielded by its own entry.
         //
-        // A RAW NAME THE SNAPSHOT DOES NOT HOLD IS YIELDED, never probed. Absence from a capped snapshot is
-        // not evidence of absence on disk, so the only two options for such an entry are to yield it — at
-        // worst a duplicate, when its gzip fell outside the cap and the gzip entry yields the id too — or to
-        // suppress it on no evidence, which omits an id that is present. This walk's stated rule picks the
-        // first: "enumerating an id twice costs an idempotent repeat; failing to enumerate one that is
-        // present under-reports the node's content". Duplicates here are bounded by the raw/gzip PAIRS whose
-        // gzip fell outside the snapshot — decompression-cache copies, bounded in turn by
-        // `decompressCacheMaxSize` — not by the directory size.
+        // A RAW NAME THE SNAPSHOT DOES NOT HOLD IS YIELDED, never probed: absence from a capped snapshot is
+        // not evidence of absence on disk, so the choice is a possible duplicate (its gzip entry yields the id
+        // too) or omitting an id that is present. The rule above picks the duplicate. They are bounded by the
+        // raw/gzip PAIRS outside the snapshot — cache copies, bounded by `decompressCacheMaxSize` — not by
+        // directory size.
         //
-        // Probing instead was tried and REVERTED. It cost one `stat` per raw entry for every directory whose
-        // gzip count crossed the cap, and the claim that justified it — that such a directory is
-        // "compressed-dominated, so its raw entries are just cache copies" — is false: a flat root with
-        // MAX_BUFFERED_DIRECTORY_ENTRIES + 1 compressed ids and hundreds of thousands of raw-only ids
-        // overflows the snapshot too, and measured one syscall per raw id (20,000 stats for 20,000 raw ids,
-        // against 0 for the same directory with no gzips). That is exactly the per-entry cost this two-pass
-        // walk exists to avoid. It also read a DIRECTORY at `<id>.gzip` as a compressed representation and
-        // suppressed a valid raw id outright — see `gzipCounterpartStillExists`.
+        // Probing instead was tried and REVERTED: it cost one `stat` per raw entry in any directory whose gzip
+        // count crossed the cap (measured 20,000 stats for 20,000 raw ids, against 0 without gzips), which is
+        // the per-entry cost this two-pass walk exists to avoid, and it read a DIRECTORY at `<id>.gzip` as a
+        // compressed representation — see `gzipCounterpartStillExists`.
         if (!entry.name.endsWith(GZIP_EXTENSION) && gzipNames.has(entry.name + GZIP_EXTENSION)) {
           if (await gzipCounterpartStillExists(folder + path.sep + entry.name + GZIP_EXTENSION)) continue
         }
@@ -2033,9 +1806,6 @@ export async function createFolderBasedFileSystemContentStorage(
     // or the raw-only representation of the new version. Until that commit the previous version
     // stays fully intact; a process killed at any point leaves only sweepable staged files.
     await writingUnder(filePath, () => storeCompressedStaged(id, filePath, stream, rename, signal))
-    // As in `doStoreStream`, and keyed on the same raw path even when the commit went to the gzip: the id
-    // exists, so a read below its path is "nothing stored here". See `forgetDamagedDirectoriesUnder`.
-    forgetDamagedDirectoriesUnder(filePath)
   }
 
   /** The fully-staged compressed store. Separated so the directory-cache healing wraps it whole. */

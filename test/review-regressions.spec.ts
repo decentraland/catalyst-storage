@@ -864,13 +864,30 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       })
     })
 
-    describe('and the damage was recorded against a descendant, with a compressed commit', () => {
+    describe('and a compressed commit leaves the raw path FREE', () => {
+      // A gzip-only commit writes `<root>/a2.gzip` and leaves `<root>/a2` unoccupied, so — unlike the raw
+      // commit above — it does NOT claim the prefix: `store('a2/b')` would succeed, creating the directory
+      // alongside the gzip. The nested id is therefore not a prefix collision, it is a genuinely destroyed
+      // one, and a fault is the answer this storage has always given for a directory it observed and lost.
+      //
+      // So the two commit shapes answer DIFFERENTLY here, and that is the on-disk truth rather than a
+      // caprice: the store side diverges the same way, succeeding for one and refusing for the other.
       beforeEach(async () => {
         await damageThenStore(true, 'a2/b/c')
       })
 
-      it('should report the deeper read as absent rather than a fault', async () => {
-        expect(await repaired.exist('a2/b/c')).toBe(false)
+      it('should report the destroyed nested id as a fault, since the prefix is not occupied', async () => {
+        await expect(repaired.exist('a2/b/c')).rejects.toBeDefined()
+      })
+
+      it('should let a store of that nested id succeed, which is why absence would be wrong', async () => {
+        await expect(repaired.storeStream('a2/b/c', bufferToStream(Buffer.from('again')))).resolves.toBeUndefined()
+      })
+
+      it('should serve it again once that store has repaired the tree', async () => {
+        await repaired.storeStream('a2/b/c', bufferToStream(Buffer.from('again')))
+
+        expect(await repaired.exist('a2/b/c')).toBe(true)
       })
     })
 
@@ -913,11 +930,13 @@ describe('when a shard directory is destroyed underneath a running instance', ()
         await damageThenStore(true, 'a2/b')
       })
 
-      it('should report a read under the occupied prefix as absent rather than a fault', async () => {
-        expect(await repaired.exist('a2/b')).toBe(false)
+      it('should report the destroyed nested id as a fault, since the raw path stays free', async () => {
+        // Same reasoning as the deeper compressed case above: nothing occupies `<root>/a2`, so `a2/b` is
+        // storable and its content was destroyed rather than shadowed.
+        await expect(repaired.exist('a2/b')).rejects.toBeDefined()
       })
 
-      it('should still serve the id that now owns the path', async () => {
+      it('should still serve the id it committed', async () => {
         expect(await repaired.exist('a2')).toBe(true)
       })
     })
@@ -1017,27 +1036,40 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       )
     })
 
-    it('should still reject when the obstructed directory is one this instance observed', async () => {
-      // The `knownDirectories` gate, which is what keeps real damage loud: `a2` was created by the store
-      // below, so replacing it with a file is a directory this instance owns ceasing to be one.
+    it('should report absence even for a prefix this instance had observed as a directory', async () => {
+      // What OCCUPIES the path decides, not what this instance saw there before. A file at a content path is
+      // served as an id, so ids under it are unstorable — `store` refuses them, `delete` resolves for them —
+      // and reads answering absence is what makes those three agree. Deciding from the observation instead
+      // would have two nodes with identical disks answer differently, and would leave reads as the only
+      // surface reporting a fault for an id the storage itself declares unstorable. The transition is still
+      // logged, since it destroyed whatever was under that path.
       await obstructed.storeStream('a2/b', bufferToStream(Buffer.from('content')))
       rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
       await nodeFs.writeFile(path.join(flatRoot, 'a2'), 'not a directory')
 
-      await expect(obstructed.exist('a2/b')).rejects.toMatchObject({ code: 'ENOTDIR' })
+      expect(await obstructed.exist('a2/b')).toBe(false)
+    })
+
+    it('should serve the file now occupying that path as its own id', async () => {
+      // The reason absence is honest rather than silent: the node is not claiming to hold nothing, it is
+      // claiming to hold `a2` and not `a2/b`, which is exactly the on-disk truth.
+      await obstructed.storeStream('a2/b', bufferToStream(Buffer.from('content')))
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+      await nodeFs.writeFile(path.join(flatRoot, 'a2'), 'not a directory')
+
+      expect(await obstructed.exist('a2')).toBe(true)
     })
   })
 
-  describe('and an observed directory deeper in the tree stops being a directory', () => {
+  describe('and an observed directory is replaced by content, at every depth', () => {
+    // A file at a content path is served as an id, so every id nested under it is unstorable. Reads report
+    // that as absence, which is what makes them agree with the store (a typed rejection) and with `delete`
+    // (resolves) — and the answer is the same at every depth, which is the property that kept breaking while
+    // it was derived from remembered damage keyed on one path.
     let damaged: IContentStorageComponent
     let flatRoot: string
 
     beforeEach(async () => {
-      // The damage signal used to be `knownDirectories.has(dirname)`, and for an ENOTDIR raised by the
-      // PARENT probe the path that stopped being a directory can be an ANCESTOR of `dirname` rather than
-      // `dirname` itself. So the immediate child of the destroyed directory rejected while every deeper
-      // descendant answered `false` — one obstruction, two answers, which is the divergence this whole
-      // read contract exists to remove.
       flatRoot = mkdtempSync(path.join(os.tmpdir(), 'damaged-deep-'))
       damaged = await createFolderBasedFileSystemContentStorage(
         { fs: createFsComponent(), logs: await createLogComponent({}) },
@@ -1046,7 +1078,7 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       )
       // Records `<root>/a2` as a directory this instance created...
       await damaged.storeStream('a2/b', bufferToStream(Buffer.from('content')))
-      // ...which is then destroyed and replaced by a regular file.
+      // ...which is then destroyed and replaced by a regular file, i.e. by something servable as the id `a2`.
       rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
       await nodeFs.writeFile(path.join(flatRoot, 'a2'), 'not a directory')
     })
@@ -1056,48 +1088,42 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       rmSync(flatRoot, { recursive: true, force: true })
     })
 
-    it('should reject for the immediate child of the destroyed directory', async () => {
-      await expect(damaged.exist('a2/b')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    it.each([['a2/b'], ['a2/b/c'], ['a2/b/c/d/e']])('should report %s as absent', async (id) => {
+      expect(await damaged.exist(id)).toBe(false)
     })
 
-    it('should reject for a deeper descendant, whose own parent was never recorded', async () => {
-      await expect(damaged.exist('a2/b/c')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    it('should agree with retrieve at depth', async () => {
+      expect(await damaged.retrieve('a2/b/c/d/e')).toBeUndefined()
     })
 
-    it('should reject for a descendant several levels below it', async () => {
-      await expect(damaged.exist('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    it('should refuse to STORE the nested id, with the typed error', async () => {
+      // The asymmetry that makes absence the right read answer: nothing can be created under a file, so the
+      // store is a caller error while the read has a provable answer.
+      //
+      // The read comes first deliberately. `ensureDirectoryFor` skips its occupant probe for a directory the
+      // mkdir-skip cache still believes in, and this instance created `<root>/a2` before it was replaced — so
+      // with a warm entry the store fails at its commit rename with a bare errno instead. The read is what
+      // drops that entry (the classifier forgets every path it proves is not a directory), which is also the
+      // realistic order: a service reads before it decides to store.
+      expect(await damaged.exist('a2/b')).toBe(false)
+
+      await expect(damaged.storeStream('a2/b', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
     })
 
-    it('should reject retrieve for the same descendant', async () => {
-      await expect(damaged.retrieve('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOTDIR' })
-    })
-
-    it('should still report a descendant of an obstruction it never observed as absent', async () => {
-      // The other half of the rule, in the same tree, so the two cannot be conflated: `<root>/plain` is
-      // another id's CONTENT and was never a directory, so ids under it stay provably absent even though a
-      // damaged directory exists elsewhere in this root.
-      await damaged.storeStream('plain', bufferToStream(Buffer.from('content')))
-
-      expect(await damaged.exist('plain/child/deeper')).toBe(false)
+    it('should resolve a delete of the nested id, as it already did', async () => {
+      await expect(damaged.delete(['a2/b'])).resolves.toBeUndefined()
     })
 
     it('should give the same answer every time the id is asked about', async () => {
-      // The damage report is DERIVED from `knownDirectories`, so invalidating that entry on the way out
-      // destroyed the evidence for it: the first read rejected and every read after it answered `false`,
-      // over an unchanged on-disk state. Asked SEQUENTIALLY, because the defect is state carried between
-      // calls — and repeating the question at all is the only way to catch it, since a test that asks once
-      // passes either way.
-      const answers: string[] = []
-      for (let attempt = 0; attempt < 3; attempt++) {
-        answers.push(
-          await damaged
-            .exist('a2/b')
-            .then(() => 'resolved')
-            .catch(() => 'rejected')
-        )
-      }
+      // Derived from the tree on each call, so repetition cannot change it. This is what the previous
+      // remembered-damage design could not hold: the first read rejected and every later one answered
+      // `false` over an unchanged disk, because the report consumed its own evidence.
+      const answers: boolean[] = []
+      for (let attempt = 0; attempt < 3; attempt++) answers.push(await damaged.exist('a2/b'))
 
-      expect(answers).toEqual(['rejected', 'rejected', 'rejected'])
+      expect(answers).toEqual([false, false, false])
     })
   })
 
