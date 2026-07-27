@@ -377,14 +377,25 @@ export async function createFolderBasedFileSystemContentStorage(
   const tempDirLower = tempDir.toLowerCase()
 
   /**
-   * Whether a resolved path IS the reserved staging directory or lands inside it.
+   * Whether a path IS the reserved staging directory or lands inside it.
    *
-   * Compared case-INSENSITIVELY, because a case-folding filesystem (APFS, NTFS, an SMB/CIFS mount)
-   * resolves `.TMP-WRITES/x` onto the reserved directory while an exact-case check waves it through:
-   * the write landed inside the staging namespace, was invisible to `allFileIds()`, and left behind a
-   * file the NEXT construction refuses to start over ("contains file(s) that this storage did not
-   * create") — a permanent startup failure needing manual cleanup. Rejecting every case makes the
-   * reservation mean the same thing on every filesystem instead of quietly widening on ext4.
+   * The ONE definition of "reserved", used both to reject an id that resolves into the staging area and
+   * to skip that area while enumerating. Those two must agree: while enumeration compared the directory
+   * entry's name to `tempDirectoryName` exactly, a reserved directory whose on-disk casing differed
+   * from the configured name — a deployment that changed `tempDirectoryName`'s casing, since `mkdir`
+   * matches case-insensitively and leaves the original entry — was DESCENDED INTO. `allFileIds()` then
+   * yielded staged files, intent journals and the ownership marker as content ids: with hash prefixes a
+   * staged file came out as a bare id whose `delete()` resolved while removing nothing, and in flat mode
+   * the ids came out reserved, so `delete()` rejected and took the whole GC batch down with it.
+   *
+   * Compared case-INSENSITIVELY for the same reason ids are: a case-folding filesystem (APFS, NTFS, an
+   * SMB/CIFS mount) resolves `.TMP-WRITES/x` onto the reserved directory, so an exact-case check waves
+   * the write through into the staging namespace, where it is invisible to `allFileIds()` and makes the
+   * NEXT construction refuse to start over a file "this storage did not create".
+   *
+   * Anchored on the ROOT-relative path rather than on a bare name, so a same-named directory deeper in
+   * the tree (reachable via a slash-containing id in flat mode) is still enumerated — the reservation
+   * covers one directory, not a filename.
    *
    * Only the PREFIX is folded, so the cost is bounded by the reserved directory's own path length
    * rather than growing with the id.
@@ -816,13 +827,6 @@ export async function createFolderBasedFileSystemContentStorage(
   // gzip, which retrieve prefers, in the instant before the committing section unlinks it). Reads
   // started after a store/delete promise resolves observe that operation's outcome.
   //
-  // WITHOUT `rename` (legacy no-rename adapters) that completeness guarantee DOES NOT HOLD, and not
-  // only after a crash: the in-place write streams straight onto the canonical path, so a concurrent
-  // reader can observe a partially written file during normal operation — a truncated raw, or a gzip
-  // that fails to inflate. There is no way to make an in-place write atomic for readers; the mode
-  // exists for backward compatibility, and a deployment that serves reads concurrently with writes
-  // needs `rename`.
-  //
   // METADATA AND BYTES CAN COME FROM DIFFERENT VERSIONS. The returned ContentItem opens its stream
   // LAZILY, while `size`/`contentSize` were measured at retrieve() time. A store landing in between
   // can unlink the observed file, making asStream() fail (typically ENOENT) — callers should treat
@@ -1026,7 +1030,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // 268 million ids still sits under the cap and every directory takes this path.
       for (const entry of buffered) {
         if (entry.isDirectory) {
-          if (folder === root && entry.name === tempDirName) continue
+          if (isInsideReservedTempDir(folder + path.sep + entry.name)) continue
           subdirectories.push(entry.name)
           continue
         }
@@ -1045,7 +1049,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // the listing to drain.
       for await (const entry of await components.fs.opendir(folder, { bufferSize: 4000 })) {
         if (entry.isDirectory()) {
-          if (folder === root && entry.name === tempDirName) continue
+          if (isInsideReservedTempDir(folder + path.sep + entry.name)) continue
           subdirectories.push(entry.name)
           continue
         }

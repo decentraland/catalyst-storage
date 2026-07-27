@@ -519,6 +519,65 @@ describe('when allFileIds walks a directory', () => {
   })
 })
 
+describe('when the reserved directory on disk is cased differently from the configured name', () => {
+  // Reached by changing `tempDirectoryName`'s casing between runs: `mkdir` matches case-insensitively
+  // on a case-folding filesystem, so the original entry survives and the configured name no longer
+  // matches it exactly. Enumeration compared the entry NAME to the configured one, so it descended into
+  // the staging area and yielded staged files, intent journals and the ownership marker as content ids
+  // — while `resolveFilePath` (case-insensitive) still called those ids reserved. The two disagreeing
+  // is the bug: with hash prefixes a staged file came out as a bare id whose `delete()` resolved having
+  // removed nothing, and in flat mode `delete()` rejected and took the whole GC batch with it.
+  const stagedName = 'aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+
+  const enumerateAcrossACasingChange = async (hashPrefix: boolean): Promise<string[]> => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'reserved-case-'))
+    const options = { disablePrefixHash: !hashPrefix }
+    const first = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      root,
+      { ...options, tempDirectoryName: '.TMP-WRITES' }
+    )
+    await first.storeStream('real-id', bufferToStream(Buffer.from('the real content')))
+    await first.stop?.()
+    // Staged residue, as an interrupted write would leave.
+    await nodeFsPromises.writeFile(path.join(root, '.TMP-WRITES', stagedName), 'staged residue')
+
+    const second = await createFolderBasedFileSystemContentStorage(
+      { fs: createFsComponent(), logs: await createLogComponent({}) },
+      root,
+      options
+    )
+    const listed: string[] = []
+    for await (const id of second.allFileIds()) listed.push(id)
+    await second.stop?.()
+    rmSync(root, { recursive: true, force: true })
+    return listed
+  }
+
+  describe.each([
+    ['with hash prefixes', true],
+    ['in flat mode', false]
+  ])('%s', (_label, hashPrefix) => {
+    let listed: string[]
+
+    beforeEach(async () => {
+      listed = await enumerateAcrossACasingChange(hashPrefix as boolean)
+    })
+
+    it('should not yield anything from the reserved directory', () => {
+      expect(listed).toEqual(['real-id'])
+    })
+
+    it('should not yield the staged file as a content id', () => {
+      expect(listed.some((id) => id.includes(stagedName))).toBe(false)
+    })
+
+    it('should not yield the ownership marker as a content id', () => {
+      expect(listed.some((id) => id.includes('owned-by-catalyst-storage'))).toBe(false)
+    })
+  })
+})
+
 describe('when a delete batch contains an id too long for the filesystem', () => {
   // ENAMETOOLONG means no file of that name CAN exist, so it is provably absent. The read path already
   // classified it that way while the delete invariant did not, and the disagreement was observable: the
