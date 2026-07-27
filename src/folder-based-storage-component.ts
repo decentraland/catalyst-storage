@@ -338,6 +338,64 @@ export async function createFolderBasedFileSystemContentStorage(
   let tempFileSweep: Promise<void> = Promise.resolve()
 
   /**
+   * The DEEPEST directory on this path that this instance has created or observed, or `undefined`.
+   *
+   * Walks upward and stops at the storage root, which is itself a legitimate answer (in flat mode a store
+   * records the root as the directory it wrote into). Pure string work over a bounded path — with hash
+   * prefixes the chain is root/shard, so this is one or two lookups.
+   */
+  function deepestObservedDirectory(dirname: string): string | undefined {
+    let candidate = dirname
+    for (;;) {
+      if (knownDirectories.has(candidate)) return candidate
+      if (candidate === root) return undefined
+      const parent = path.dirname(candidate)
+      // Defensive: `resolveFilePath` guarantees containment, so the root is always reached first.
+      if (parent === candidate || parent.length < root.length) return undefined
+      candidate = parent
+    }
+  }
+
+  /**
+   * The observed directory that stopped being one, or `undefined` when the obstruction is a path this
+   * instance never observed as a directory (so nothing it owns was destroyed).
+   *
+   * This is the difference between the two answers a non-directory ancestor can deserve. An obstruction at
+   * a never-observed path makes the id PROVABLY ABSENT — a filesystem cannot hold a file and a directory at
+   * one path — while an observed directory ceasing to be one is damage that has to reject.
+   *
+   * `knownDirectories.has(dirname)` alone was not enough, and the gap was reachable: with `a2/b` stored
+   * (recording `<root>/a2`) and `<root>/a2` then replaced by a file, `exist('a2/b')` rejected while
+   * `exist('a2/b/c')` answered `false`, because the deeper id's `dirname` is `<root>/a2/b`, which was never
+   * recorded. One obstruction, two answers — the divergence this whole read contract exists to remove.
+   */
+  async function lostObservedDirectory(
+    dirname: string,
+    /** Whether `stat(dirname)` SUCCEEDED and returned a non-directory, i.e. the parent is the obstruction. */
+    immediateParentIsObstruction: boolean
+  ): Promise<string | undefined> {
+    // That stat succeeding PROVES every path above `dirname` is still a directory — a stat cannot traverse
+    // a file — so `dirname` itself is the only candidate and nothing more needs probing.
+    if (immediateParentIsObstruction) return knownDirectories.has(dirname) ? dirname : undefined
+    // ENOTDIR from the parent probe: the obstruction is strictly ABOVE `dirname`, and which ancestor it is
+    // decides the answer. Only the DEEPEST observed directory has to be checked, because if it is still a
+    // directory then so is every ancestor of it, which puts the obstruction BELOW it at a path this
+    // instance never observed — the provably-absent case. One extra stat, on a path where two have already
+    // failed.
+    const observed = deepestObservedDirectory(dirname)
+    if (observed === undefined) return undefined
+    // `dirname` was observed as a directory and its stat just failed, so it is not a usable one now.
+    if (observed === dirname) return dirname
+    try {
+      return (await statOccupant(observed)) === 'directory' ? undefined : observed
+    } catch {
+      // Cannot tell. Fail closed: the alternative is reporting content absent on no evidence, which is the
+      // answer this contract refuses.
+      return observed
+    }
+  }
+
+  /**
    * Read-path existence probe: ONE stat instead of `existPath` followed by `stat`, since a stat
    * answers both questions.
    *
@@ -465,21 +523,33 @@ export async function createFolderBasedFileSystemContentStorage(
       // The store keeps rejecting, which is right: a store asks to CREATE something that cannot be
       // created, while a read asks a question whose true answer is "nothing".
       if (parent || probeCode === 'ENOTDIR') {
-        // A FAULT when this instance created or observed `dirname` as a directory: the tree it owns was
-        // destroyed underneath it, which is provable damage and has to be loud. Read BEFORE the
-        // invalidation, or forgetting it would answer its own question — same evidence and same rule as
-        // the removed-directory case below. Note this gate is stronger than it looks: every successful
-        // stat and every classified miss calls `rememberDirectory`, so damage under a shard this
-        // instance is actually using still rejects. `undefined` is reserved for a directory it has
-        // never observed, which is the same position the removed-directory case below already takes.
-        const wasKnown = knownDirectories.has(dirname)
-        // Invalidated either way, so a write can recreate the tree once whatever occupies the path is
-        // gone (it is never removed here: destroying something this storage cannot prove it owns is
-        // exactly what the reserved-namespace checks refuse to do).
-        forgetDirectory(dirname)
-        if (!wasKnown) return undefined
+        // A FAULT when a directory this instance created or observed is the one that stopped being a
+        // directory: the tree it owns was destroyed underneath it, which is provable damage and has to be
+        // loud. Decided BEFORE the invalidation, or forgetting the entry would answer its own question —
+        // same evidence and same rule as the removed-directory case below. The gate is stronger than it
+        // looks: every successful stat and every classified miss calls `rememberDirectory`, so damage
+        // under a shard this instance is actually serving always rejects. Absence is reserved for an
+        // obstruction at a path it never observed as a directory, which is the same position the
+        // removed-directory case below already takes.
+        const damaged = await lostObservedDirectory(dirname, parent !== undefined)
+        // Nothing this instance observed was lost, so the obstruction is a name that can never hold a
+        // file. There is nothing to invalidate on this path either: `dirname` being absent from
+        // `knownDirectories` is precisely what produced this answer.
+        if (damaged === undefined) return undefined
+        // THE ENTRY IS DELIBERATELY KEPT, where this used to call `forgetDirectory`. Now that the damage
+        // report is DERIVED from that entry, dropping it destroys the evidence for the report — so the
+        // first read of a damaged id rejected and every read after it answered `false`, for content in an
+        // unchanged on-disk state. Two answers to one repeated question, which is the failure class this
+        // contract exists to remove; it did not arise before because this branch threw unconditionally.
+        //
+        // Recovery does not need the invalidation: `writingUnder` already drops the entry when a write
+        // fails ENOENT/ENOTDIR under it, which is exactly what it is documented for, so the first store
+        // after an operator clears the obstruction heals the entry and the retry succeeds. (The
+        // obstruction itself is never removed here — destroying something this storage cannot prove it
+        // owns is what the reserved-namespace checks refuse to do.)
         logger.warn(
-          `Refusing to report ${filePath} as absent: a path this storage observed as a directory is no longer one`
+          `Refusing to report ${filePath} as absent: ${JSON.stringify(damaged)}, which this storage ` +
+            `observed as a directory, is no longer one`
         )
         throw err
       }

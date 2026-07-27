@@ -234,10 +234,7 @@ describe('folder-based review regressions', () => {
 
   const logs = async () => createLogComponent({})
   const shardOf = (base: string): string => path.join(base, '9584')
-  // Return type INFERRED rather than annotated as `IFileSystemComponent`: that annotation widened away
-  // `existPath`, which the interface now only declares optionally (it is deprecated and unused by the
-  // library), while the bundled component still provides it. The assertions below call it directly.
-  const realFs = () => createFsComponent()
+  const realFs = (): IFileSystemComponent => createFsComponent()
 
   afterEach(async () => {
     await storage?.stop?.()
@@ -761,13 +758,86 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
 
     it('should still reject when the obstructed directory is one this instance observed', async () => {
-      // The `knownDirectories` gate, which is what keeps real damage loud: `a` was created by the store
-      // above, so replacing it with a file is a directory this instance owns ceasing to be one.
+      // The `knownDirectories` gate, which is what keeps real damage loud: `a2` was created by the store
+      // below, so replacing it with a file is a directory this instance owns ceasing to be one.
       await obstructed.storeStream('a2/b', bufferToStream(Buffer.from('content')))
       rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
       await nodeFs.writeFile(path.join(flatRoot, 'a2'), 'not a directory')
 
       await expect(obstructed.exist('a2/b')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    })
+  })
+
+  describe('and an observed directory deeper in the tree stops being a directory', () => {
+    let damaged: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      // The damage signal used to be `knownDirectories.has(dirname)`, and for an ENOTDIR raised by the
+      // PARENT probe the path that stopped being a directory can be an ANCESTOR of `dirname` rather than
+      // `dirname` itself. So the immediate child of the destroyed directory rejected while every deeper
+      // descendant answered `false` — one obstruction, two answers, which is the divergence this whole
+      // read contract exists to remove.
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'damaged-deep-'))
+      damaged = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      // Records `<root>/a2` as a directory this instance created...
+      await damaged.storeStream('a2/b', bufferToStream(Buffer.from('content')))
+      // ...which is then destroyed and replaced by a regular file.
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+      await nodeFs.writeFile(path.join(flatRoot, 'a2'), 'not a directory')
+    })
+
+    afterEach(async () => {
+      await damaged.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should reject for the immediate child of the destroyed directory', async () => {
+      await expect(damaged.exist('a2/b')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    })
+
+    it('should reject for a deeper descendant, whose own parent was never recorded', async () => {
+      await expect(damaged.exist('a2/b/c')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    })
+
+    it('should reject for a descendant several levels below it', async () => {
+      await expect(damaged.exist('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    })
+
+    it('should reject retrieve for the same descendant', async () => {
+      await expect(damaged.retrieve('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    })
+
+    it('should still report a descendant of an obstruction it never observed as absent', async () => {
+      // The other half of the rule, in the same tree, so the two cannot be conflated: `<root>/plain` is
+      // another id's CONTENT and was never a directory, so ids under it stay provably absent even though a
+      // damaged directory exists elsewhere in this root.
+      await damaged.storeStream('plain', bufferToStream(Buffer.from('content')))
+
+      expect(await damaged.exist('plain/child/deeper')).toBe(false)
+    })
+
+    it('should give the same answer every time the id is asked about', async () => {
+      // The damage report is DERIVED from `knownDirectories`, so invalidating that entry on the way out
+      // destroyed the evidence for it: the first read rejected and every read after it answered `false`,
+      // over an unchanged on-disk state. Asked SEQUENTIALLY, because the defect is state carried between
+      // calls — and repeating the question at all is the only way to catch it, since a test that asks once
+      // passes either way.
+      const answers: string[] = []
+      for (let attempt = 0; attempt < 3; attempt++) {
+        answers.push(
+          await damaged
+            .exist('a2/b')
+            .then(() => 'resolved')
+            .catch(() => 'rejected')
+        )
+      }
+
+      expect(answers).toEqual(['rejected', 'rejected', 'rejected'])
     })
   })
 
