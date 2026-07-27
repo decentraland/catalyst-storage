@@ -20,7 +20,7 @@ The folder-based and in-memory backends enforce the same id-shape rules, so an i
 Two divergences remain, and both are structural — the folder-based backend knows things about its filesystem that an id-shape rule cannot:
 
 - The reserved staging-directory name is a folder-based *configuration* value, so the in-memory backend cannot know it. In flat mode `'.tmp-writes/foo'` is rejected by the folder-based backend and accepted by the in-memory one. A service that may run against either should not use ids under its configured `tempDirectoryName`.
-- **Two ids where one is a path prefix of the other cannot both be stored on a filesystem** — nothing can hold a file and a directory at one path. Storing `a` and then `a/b` (or the reverse) makes the second store reject with `PathNotContainedError`, while the in-memory and S3 backends take both. Hash prefixes usually hide this by putting the two ids in different shards, so it is reachable in flat mode and, via a 4-hex shard collision, rarely in hash mode too. The typed rejection is new: this used to surface as a bare `ENOTDIR`/`EISDIR` from the commit, several awaits after the id was accepted. **Reads of such an id still reject** rather than reporting it absent — a non-directory inside the storage's own tree is a fault, and answering "absent" for it would let a broken store read as an empty one. Since the store now refuses the id up front, nothing can be written there for a read to miss.
+- **Two ids where one is a path prefix of the other cannot both be stored on a filesystem** — nothing can hold a file and a directory at one path. Storing `a` and then `a/b` (or the reverse) makes the second store reject with `PathNotContainedError`, while the in-memory and S3 backends take both. Hash prefixes usually hide this by putting the two ids in different shards, so it is reachable in flat mode and, via a 4-hex shard collision, rarely in hash mode too. Both directions are checked before anything is staged — the parent path for `a` then `a/b`, and the commit target itself for the reverse — because each used to surface as a bare `ENOTDIR`/`EISDIR` from the commit rename, several awaits after the id was accepted. A **compressed** store is refused in the reverse case too, rather than succeeding: it would otherwise leave an id whose whole reads work but whose byte ranges can never be served, since the range path has to publish its decompressed copy at exactly the occupied path. **Reads of such an id still reject** rather than reporting it absent — a non-directory inside the storage's own tree is a fault, and answering "absent" for it would let a broken store read as an empty one. Since the store now refuses the id up front, nothing can be written there for a read to miss.
 
 **A store refuses a source it cannot read**, on every backend. What it rejects with depends on why:
 
@@ -71,6 +71,13 @@ cannot supply the content any more, and every backend refuses it. A caller that 
 storing can check the source it is about to hand over instead of learning from a rejected store. The id
 validators stay internal: they encode invariants that only make sense applied at a specific point, and the
 backends apply them on the caller's behalf.
+
+A source that still has a **`'readable'` listener attached** is refused by every backend for the same reason,
+even though nothing has been read from it yet. That listener is a competing consumer: a backend that pipes
+never sees the body flow at all (a store of such a source used to hang forever, with no timeout in this
+package), and a backend that reads explicitly — S3, via the MIME head peek — *races* it and stores only the
+chunks it happens to win. Measured on the S3 backend with a reader attached to a 20-chunk source: **0 of 2000
+bytes committed, and the store resolved**. Hand over a fresh source rather than one someone else is reading.
 
 `streamToBuffer(stream, maxBytes?)` takes an **optional** cap, and it is opt-in on purpose: callers know
 their own content sizes, and a default ceiling would start rejecting bodies that store and read correctly

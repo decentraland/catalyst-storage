@@ -738,10 +738,11 @@ export async function createS3BasedFileSystemContentStorage(
       // earlier revision of this patch enforced the segment-length rule here for cross-backend parity; that
       // is the wrong trade, because S3 keys have no per-segment limit and a >255-byte segment is a key this
       // bucket may already be serving.
-      // `true`: this backend drains the body through `peekHead`'s async iterator, i.e. explicit `read()`
-      // calls, which a competing `'readable'` listener does not block. It stored such sources correctly
-      // before that refusal existed, so it opts out of it rather than losing the capability.
-      assertStorableStream(stream, true)
+      // The SAME rule as the other backends, including the competing-`'readable'`-consumer refusal. This
+      // backend drains the body by explicit `read()`, which such a listener does not block — but not being
+      // blocked is not the same as being safe: the listener races this upload for the body, and it can win.
+      // See `assertStorableStream` for the measured corruption that made an exemption here untenable.
+      assertStorableStream(stream)
       // Inspect only the head for MIME detection, then stream the body straight to S3 so large
       // files are never buffered in memory. The AWS SDK's managed upload performs a multipart
       // upload, buffering only part-sized chunks rather than the whole file.

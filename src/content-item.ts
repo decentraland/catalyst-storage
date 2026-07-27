@@ -278,16 +278,9 @@ function prematureClose(): Error {
  * the in-memory backend rejected while the folder-based and S3 backends silently stored 0 bytes. The
  * checks live here so all three share one rule; they are synchronous, so no event can slip in between.
  *
- * @param consumesByExplicitRead Set by a caller that drains the source with `read()` (or async iteration)
- * rather than by letting it FLOW. It relaxes exactly one check — the competing-`'readable'`-listener refusal
- * — because that listener blocks `pipe`/`resume()` but not an explicit read. The S3 backend consumes this
- * way and demonstrably stored such sources correctly, so refusing them there withdrew a working capability
- * (and re-opened the cross-backend divergence this guard exists to close, in the other direction). Every
- * other check still applies.
- *
  * @public
  */
-export function assertStorableStream(stream: Readable, consumesByExplicitRead = false): void {
+export function assertStorableStream(stream: Readable): void {
   if (stream.errored) throw stream.errored
   // Fully consumed by someone else: there are no bytes left to collect, and storing that as empty
   // content is the silent-corruption case above.
@@ -317,20 +310,32 @@ export function assertStorableStream(stream: Readable, consumesByExplicitRead = 
   // `bufferToStream`) rather than a rewound one.
   if (stream.readableDidRead) throw prematureClose()
   // A COMPETING 'readable' CONSUMER, which none of the flags above can see: a listener that has not pulled
-  // anything yet leaves `readableDidRead` false, so the source looks pristine. It is not. That listener takes
-  // precedence over `pipe` — the note above says so for the already-read case — and equally over `resume()`,
-  // which Node documents as having no effect while one is attached. So for a backend that consumes by FLOWING
-  // the source never flows: no 'data', no 'end', no 'close', and the store HANGS FOREVER, with no timeout
-  // anywhere in this package to end it.
+  // anything yet leaves `readableDidRead` false, so the source looks pristine. It is not, and it is refused on
+  // EVERY backend, because the two failure modes it produces are both worse than the rejection.
   //
-  // Skipped for a caller that drains by explicit `read()`, which such a listener does not block — see the
-  // parameter. `listenerCount` is feature-detected because this is a `@public` helper and every other check
-  // here reads a PROPERTY: a duck-typed stream stand-in (common in consumers' own tests) would otherwise get
-  // a `TypeError` from inside `storeStream` instead of being stored.
-  if (!consumesByExplicitRead && typeof stream.listenerCount === 'function' && stream.listenerCount('readable') > 0) {
+  // A backend that consumes by FLOWING (folder-based via `pipeline`, in-memory via `streamToBuffer`) never
+  // gets any bytes: the listener takes precedence over `pipe` — the note above says so for the already-read
+  // case — and equally over `resume()`, which Node documents as having no effect while one is attached. So
+  // nothing flows: no 'data', no 'end', no 'close', and the store HANGS FOREVER, with no timeout in this
+  // package to end it.
+  //
+  // A backend that consumes by EXPLICIT READ (S3, via the head peek's async iterator) is not blocked by the
+  // listener — and that is exactly what makes it dangerous rather than safe. The listener is still a
+  // consumer, so the two RACE, and every byte it wins is a byte the upload never sees. This was briefly
+  // exempted here on the reasoning that S3 "stored such sources correctly"; it does so only while the
+  // listener is idle. With a listener that actually reads, S3 committed 0 of 2000 bytes for a 20-chunk
+  // source, and 200 of 2000 for a reader that attached one tick late — and `storeStream` RESOLVED both
+  // times, so a content-addressed id permanently holds bytes that are not its content. Silent corruption
+  // is the failure this whole guard exists to prevent, so the exemption is gone and the rule is uniform.
+  //
+  // `listenerCount` is feature-detected because this is a `@public` helper and every other check here reads
+  // a PROPERTY: a duck-typed stream stand-in (common in consumers' own tests) would otherwise get a
+  // `TypeError` from inside `storeStream` instead of being stored.
+  if (typeof stream.listenerCount === 'function' && stream.listenerCount('readable') > 0) {
     throw new Error(
-      `Cannot store a stream that already has a 'readable' listener: it will not flow while another ` +
-        `consumer is attached, and the two would race for the same bytes. Hand over a fresh source instead.`
+      `Cannot store a stream that already has a 'readable' listener: another consumer is attached, and the ` +
+        `two would race for the same bytes — a backend that reads explicitly would store only what it won, ` +
+        `and one that pipes would never flow at all. Hand over a fresh source instead.`
     )
   }
   // A source in a NON-UTF8 encoding mode yields strings, and every backend turns those back into bytes as

@@ -11,13 +11,7 @@ import { createFsInvariants } from './folder-based/fs-invariants'
 import { createDecompressCache, InvalidationToken } from './folder-based/decompress-cache'
 import { createIntentJournal, TEMP_DIR_NAME, UncommittedIntentSurvivedError } from './folder-based/intent-journal'
 import { DecompressionLimitExceededError, PathNotContainedError } from './folder-based/errors'
-import {
-  assertAddressableContentId,
-  assertStorableContentId,
-  assertValidContentId,
-  GZIP_EXTENSION,
-  gzipPathOf
-} from './content-id'
+import { assertStorableContentId, assertValidContentId, GZIP_EXTENSION, gzipPathOf } from './content-id'
 import { destroyAllQuietly, destroyQuietly } from './stream-teardown'
 
 const pipe = promisify(pipeline)
@@ -873,6 +867,46 @@ export async function createFolderBasedFileSystemContentStorage(
    * ordinary case for both. `existPath` cannot answer it either, since F_OK|R_OK passes for a file.
    * The absent codes match `existsForInvariant`'s: no name of that shape can exist.
    */
+  /**
+   * Refuses a store whose commit would rename onto something that is not a regular file.
+   *
+   * `ensureDirectoryFor` covers the case where an id's PARENT path is occupied (`a` stored, then `a/b`). This
+   * is the mirror image: `a/b` stored first creates the directory `a`, so a later store of `a` has a perfectly
+   * good parent and only fails at the commit — with a bare `EISDIR` from the rename, several awaits after the
+   * id was accepted, which is the untyped-late-failure shape the id rules exist to remove. Checked here, before
+   * anything is staged, so a rejected store leaves no residue.
+   *
+   * Both commit targets are checked for a compressed store, because it commits to whichever representation it
+   * decides on: the gzip when compression helped, the raw when it did not. A directory at the raw path would
+   * otherwise leave an id that stores and serves whole reads but can never serve a byte RANGE, since the range
+   * path has to publish its decompressed copy exactly there.
+   *
+   * A directory is a NAME problem — another id's nested content legitimately occupies the path — so it is a
+   * typed rejection. Anything else (a fifo, socket or device node) is foreign to this storage and no id can
+   * create it, so it is a fault. This is not a substitute for the commit's own failure handling: the state can
+   * appear between this check and the rename, and the commit still reports that honestly.
+   */
+  async function assertCommitTargetsWritable(id: string, filePath: string, includeGzipPath: boolean): Promise<void> {
+    const targets = includeGzipPath ? [filePath, gzipPathOf(filePath)] : [filePath]
+    for (const target of targets) {
+      const occupant = await statOccupant(target)
+      if (occupant === 'directory') {
+        throw new PathNotContainedError(
+          `The id cannot be stored: ${JSON.stringify(target)} is a directory, which means another id nested ` +
+            `under this one already occupies the path its content must be written to. Ids where one is a path ` +
+            `prefix of another can only coexist when hash prefixes put them in different shards: ` +
+            `${JSON.stringify(id)}`
+        )
+      }
+      if (occupant === 'other') {
+        throw new Error(
+          `Cannot store ${JSON.stringify(id)}: ${JSON.stringify(target)} exists but is neither a regular file ` +
+            `nor a directory, so this storage cannot commit its content there. Remove whatever occupies it.`
+        )
+      }
+    }
+  }
+
   async function statOccupant(target: string): Promise<'file' | 'directory' | 'other' | 'absent'> {
     try {
       const stat = await components.fs.stat(target)
@@ -1027,6 +1061,8 @@ export async function createFolderBasedFileSystemContentStorage(
     // reported success. See `assertStorableStream`.
     assertStorableStream(stream)
     await ensureDirectoryFor(filePath)
+    // The mirror of `ensureDirectoryFor`'s parent check: this store's own commit target must be writable.
+    await assertCommitTargetsWritable(id, filePath, false)
     // Stage the write in the reserved temp dir under a random name, then atomically rename it into
     // place. A direct write to the final path leaves a truncated/zero-byte file if the process dies
     // mid-write (OOM-kill, eviction, crash); since `exist()` only checks for the path, that partial
@@ -1684,6 +1720,8 @@ export async function createFolderBasedFileSystemContentStorage(
     const filePath = await resolveFilePath(id)
     assertStorableStream(stream)
     await ensureDirectoryFor(filePath)
+    // BOTH representations, because the commit picks one of them depending on whether compression helped.
+    await assertCommitTargetsWritable(id, filePath, true)
     // Fully staged: both the raw bytes and their gzip are produced in the operation-owned staging
     // area — the compression reads the PRIVATE staged raw, so no concurrent store/delete can
     // supersede or fail it — and the id transitions in ONE locked commit to either the gzip-only
@@ -1880,12 +1918,22 @@ export async function createFolderBasedFileSystemContentStorage(
       // id anywhere in the list used to let up to `BATCH_CONCURRENCY` ids run to completion first, so a
       // rejected batch had deleted a nondeterministic prefix of the ids behind the bad one — while the
       // in-memory backend, being sequential, had deleted none of them. A caller cannot act on "some
-      // unspecified subset was removed"; it can act on "nothing was". Validated with the SHARED id rules
-      // rather than by resolving each path, so this costs no sha1 and holds no array of resolved paths for
-      // a million-id sweep — and those rules are the whole rejection surface `resolveFilePath` shares with
-      // the other backends. An id landing inside the reserved staging directory is the one rejection only
-      // this backend has, so it is still raised below, from the removal pass.
-      ids.forEach((id) => assertAddressableContentId(id))
+      // unspecified subset was removed"; it can act on "nothing was".
+      //
+      // Validated with `resolveFilePath`, the SAME function the removal pass uses, rather than with the
+      // shared id rules alone. Those rules are not the whole rejection surface: an id landing inside the
+      // reserved staging directory is refused only by `resolveFilePath`, so in flat mode
+      // `delete(['victim', '.tmp-writes/x'])` passed pre-validation, removed `victim`, and only then
+      // rejected — the exact partial application this pass exists to rule out. Using one function for both
+      // makes the guarantee hold by construction instead of by keeping two lists of rules in step.
+      //
+      // The resolved paths are DISCARDED rather than kept for the pass below, so the ids are resolved twice.
+      // That is deliberate: resolution is pure CPU (no syscall), while retaining a path per id would hold
+      // hundreds of megabytes for the million-id sweeps this surface is documented to accept — the same
+      // reason the pass below uses `forEach` rather than `map`.
+      for (const id of ids) {
+        await resolveFilePath(id)
+      }
       await forEachWithConcurrency(ids, BATCH_CONCURRENCY, async (id) => {
         const filePath = await resolveFilePath(id)
         // Locked so an in-flight decompression can never resurrect the id by renaming its staged

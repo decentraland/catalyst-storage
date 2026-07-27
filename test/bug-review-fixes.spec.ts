@@ -16,6 +16,8 @@ import {
 } from '../src'
 import { assertStorableStream } from '../src'
 import { createDecompressCache, DecompressCache } from '../src/folder-based/decompress-cache'
+import { createS3BasedFileSystemContentStorage } from '../src/s3-based-storage-component'
+import { createFakeS3Client } from './fake-s3-client'
 
 /**
  * Regression tests for the defects found in the multi-agent bug review. Each block names the failure it
@@ -324,12 +326,18 @@ describe('bug review fixes', () => {
       // Reads report a directory as absent, which is exactly what routes a RANGE request into the
       // inflation — whose commit then renamed onto that directory and failed with a bare EISDIR on every
       // call, forever, for an id whose whole-file reads succeed.
+      //
+      // The directory is created DIRECTLY, not by storing a nested id, because the store side now refuses to
+      // create this state at all (see the prefix-collision block above): a compressed store whose raw path is
+      // a directory would produce an id that can never serve a range. So this state is only reachable as
+      // pre-existing on-disk residue — an older version of this library, or an operator — which is precisely
+      // why the read path still has to answer for it rather than assume it away.
       root = mkdtempSync(path.join(os.tmpdir(), 'range-eisdir-'))
       storage = await createFolderBasedFileSystemContentStorage({ fs: realFs(), logs: await logs() }, root, {
         disablePrefixHash: true
       })
-      await storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))
       await storage.storeStreamAndCompress('a', bufferToStream(Buffer.from('x'.repeat(5000))))
+      await nodeFs.mkdir(path.join(root, 'a'))
     })
 
     afterEach(async () => {
@@ -587,6 +595,151 @@ describe('bug review fixes', () => {
       await waitUntil(() => unlinked.includes('/victim'))
 
       expect(unlinked).toContain('/victim')
+    })
+  })
+
+  describe('when a source is handed over with a competing reader already consuming it', () => {
+    let storage: IContentStorageComponent
+    let s3: IContentStorageComponent
+    let memory: IContentStorageComponent
+    let root: string
+    let stolen: Buffer[]
+    let contendedSource: () => Readable
+
+    beforeEach(async () => {
+      // A listener that has not read yet leaves `readableDidRead` false, so the source looks pristine. On a
+      // backend that consumes by EXPLICIT READ the listener is not blocked — and that is what makes it
+      // dangerous rather than harmless: the two race, and every byte the listener wins is a byte the upload
+      // never sees. S3 was briefly exempted from the refusal on the reasoning that it "stored such sources
+      // correctly", which holds only while the listener is idle. With one that actually reads, S3 committed 0
+      // of 2000 bytes and `storeStream` RESOLVED — silent corruption under a content-addressed id.
+      root = mkdtempSync(path.join(os.tmpdir(), 'contended-'))
+      stolen = []
+      storage = await createFolderBasedFileSystemContentStorage({ fs: realFs(), logs: await logs() }, root, {
+        disablePrefixHash: true
+      })
+      s3 = await createS3BasedFileSystemContentStorage({ logs: await logs() }, createFakeS3Client(), {
+        Bucket: 'a-bucket',
+        fileTypeLoader: async () => ({ fileTypeFromBuffer: async () => undefined }) as never
+      })
+      memory = createInMemoryStorage()
+      // Multi-chunk and slow, so the competing reader has real opportunities to win a chunk. A single
+      // synchronous chunk does not reproduce it.
+      contendedSource = () => {
+        const source = Readable.from(
+          (async function* () {
+            for (let index = 0; index < 20; index++) {
+              await new Promise((resolve) => setTimeout(resolve, 5))
+              yield Buffer.alloc(100, 'z')
+            }
+          })()
+        )
+        source.on('readable', () => {
+          let chunk: Buffer | null
+          while ((chunk = source.read() as Buffer | null) !== null) stolen.push(chunk)
+        })
+        return source
+      }
+    })
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('should be refused by the S3 backend rather than committing the bytes it won the race for', async () => {
+      await expect(s3.storeStream('an-id', contendedSource())).rejects.toThrow(/'readable' listener/)
+    })
+
+    it('should leave nothing stored on the S3 backend', async () => {
+      await s3.storeStream('an-id', contendedSource()).catch(() => undefined)
+
+      await expect(s3.exist('an-id')).resolves.toBe(false)
+    })
+
+    it('should be refused by the folder-based backend', async () => {
+      await expect(storage.storeStream('an-id', contendedSource())).rejects.toThrow(/'readable' listener/)
+    })
+
+    it('should be refused by the in-memory backend', async () => {
+      await expect(memory.storeStream('an-id', contendedSource())).rejects.toThrow(/'readable' listener/)
+    })
+  })
+
+  describe('when an id is stored after another id has nested itself under that path', () => {
+    let storage: IContentStorageComponent
+    let root: string
+    let rawOutcome: unknown
+    let compressedOutcome: unknown
+
+    beforeEach(async () => {
+      // The mirror of the parent-occupied case: `a/b` stored first creates the directory `a`, so a later store
+      // of `a` has a perfectly good parent and only failed at the COMMIT, with a bare EISDIR from the rename
+      // several awaits after the id was accepted. A compressed store of `a` was worse than untyped — it
+      // SUCCEEDED, leaving an id whose whole reads work and whose byte ranges can never be served, because the
+      // range path has to publish its decompressed copy at exactly the occupied path.
+      root = mkdtempSync(path.join(os.tmpdir(), 'reverse-prefix-'))
+      storage = await createFolderBasedFileSystemContentStorage({ fs: realFs(), logs: await logs() }, root, {
+        disablePrefixHash: true
+      })
+      await storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))
+      rawOutcome = await storage.storeStream('a', bufferToStream(Buffer.from('A'))).catch((error) => error)
+      compressedOutcome = await storage
+        .storeStreamAndCompress('a', bufferToStream(Buffer.from('x'.repeat(5000))))
+        .catch((error) => error)
+    })
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('should refuse the raw store with a typed error rather than a bare errno', () => {
+      expect(rawOutcome).toBeInstanceOf(PathNotContainedError)
+    })
+
+    it('should refuse the compressed store too, rather than creating an id that cannot serve ranges', () => {
+      expect(compressedOutcome).toBeInstanceOf(PathNotContainedError)
+    })
+
+    it('should leave the nested id readable', async () => {
+      const item = await storage.retrieve('a/b')
+
+      expect((await streamToBuffer(await item!.asStream())).toString()).toBe('nested')
+    })
+  })
+
+  describe('when a delete batch contains an id inside the reserved staging directory', () => {
+    let storage: IContentStorageComponent
+    let root: string
+    let batch: string[]
+
+    beforeEach(async () => {
+      // The pre-validation pass originally applied only the SHARED id rules, which have no notion of the
+      // reserved directory — that rejection lives in `resolveFilePath`, inside the concurrent removal loop. So
+      // this batch passed pre-validation, removed `victim`, and only then rejected: the partial application the
+      // pass exists to rule out. Reachable in flat mode, where the root itself is the id namespace.
+      root = mkdtempSync(path.join(os.tmpdir(), 'reserved-delete-'))
+      batch = ['victim', '.tmp-writes/x']
+      storage = await createFolderBasedFileSystemContentStorage({ fs: realFs(), logs: await logs() }, root, {
+        disablePrefixHash: true
+      })
+      await storage.storeStream('victim', bufferToStream(Buffer.from('v')))
+    })
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('should reject the batch', async () => {
+      await expect(storage.delete(batch)).rejects.toBeInstanceOf(PathNotContainedError)
+    })
+
+    it('should not have deleted the valid id ahead of it', async () => {
+      await storage.delete(batch).catch(() => undefined)
+
+      await expect(storage.exist('victim')).resolves.toBe(true)
     })
   })
 
