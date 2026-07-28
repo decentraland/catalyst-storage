@@ -340,7 +340,13 @@ export async function createFolderBasedFileSystemContentStorage(
     // spells the compressed form of a reserved id). Skipping the resolve matters because it runs per
     // enumerated entry: flat-mode enumeration measured 4.39 µs/id going through it against 2.9 µs/id here.
     if (!USE_HASH_PREFIX) {
-      if (isInsideReservedTempDir(target)) return false
+      // The RAW path, not `target`. For a `.gzip` name those differ, and it is the raw one `resolveFilePath`
+      // would build and then refuse for landing in the reserved staging directory — so checking only `target`
+      // accepted a foreign `.tmp-writes.gzip` as the compressed form of `.tmp-writes`, an id enumeration then
+      // yielded and every point lookup refused. `root + sep + id` is exactly what the resolve produces here,
+      // since these segments come from a real listing and so give `path.normalize` nothing to change.
+      const rawPath = root + path.sep + id
+      if (isInsideReservedTempDir(rawPath)) return false
       try {
         assertValidContentId(id)
         return true
@@ -836,9 +842,26 @@ export async function createFolderBasedFileSystemContentStorage(
         try {
           await components.fs.mkdir(dirname, { recursive: true })
         } catch (err: any) {
-          // ENOTDIR means an ANCESTOR is a regular file — the same prefix collision as above, just further up,
-          // and equally a property of the name.
+          // ENOTDIR means an ANCESTOR is not a directory. WHICH class that is depends on what is in the way,
+          // exactly as it does for the immediate parent above and for the read path — so the same classifier
+          // decides, rather than this branch assuming a prefix collision. It used to assume one, and in
+          // hash-prefix mode the reachable obstruction is a foreign file where a SHARD belongs: a nested id
+          // then had its store refused as a bad content id, sending a service to 400 over a valid id and
+          // hiding the operator action that would actually fix it.
+          //
+          // `faultBehindAbsence` answers with the offending path when nothing addressable owns it, and with
+          // `undefined` when the obstruction IS another id's content — which is the genuine prefix collision the
+          // typed error is for. `'absent'` is what `statOccupant` reported for `dirname`, so the walk starts
+          // there and finds the real obstruction above it.
           if (err?.code === 'ENOTDIR') {
+            const fault = await faultBehindAbsence(filePath, 'absent')
+            if (fault !== undefined) {
+              throw new Error(
+                `Cannot store into ${JSON.stringify(dirname)}: ${JSON.stringify(fault)} is not a directory and is ` +
+                  `not content any id resolves to, so the directory the id needs cannot be created. Remove ` +
+                  `whatever occupies it.`
+              )
+            }
             throw new PathNotContainedError(
               `The id cannot be stored: an ancestor of ${JSON.stringify(dirname)} is a file, so the directory ` +
                 `the id needs cannot be created. Ids where one is a path prefix of another can only coexist ` +

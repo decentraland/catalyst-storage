@@ -1096,6 +1096,116 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
+  describe('when a NESTED id needs a directory under a foreign file', () => {
+    // The immediate-parent case and the recursive-mkdir case are different branches, and only the first was
+    // classified. `statOccupant` collapses an ancestor ENOTDIR to "absent", so a nested id took the
+    // `mkdir(..., { recursive: true })` path, failed ENOTDIR there, and was reported as a bad content id —
+    // sending a service to 400 over a valid id and hiding the operator action that would fix the tree.
+    const shardOfId = (id: string): string => createHash('sha1').update(id).digest('hex').substring(0, 4)
+    let storage: IContentStorageComponent
+    let storageRoot: string
+    const nestedId = 'some/child'
+
+    beforeEach(async () => {
+      storageRoot = mkdtempSync(path.join(os.tmpdir(), 'nested-foreign-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        storageRoot
+      )
+      // A foreign file where the SHARD belongs, so the obstruction is two levels above the id's own parent.
+      await nodeFs.writeFile(path.join(storageRoot, shardOfId(nestedId)), 'foreign')
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    it('should refuse the store as a storage fault, not as a bad content id', async () => {
+      const failure = await storage.storeStream(nestedId, bufferToStream(Buffer.from('x'))).then(
+        () => undefined,
+        (error) => error
+      )
+
+      expect(failure).toBeDefined()
+      expect(failure).not.toBeInstanceOf(PathNotContainedError)
+    })
+
+    it('should name the obstructing path', async () => {
+      await expect(storage.storeStream(nestedId, bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /is not a directory and is not content any id resolves to/
+      )
+    })
+  })
+
+  describe('when a nested id needs a directory under ANOTHER ID content', () => {
+    // The counterpart, so the recursive-mkdir branch keeps the typed class where the obstruction really is a
+    // prefix collision: `<root>/a` is exactly where the id `a` lives, and `a/b/c` asks for a directory there.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'nested-content-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      await storage.storeStream('a', bufferToStream(Buffer.from('content')))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should refuse the store with the typed error', async () => {
+      await expect(storage.storeStream('a/b/c', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    })
+  })
+
+  describe('when a foreign file is named like the reserved directory plus the compressed suffix', () => {
+    // `<root>/.tmp-writes.gzip` is not inside the reserved directory, so it is enumerable — but the id it
+    // would stand for is `.tmp-writes`, whose RAW path IS the reserved directory, which every point lookup
+    // refuses. Checking only the `.gzip` path for containment accepted it and enumeration reported an id
+    // nothing could serve.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+    let listed: string[]
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'reserved-gzip-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      await nodeFs.writeFile(path.join(flatRoot, '.tmp-writes.gzip'), 'foreign')
+      await storage.storeStream('real', bufferToStream(Buffer.from('x')))
+      listed = []
+      for await (const id of storage.allFileIds()) listed.push(id)
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should not enumerate the reserved id', () => {
+      expect(listed).not.toContain('.tmp-writes')
+    })
+
+    it('should still enumerate the real content', () => {
+      expect(listed).toEqual(['real'])
+    })
+
+    it('should agree with the point lookup, which refuses that id', async () => {
+      await expect(storage.exist('.tmp-writes')).rejects.toBeInstanceOf(PathNotContainedError)
+    })
+  })
+
   describe('when a regular file occupies a path that IS another id content', () => {
     // The other side of the same test, so the two classes cannot be conflated: in flat mode `<root>/a` is
     // exactly where the id `a` lives, so `a/b` really is a prefix collision — absent on a read, and a typed
