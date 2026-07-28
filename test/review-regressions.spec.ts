@@ -1638,6 +1638,139 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       })
     })
 
+    describe('and a store of the prefix id ITSELF races the nested one', () => {
+      // Preflight values do not survive a wait. `ensureDirectoryFor` probed what occupies the directory before
+      // taking the prefix locks and then branched on that value inside them, so a nested store that saw
+      // `absent`, queued behind a raw store of `a` committing under the same lock, and then ran `mkdir` over the
+      // file it had just published surfaced a bare EEXIST. And a raw commit never re-checked its own target, so
+      // the mirror image — a nested store making `<root>/a` a directory between the raw store's preflight and
+      // its commit — surfaced a bare EISDIR. Both are conflicts the preflights report as typed refusals, so a
+      // service saw 500-and-retry-forever for an id that can never succeed.
+      let racedRoot: string
+      let racedStorage: IContentStorageComponent
+
+      afterEach(async () => {
+        await racedStorage.stop?.()
+        rmSync(racedRoot, { recursive: true, force: true })
+      })
+
+      describe('and the raw store of the prefix commits first, holding the lock', () => {
+        let nestedOutcome: string
+
+        beforeEach(async () => {
+          racedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-stale-'))
+          let releaseCommit: () => void = () => {}
+          let commitReached: () => void = () => {}
+          const reached = new Promise<void>((resolve) => {
+            commitReached = resolve
+          })
+          const base = createFsComponent()
+          const gatedFs: IFileSystemComponent = {
+            ...base,
+            rename: (async (from: any, to: any) => {
+              // The raw commit of `a`, inside the path lock the nested store needs for its mkdir.
+              if (String(to) === path.join(racedRoot, 'a')) {
+                commitReached()
+                await new Promise<void>((resolve) => {
+                  releaseCommit = resolve
+                })
+              }
+              return base.rename(from, to)
+            }) as any
+          }
+          racedStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: gatedFs, logs: await createLogComponent({}) },
+            racedRoot,
+            { disablePrefixHash: true }
+          )
+          const raw = racedStorage.storeStream('a', bufferToStream(Buffer.from('RAW'))).catch(() => undefined)
+          await reached
+          const nested = racedStorage
+            .storeStream('a/b', bufferToStream(Buffer.from('nested')))
+            .then(() => 'resolved')
+            .catch((err) => err.constructor.name)
+          await new Promise((resolve) => setTimeout(resolve, 80))
+          releaseCommit()
+          await raw
+          nestedOutcome = await nested
+        })
+
+        it('should refuse the nested store with the typed error, not a raw EEXIST', () => {
+          expect(nestedOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should have stored the prefix id itself', async () => {
+          await expect(racedStorage.exist('a')).resolves.toBe(true)
+        })
+      })
+
+      describe('and the nested store lands between the raw preflight and its commit', () => {
+        let rawOutcome: string
+
+        beforeEach(async () => {
+          racedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-late-'))
+          racedStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: createFsComponent(), logs: await createLogComponent({}) },
+            racedRoot,
+            { disablePrefixHash: true }
+          )
+          // Stalls after its first chunk, holding the raw store between its preflight and its commit.
+          const stalled = new PassThrough()
+          stalled.write(Buffer.from('RA'))
+          const raw = racedStorage
+            .storeStream('a', stalled)
+            .then(() => 'resolved')
+            .catch((err) => err.constructor.name)
+          await new Promise((resolve) => setTimeout(resolve, 40))
+          await racedStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))
+          stalled.end(Buffer.from('W'))
+          rawOutcome = await raw
+        })
+
+        it('should refuse the raw store with the typed error, not a raw EISDIR', () => {
+          expect(rawOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should keep the nested id that won', async () => {
+          await expect(racedStorage.exist('a/b')).resolves.toBe(true)
+        })
+      })
+
+      describe('and the nested store claims the COMPRESSED target instead', () => {
+        // The same window on the other commit target: `a.gzip/x` is a legal id, so `<root>/a.gzip` can become a
+        // directory while a compressed store of `a` is consuming its source. The gzip commit's re-probe covers
+        // the RAW path, so this one is caught by classifying the commit's own failure.
+        let compressedOutcome: string
+
+        beforeEach(async () => {
+          racedRoot = mkdtempSync(path.join(os.tmpdir(), 'gzip-target-late-'))
+          racedStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: createFsComponent(), logs: await createLogComponent({}) },
+            racedRoot,
+            { disablePrefixHash: true }
+          )
+          const stalled = new PassThrough()
+          stalled.write(Buffer.alloc(3000, 'A'))
+          const compressed = racedStorage
+            .storeStreamAndCompress('a', stalled)
+            .then(() => 'resolved')
+            .catch((err) => err.constructor.name)
+          await new Promise((resolve) => setTimeout(resolve, 40))
+          await racedStorage.storeStream('a.gzip/x', bufferToStream(Buffer.from('nested')))
+          stalled.end(Buffer.alloc(3000, 'A'))
+          compressedOutcome = await compressed
+        })
+
+        it('should refuse the compressed store with the typed error, not a raw EISDIR', () => {
+          expect(compressedOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should keep the id that claimed the compressed path', async () => {
+          await expect(racedStorage.exist('a.gzip/x')).resolves.toBe(true)
+        })
+      })
+    })
+
     describe('and repeated stores go into a directory the store path has already checked', () => {
       // The check is per DIRECTORY, not per store: once the store path has asked, repeat stores skip it and the
       // write path costs exactly what it did before. Only PASSES are cached, so a refusal is re-decided every

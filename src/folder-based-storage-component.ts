@@ -993,54 +993,61 @@ export async function createFolderBasedFileSystemContentStorage(
       // hold a file and a directory at one path, so `a/b` is genuinely unstorable here — and saying so with
       // the typed error every other unstorable-name rule uses means a service mapping it to 400 stops
       // answering 500, and stops retrying an id that can never succeed.
-      const occupant = await statOccupant(dirname)
-      // A REGULAR FILE here is a property of the NAME, so it is a bad request: nested ids are legal, so
-      // storing `a` and then `a/b` asks this to create a directory exactly where another id's content already
-      // is, and a filesystem cannot hold both at one path. `PathNotContainedError` is the class every other
-      // unstorable-name rule uses, so a service mapping it to 400 stops answering 500 and stops retrying an
-      // id that can never succeed. (`existPath` could not see this at all: F_OK|R_OK passes for a file, so
-      // `mkdir` was skipped and the failure surfaced several awaits later as a bare `ENOTDIR` from the commit
-      // rename.)
-      if (occupant === 'file') {
-        // WHICH class this is depends on whether any id owns that path, exactly as the read side decides. A
-        // file at a path this storage would use for content is another id's content, so the caller's id is
-        // genuinely unstorable and the typed error is right. A file anywhere else — most reachably where a
-        // SHARD belongs — is foreign state in this storage's own tree, and reporting it as a bad content id
-        // sent a service to 400 for something no id of the caller's could ever fix.
-        if (await isCanonicalContentPath(dirname)) {
-          throw new PathNotContainedError(
-            `The id cannot be stored: its parent path is already occupied by another id's content, and a ` +
-              `filesystem cannot hold both a file and a directory at ${JSON.stringify(dirname)}. Ids where one ` +
-              `is a path prefix of another can only coexist when hash prefixes put them in different shards.`
+      // PROBED INSIDE THE LOCKS, not before them. Every transition this classifies is one a concurrent store
+      // performs while holding the very lock acquired below — a raw store of `a` commits under the path lock of
+      // `<root>/a`, which is this directory — so a value read before the wait is a value that can already be
+      // wrong by the time it is used. It was: a nested store that probed `absent`, queued behind that raw
+      // commit and then ran `mkdir` on the file it had just published surfaced a bare EEXIST, in place of the
+      // typed refusal every other unstorable-name rule gives. Read under the locks, the answer cannot go stale
+      // inside the section that acts on it.
+      await withPrefixLocks(prefixLevels(dirname), async () => {
+        const occupant = await statOccupant(dirname)
+        // A REGULAR FILE here is a property of the NAME, so it is a bad request: nested ids are legal, so
+        // storing `a` and then `a/b` asks this to create a directory exactly where another id's content already
+        // is, and a filesystem cannot hold both at one path. `PathNotContainedError` is the class every other
+        // unstorable-name rule uses, so a service mapping it to 400 stops answering 500 and stops retrying an
+        // id that can never succeed. (`existPath` could not see this at all: F_OK|R_OK passes for a file, so
+        // `mkdir` was skipped and the failure surfaced several awaits later as a bare `ENOTDIR` from the commit
+        // rename.)
+        if (occupant === 'file') {
+          // WHICH class this is depends on whether any id owns that path, exactly as the read side decides. A
+          // file at a path this storage would use for content is another id's content, so the caller's id is
+          // genuinely unstorable and the typed error is right. A file anywhere else — most reachably where a
+          // SHARD belongs — is foreign state in this storage's own tree, and reporting it as a bad content id
+          // sent a service to 400 for something no id of the caller's could ever fix.
+          if (await isCanonicalContentPath(dirname)) {
+            throw new PathNotContainedError(
+              `The id cannot be stored: its parent path is already occupied by another id's content, and a ` +
+                `filesystem cannot hold both a file and a directory at ${JSON.stringify(dirname)}. Ids where one ` +
+                `is a path prefix of another can only coexist when hash prefixes put them in different shards.`
+            )
+          }
+          throw new Error(
+            `Cannot store into ${JSON.stringify(dirname)}: a regular file occupies a path no content id resolves ` +
+              `to, so it is not another id's content and this storage cannot create the directory the id needs. ` +
+              `Remove whatever occupies it.`
           )
         }
-        throw new Error(
-          `Cannot store into ${JSON.stringify(dirname)}: a regular file occupies a path no content id resolves ` +
-            `to, so it is not another id's content and this storage cannot create the directory the id needs. ` +
-            `Remove whatever occupies it.`
-        )
-      }
-      // A FIFO, socket or device node is NOT a name problem — no id can put one there. It is something
-      // foreign in the storage's own tree, i.e. a storage fault, and calling it a bad request would tell the
-      // caller to fix an id that is perfectly valid.
-      if (occupant === 'other') {
-        throw new Error(
-          `Cannot store into ${JSON.stringify(dirname)}: the path exists but is neither a directory nor a ` +
-            `regular file, so this storage cannot create the directory the id needs. Remove whatever occupies it.`
-        )
-      }
-      // BOTH remaining occupants, because the rule is about the STATE and not about who created it. Gated on
-      // the mkdir, it missed the case where `<root>/a` is ALREADY a directory beside `a.gzip` — reachable from a
-      // tree an older version wrote (this store used to be allowed), from versions that created directories on
-      // read, or from operator state — which is the very state the check exists to keep out.
-      // CHECKED AND CREATED UNDER ONE LOCK, because two preflights that each passed are not enough: a
-      // compressed store of `a` probes its commit targets while `<root>/a` is free, blocks for as long as
-      // consuming and compressing its source takes, and commits `a.gzip` afterwards — so a nested store that
-      // checked and created `<root>/a` inside that window produced exactly the unrangeable pair both checks
-      // exist to prevent, each having been correct when it ran. The lock is the compressed store's OWN: it
-      // commits under the path lock of `<root>/a`, which is the directory created here, and it re-probes that
-      // path under it (see the gzip commit). One of the two now always loses.
-      await withPrefixLocks(prefixLevels(dirname), async () => {
+        // A FIFO, socket or device node is NOT a name problem — no id can put one there. It is something
+        // foreign in the storage's own tree, i.e. a storage fault, and calling it a bad request would tell the
+        // caller to fix an id that is perfectly valid.
+        if (occupant === 'other') {
+          throw new Error(
+            `Cannot store into ${JSON.stringify(dirname)}: the path exists but is neither a directory nor a ` +
+              `regular file, so this storage cannot create the directory the id needs. Remove whatever occupies it.`
+          )
+        }
+        // BOTH remaining occupants, because the rule is about the STATE and not about who created it. Gated on
+        // the mkdir, it missed the case where `<root>/a` is ALREADY a directory beside `a.gzip` — reachable from a
+        // tree an older version wrote (this store used to be allowed), from versions that created directories on
+        // read, or from operator state — which is the very state the check exists to keep out.
+        // CHECKED AND CREATED UNDER ONE LOCK, because two preflights that each passed are not enough: a
+        // compressed store of `a` probes its commit targets while `<root>/a` is free, blocks for as long as
+        // consuming and compressing its source takes, and commits `a.gzip` afterwards — so a nested store that
+        // checked and created `<root>/a` inside that window produced exactly the unrangeable pair both checks
+        // exist to prevent, each having been correct when it ran. The lock is the compressed store's OWN: it
+        // commits under the path lock of `<root>/a`, which is the directory created here, and it re-probes that
+        // path under it (see the gzip commit). One of the two now always loses.
         await assertNoCompressedIdOwnsChain(dirname)
         if (occupant !== 'absent') return
         try {
@@ -1269,6 +1276,41 @@ export async function createFolderBasedFileSystemContentStorage(
    * create it, so it is a fault. This is not a substitute for the commit's own failure handling: the state can
    * appear between this check and the rename, and the commit still reports that honestly.
    */
+  /**
+   * Turns a commit's `EISDIR` into the typed prefix collision it actually is.
+   *
+   * Both commit targets are checked before anything is staged, but a store spends the whole of consuming and
+   * compressing its source between that check and its commit, and a nested store can claim either path inside
+   * that window: `a/b` makes `<root>/a` a directory, `a.gzip/x` makes `<root>/a.gzip` one. The rename then fails
+   * with a bare `EISDIR`, so a service answered 500 and retried an id that can never succeed, where the same
+   * conflict found by the preflight gives a 400.
+   *
+   * CLASSIFIED FROM THE FAILURE rather than pre-probed under the lock, which is the cheaper half of the same
+   * guarantee: renaming onto a directory cannot succeed, so the commit reports the conflict by itself and this
+   * only has to name it — no syscall on the success path. The gzip commit's re-probe of the RAW path is the case
+   * that genuinely needs one, because renaming onto `<id>.gzip` succeeds whatever occupies `<id>`.
+   */
+  async function classifyCommitFailure(err: unknown, id: string, target: string): Promise<never> {
+    if ((err as { code?: string } | null)?.code === 'EISDIR') {
+      let occupant: Awaited<ReturnType<typeof statOccupant>> | undefined
+      try {
+        occupant = await statOccupant(target)
+      } catch {
+        // Whatever went wrong here, the ORIGINAL failure is the one the caller needs.
+        throw err
+      }
+      if (occupant === 'directory') {
+        rememberDirectory(target)
+        throw new PathNotContainedError(
+          `The id cannot be stored: ${JSON.stringify(target)} became a directory while this store was in ` +
+            `flight, so another id nested under the path this one commits to. Ids where one is a path prefix ` +
+            `of another can only coexist when hash prefixes put them in different shards: ${JSON.stringify(id)}`
+        )
+      }
+    }
+    throw err
+  }
+
   async function assertCommitTargetsWritable(id: string, filePath: string, includeGzipPath: boolean): Promise<void> {
     const targets = includeGzipPath ? [filePath, gzipPathOf(filePath)] : [filePath]
     for (const target of targets) {
@@ -1491,16 +1533,18 @@ export async function createFolderBasedFileSystemContentStorage(
             // The raw and its .gzip are one versioned object: a gzip left from a previous version
             // would be preferred by retrieve() and serve stale bytes over the content just stored
             // (intent-journaled so even a crash mid-cleanup cannot leave the stale gzip preferred).
-            await journal.commitRepresentation(
-              'raw',
-              id,
-              tempPath,
-              filePath,
-              gzipPathOf(filePath),
-              rename,
-              signal,
-              () => (committed = true)
-            )
+            await journal
+              .commitRepresentation(
+                'raw',
+                id,
+                tempPath,
+                filePath,
+                gzipPathOf(filePath),
+                rename,
+                signal,
+                () => (committed = true)
+              )
+              .catch((err) => classifyCommitFailure(err, id, filePath))
           } finally {
             // Gated on the rename having LANDED, not on reaching this line. The commit still needs
             // this bookkeeping when it fails AFTER the rename (a failed counterpart cleanup), but it
@@ -2304,34 +2348,40 @@ export async function createFolderBasedFileSystemContentStorage(
                   `Remove whatever occupies it.`
               )
             }
-            await journal.commitRepresentation(
-              'gzip',
-              id,
-              stagedGzipPath,
-              gzipPathOf(filePath),
-              filePath,
-              rename,
-              signal,
-              onCommitted,
-              // For a GZIP commit the raw path is the COUNTERPART, removed by an unlink after the
-              // rename rather than overwritten by it — so only its proven removal means the cache entry
-              // describing it no longer describes a file.
-              () => (rawPathReleased = true)
-            )
+            await journal
+              .commitRepresentation(
+                'gzip',
+                id,
+                stagedGzipPath,
+                gzipPathOf(filePath),
+                filePath,
+                rename,
+                signal,
+                onCommitted,
+                // For a GZIP commit the raw path is the COUNTERPART, removed by an unlink after the
+                // rename rather than overwritten by it — so only its proven removal means the cache entry
+                // describing it no longer describes a file.
+                () => (rawPathReleased = true)
+              )
+              // The re-probe above covers the RAW path; this covers this commit's OWN target, which a store of
+              // `<id>.gzip/x` can turn into a directory in the same window.
+              .catch((err) => classifyCommitFailure(err, id, gzipPathOf(filePath)))
           } else {
-            await journal.commitRepresentation(
-              'raw',
-              id,
-              stagedRawPath,
-              filePath,
-              gzipPathOf(filePath),
-              rename,
-              signal,
-              onCommitted,
-              // A RAW commit renames ONTO the raw path, so the rename itself is what invalidates the
-              // entry; the counterpart here is the gzip, which the cache does not track.
-              () => (rawPathReleased = true)
-            )
+            await journal
+              .commitRepresentation(
+                'raw',
+                id,
+                stagedRawPath,
+                filePath,
+                gzipPathOf(filePath),
+                rename,
+                signal,
+                onCommitted,
+                // A RAW commit renames ONTO the raw path, so the rename itself is what invalidates the
+                // entry; the counterpart here is the gzip, which the cache does not track.
+                () => (rawPathReleased = true)
+              )
+              .catch((err) => classifyCommitFailure(err, id, filePath))
           }
         } finally {
           // `forget` drops tracking WITHOUT unlinking, so it is only correct once the file it tracked is
