@@ -970,7 +970,7 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       if (storageRoot) rmSync(storageRoot, { recursive: true, force: true })
     })
 
-    describe('and it is the deepest observed ancestor, above the id own parent', () => {
+    describe('and the walk reaches it above a path that is merely missing', () => {
       beforeEach(async () => {
         storageRoot = mkdtempSync(path.join(os.tmpdir(), 'unreadable-ancestor-'))
         unreadable = ''
@@ -979,13 +979,14 @@ describe('when a shard directory is destroyed underneath a running instance', ()
           storageRoot,
           { disablePrefixHash: true }
         )
-        // Observes `<root>/a`, so a read of `a/b/c` looks there rather than at its own parent `<root>/a/b`.
-        await storage.storeStream('a/b', bufferToStream(Buffer.from('x')))
-        unreadable = path.join(storageRoot, 'a')
+        // `<root>/x` becomes a real directory, and `<root>/x/y` is simply not there — so the walk steps past the
+        // missing level and asks about `<root>/x`, which is the level that cannot be read.
+        await storage.storeStream('x/other', bufferToStream(Buffer.from('x')))
+        unreadable = path.join(storageRoot, 'x')
       })
 
       it('should reject rather than report the id absent', async () => {
-        await expect(storage.exist('a/b/c')).rejects.toBeDefined()
+        await expect(storage.exist('x/y/z')).rejects.toBeDefined()
       })
     })
 
@@ -1040,6 +1041,94 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
+  describe('when a regular file occupies a SHARD path in hash-prefix mode', () => {
+    // A file where a shard belongs is foreign to the layout: content lives at `<root>/<shard>/<id>`, so nothing
+    // resolves to `<root>/<shard>` and this storage would never put anything there. Treating it as another id's
+    // content made every id in that shard — 1/65,536 of the keyspace — read as an empty node, and told a store
+    // its id was bad when the id was fine and the tree was not.
+    let storage: IContentStorageComponent
+    let storageRoot: string
+    const idInShard = 'some-id'
+
+    beforeEach(async () => {
+      storageRoot = mkdtempSync(path.join(os.tmpdir(), 'file-at-shard-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        storageRoot
+      )
+      const shard = createHash('sha1').update(idInShard).digest('hex').substring(0, 4)
+      await nodeFs.writeFile(path.join(storageRoot, shard), 'foreign file where a shard belongs')
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    it('should reject exist rather than report the id absent', async () => {
+      await expect(storage.exist(idInShard)).rejects.toBeDefined()
+    })
+
+    it('should reject fileInfo for the same reason', async () => {
+      await expect(storage.fileInfo(idInShard)).rejects.toBeDefined()
+    })
+
+    it('should reject retrieve for the same reason', async () => {
+      await expect(storage.retrieve(idInShard)).rejects.toBeDefined()
+    })
+
+    it('should refuse a store as a storage fault, NOT as a bad content id', async () => {
+      // The class matters: a service maps the typed error to 400 and stops retrying, which is wrong when the
+      // id is valid and an operator has to clear the obstruction.
+      const failure = await storage.storeStream(idInShard, bufferToStream(Buffer.from('x'))).then(
+        () => undefined,
+        (error) => error
+      )
+
+      expect(failure).toBeDefined()
+      expect(failure).not.toBeInstanceOf(PathNotContainedError)
+    })
+
+    it('should say what is wrong with the tree', async () => {
+      await expect(storage.storeStream(idInShard, bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /no content id resolves to/
+      )
+    })
+  })
+
+  describe('when a regular file occupies a path that IS another id content', () => {
+    // The other side of the same test, so the two classes cannot be conflated: in flat mode `<root>/a` is
+    // exactly where the id `a` lives, so `a/b` really is a prefix collision — absent on a read, and a typed
+    // rejection on a store.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'file-at-content-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      await storage.storeStream('a', bufferToStream(Buffer.from('content')))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should report the nested id as absent', async () => {
+      expect(await storage.exist('a/b')).toBe(false)
+    })
+
+    it('should refuse a store with the typed error', async () => {
+      await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    })
+  })
+
   describe('when something that is neither a file nor a directory occupies a path', () => {
     // A fifo, socket or device node is FOREIGN to this storage: no id can create one, so it is a storage
     // fault rather than a bad request — the distinction the typed error draws everywhere else.
@@ -1079,6 +1168,13 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     it('should not report it as content on a read', async () => {
       if (!madeFifo) return
       expect(await storage.exist('pipe')).toBe(false)
+    })
+
+    it('should reject a read NESTED under it rather than reporting absence', async () => {
+      if (!madeFifo) return
+      // Nothing can be created beneath it and nothing serves it, so — like a file no id resolves to — it is
+      // foreign state in this storage's own tree rather than a prefix another id legitimately owns.
+      await expect(storage.exist('pipe/child')).rejects.toBeDefined()
     })
   })
 

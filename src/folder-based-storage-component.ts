@@ -411,84 +411,76 @@ export async function createFolderBasedFileSystemContentStorage(
   let tempFileSweep: Promise<void> = Promise.resolve()
 
   /**
-   * The deepest path on `from`'s ancestor chain, inclusive, that this instance has observed to be a directory.
-   *
-   * The root always qualifies, so this always answers. Pure string work.
-   */
-  function deepestObservedOnChain(from: string): string {
-    let candidate = from
-    for (;;) {
-      if (wasObserved(candidate)) return candidate
-      if (candidate === root) return root
-      const parent = path.dirname(candidate)
-      // Defensive: `resolveFilePath` guarantees containment, so the root is always reached first.
-      if (parent === candidate || parent.length < root.length) return root
-      candidate = parent
-    }
-  }
-
-  /**
    * Why a read found nothing at `filePath`: the path whose loss makes this a FAULT, or `undefined` when the id
    * is provably absent.
    *
-   * DERIVED FROM THE DISK on each call rather than from remembered damage. A recorded damage set was wrong
-   * four different reachable ways — consumed by its own report, keyed on one path while the break was at
-   * another, outliving a store that claimed the path, and stale for that path's descendants — and all four are
-   * questions about the CURRENT tree, which can simply be asked.
+   * DERIVED FROM THE DISK on each call rather than from remembered damage. A recorded damage set was wrong four
+   * different reachable ways — consumed by its own report, keyed on one path while the break was at another,
+   * outliving a store that claimed the path, and stale for that path's descendants — and all four are questions
+   * about the CURRENT tree, which can simply be asked.
    *
-   * Only an OBSERVED path being broken can be a fault, and the DEEPEST observed one settles it: if that is
-   * still a directory then so is every path above it, so nothing this instance owns is broken. Healthy trees
-   * therefore cost ONE probe whatever the id's depth. Only a genuinely broken one pays the walk above it,
-   * which looks for the single thing that turns a fault back into absence — a CONTENT path holding a regular
-   * file. Nothing can exist beneath a file, so the id is unstorable (`ensureDirectoryFor` refuses it, `delete`
-   * resolves for it) and absence is what makes those three agree. What counts as a content path is decided by
-   * `isCanonicalContentPath`, not by depth: a file only supersedes if this storage would itself have put
-   * content there.
+   * Walks up from the id's parent to the first real directory, and what it meets on the way decides:
+   *
+   * - a regular file at a path this storage would ITSELF have used for content -> ABSENT. Nothing can exist
+   *   beneath a file, so the id is unstorable (`ensureDirectoryFor` refuses it, `delete` resolves for it), and
+   *   absence is what makes those three agree.
+   * - a regular file ANYWHERE ELSE, or a fifo/socket/device -> FAULT. It is foreign to the layout: no id
+   *   resolves to it, so calling it content would report every id beneath it absent on the strength of
+   *   something this storage cannot serve. A file where a SHARD belongs is the reachable case, and it makes
+   *   1/65,536 of the keyspace read as an empty node.
+   * - a directory -> the paths below it are genuinely missing, so the id is absent unless one of them is one
+   *   this instance observed, which means a tree it owns was destroyed.
+   *
+   * A "deepest observed ancestor" shortcut was tried here and REVERTED. It settled the answer in one probe by
+   * reasoning that only an observed path being broken can be a fault — true for MISSING paths, but it skipped
+   * the chain entirely when that ancestor was intact, and so never asked what was between. A foreign file at a
+   * shard path was then reported as absence, contradicting this module's own rule. The walk costs one `stat`
+   * per level only up to the first intact directory: unchanged for the default shape (one level from a shard to
+   * the root), and paid by flat-mode nested ids in a subtree nothing has stored into.
    */
   async function faultBehindAbsence(
     filePath: string,
     /** What the caller's own probe already found at `path.dirname(filePath)`, so it is never re-stated. */
     parentOccupant: Awaited<ReturnType<typeof statOccupant>>
   ): Promise<string | undefined> {
-    const dirname = path.dirname(filePath)
-    const observed = deepestObservedOnChain(dirname)
-    let occupant: Awaited<ReturnType<typeof statOccupant>>
-    if (observed === dirname) {
-      occupant = parentOccupant
-    } else {
-      try {
-        occupant = await statOccupant(observed)
-      } catch {
-        // Unreadable, so absence cannot be proven. Fail closed.
-        return observed
-      }
-    }
-    if (occupant === 'directory') return undefined
-
-    // An observed directory is broken. Walk up from it for a content file that superseded the path; anything
-    // proven not to be a directory also leaves the mkdir-skip cache, so the next write recreates the chain.
-    let candidate = observed
+    const missing: string[] = []
+    let candidate = path.dirname(filePath)
+    let occupant = parentOccupant
     for (;;) {
+      if (occupant === 'directory') break
+      // Anything proven not to be a directory leaves the mkdir-skip cache, so the next write recreates the
+      // chain on its first attempt. Done here because the walk knows the whole broken chain.
       forgetDirectory(candidate)
-      if (occupant === 'file' && (await isCanonicalContentPath(candidate))) {
-        // Absence is the answer, but the transition destroyed whatever was under it, so say so once.
-        if (wasObserved(candidate)) {
-          logger.warn(`${JSON.stringify(candidate)} was observed as a directory and now holds content`)
+      if (occupant === 'file') {
+        if (await isCanonicalContentPath(candidate)) {
+          // Absence is the answer, but if this replaced a directory we had seen, that destroyed whatever was
+          // under it, so say so once.
+          if (wasObserved(candidate)) {
+            logger.warn(`${JSON.stringify(candidate)} was observed as a directory and now holds content`)
+          }
+          return undefined
         }
-        return undefined
+        // A file no id resolves to. Foreign state inside this storage's own tree, so it is reported whether or
+        // not anything here was ever observed: nothing can be stored beneath it and nothing serves it.
+        return candidate
       }
-      if (candidate === root) return observed
+      // Neither a directory, nor a file, nor absent: a fifo, socket or device node. No id can create one.
+      if (occupant === 'other') return candidate
+      missing.push(candidate)
+      if (candidate === root) break
       const parent = path.dirname(candidate)
-      // Defensive, as above.
-      if (parent === candidate || parent.length < root.length) return observed
+      // Defensive: `resolveFilePath` guarantees containment, so the root always terminates the walk first.
+      if (parent === candidate || parent.length < root.length) break
       candidate = parent
       try {
         occupant = await statOccupant(candidate)
       } catch {
-        return observed
+        // Unreadable, so nothing here can be proven either way. Fail closed: the alternative is reporting
+        // content absent on no evidence.
+        return candidate
       }
-      if (occupant === 'directory') return observed
     }
+    return missing.find(wasObserved)
   }
 
   /**
@@ -813,10 +805,22 @@ export async function createFolderBasedFileSystemContentStorage(
       // `mkdir` was skipped and the failure surfaced several awaits later as a bare `ENOTDIR` from the commit
       // rename.)
       if (occupant === 'file') {
-        throw new PathNotContainedError(
-          `The id cannot be stored: its parent path is already occupied by another id's content, and a ` +
-            `filesystem cannot hold both a file and a directory at ${JSON.stringify(dirname)}. Ids where one ` +
-            `is a path prefix of another can only coexist when hash prefixes put them in different shards.`
+        // WHICH class this is depends on whether any id owns that path, exactly as the read side decides. A
+        // file at a path this storage would use for content is another id's content, so the caller's id is
+        // genuinely unstorable and the typed error is right. A file anywhere else — most reachably where a
+        // SHARD belongs — is foreign state in this storage's own tree, and reporting it as a bad content id
+        // sent a service to 400 for something no id of the caller's could ever fix.
+        if (await isCanonicalContentPath(dirname)) {
+          throw new PathNotContainedError(
+            `The id cannot be stored: its parent path is already occupied by another id's content, and a ` +
+              `filesystem cannot hold both a file and a directory at ${JSON.stringify(dirname)}. Ids where one ` +
+              `is a path prefix of another can only coexist when hash prefixes put them in different shards.`
+          )
+        }
+        throw new Error(
+          `Cannot store into ${JSON.stringify(dirname)}: a regular file occupies a path no content id resolves ` +
+            `to, so it is not another id's content and this storage cannot create the directory the id needs. ` +
+            `Remove whatever occupies it.`
         )
       }
       // A FIFO, socket or device node is NOT a name problem — no id can put one there. It is something

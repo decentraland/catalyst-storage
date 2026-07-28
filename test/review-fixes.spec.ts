@@ -1,5 +1,5 @@
 import { createHash } from 'crypto'
-import { mkdtempSync, rmSync, promises as nodeFsPromises } from 'fs'
+import { mkdtempSync, readdirSync, rmSync, promises as nodeFsPromises } from 'fs'
 import os from 'os'
 import path from 'path'
 import { Readable } from 'stream'
@@ -690,6 +690,48 @@ describe('when allFileIds walks a directory', () => {
       const { listed } = await walkWithDirectories(names, [], ['a.gzip'])
 
       expect(listed.filter((id) => id === 'a')).toEqual(['a', 'a'])
+    })
+  })
+
+  describe('and the tree is deeply nested', () => {
+    it('should hold no extra directory handles while it descends', async () => {
+      // The streaming branch descends while its own `opendir` handle is open, which bounds retained NAMES but
+      // holds one handle per ancestor that took that branch. What bounds THAT is not nesting depth: only a
+      // directory past the buffered cap streams, so a deep chain of small directories — which is what a deep
+      // tree actually looks like — holds none at all. Pinned here so the tradeoff cannot silently become one
+      // handle per level.
+      const root = mkdtempSync(path.join(os.tmpdir(), 'enum-deep-'))
+      let cursor = root
+      for (let level = 0; level < 60; level++) {
+        cursor = path.join(cursor, 'd')
+        await nodeFsPromises.mkdir(cursor)
+        await nodeFsPromises.writeFile(path.join(cursor, 'f'), 'x')
+      }
+      const storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        root,
+        { disablePrefixHash: true }
+      )
+      const openDescriptors = (): number => {
+        try {
+          return readdirSync('/dev/fd').length
+        } catch {
+          return -1
+        }
+      }
+      const before = openDescriptors()
+      let peak = 0
+      let yielded = 0
+      for await (const _id of storage.allFileIds()) {
+        yielded++
+        peak = Math.max(peak, openDescriptors() - before)
+      }
+      await storage.stop?.()
+      rmSync(root, { recursive: true, force: true })
+
+      expect(yielded).toBe(60)
+      // `/dev/fd` is unavailable on some platforms; skip the bound rather than assert on -1.
+      if (before > 0) expect(peak).toBeLessThanOrEqual(1)
     })
   })
 
