@@ -1,4 +1,5 @@
 import { createHash } from 'crypto'
+import type { Dirent } from 'fs'
 import path from 'path'
 import { pipeline, Readable, Transform, Writable } from 'stream'
 import { promisify } from 'util'
@@ -15,6 +16,26 @@ import { assertStorableContentId, assertValidContentId, GZIP_EXTENSION, gzipPath
 import { destroyAllQuietly, destroyQuietly } from './stream-teardown'
 
 const pipe = promisify(pipeline)
+
+/**
+ * A directory entry no id can have stored: a fifo, socket or device node.
+ *
+ * Enumeration must only ever yield ids the point lookups accept, and those now REJECT these paths as storage
+ * faults, so yielding one would hand a GC sweep an id whose `exist()` throws — failing the whole batch on
+ * every retry, forever, which is the hazard `idForEntry` already skips foreign names to avoid.
+ *
+ * Identified POSITIVELY rather than as "not a regular file", so an entry whose type the listing does not
+ * report keeps being enumerated exactly as before instead of silently vanishing from the listing. Three ways
+ * that happens, all of which must stay enumerable: `readdir` may answer UNKNOWN, a symlink is reported as the
+ * link, and `fs` is a COMPONENT — an adapter is free to yield entries that answer only `isDirectory()`, which
+ * is why each predicate is checked for before it is called rather than assumed from the `Dirent` type. The
+ * residual gap is a symlink TO one of these, which stays enumerable while reads of it fault; planting one
+ * takes deliberate foreign action, and closing it would cost a `stat` per entry on every enumeration.
+ */
+const FOREIGN_ENTRY_PREDICATES = ['isFIFO', 'isSocket', 'isCharacterDevice', 'isBlockDevice'] as const
+
+const isForeignEntry = (entry: Dirent): boolean =>
+  FOREIGN_ENTRY_PREDICATES.some((predicate) => typeof entry[predicate] === 'function' && entry[predicate]())
 
 /**
  * How many entries of one directory `allFileIds()` holds in memory — the buffered listing that lets it
@@ -505,6 +526,23 @@ export async function createFolderBasedFileSystemContentStorage(
    * looks like 404" behaviour right back into the read path this contract exists to fix. Same rule as
    * `existsForInvariant`; the difference is only that recovery paths need the boolean.
    */
+  /**
+   * A fault an earlier representation probe found and left for the LAST probe of the same id to raise.
+   *
+   * A foreign node at one representation says nothing about the other: `<id>.gzip` being a socket does not
+   * stop the raw file beside it from serving. So the probe that meets one records it here and answers "not
+   * this representation", exactly as it does for a plain absence, and the fault surfaces only if no
+   * representation served the id. Reporting it any earlier would answer a storage fault for content this
+   * storage can read, which is the same bug as the absence answer it replaces, pointing the other way.
+   */
+  type DeferredFault = { path?: string }
+
+  const foreignNodeError = (occupiedPath: string): Error =>
+    new Error(
+      `Refusing to report ${JSON.stringify(occupiedPath)} as absent: it exists but is neither a regular file ` +
+        `nor a directory, so no id can have stored it and none can serve it. Remove whatever occupies it.`
+    )
+
   async function statForRead(
     filePath: string,
     /**
@@ -519,8 +557,18 @@ export async function createFolderBasedFileSystemContentStorage(
      * Safe because it only ever DEFERS: whenever every representation is absent, the last probe runs
      * the classification and a damaged shard still rejects instead of being reported empty.
      */
-    deferAbsenceClassification = false
+    deferAbsenceClassification = false,
+    /** Collects a foreign node for the last probe to raise, and carries an earlier probe's into this one. */
+    deferredFault?: DeferredFault
   ): Promise<{ size: number } | undefined> {
+    // Absence is only an ANSWER while nothing else about the id is broken: a foreign node an earlier
+    // representation probe deferred is raised here instead, on the probe that would report the id missing.
+    const absent = (): undefined => {
+      if (!deferAbsenceClassification && deferredFault?.path !== undefined) {
+        throw foreignNodeError(deferredFault.path)
+      }
+      return undefined
+    }
     try {
       const stat = await components.fs.stat(filePath)
       // Successfully statting a file PROVES its parent is an intact directory — nothing can be
@@ -542,8 +590,9 @@ export async function createFolderBasedFileSystemContentStorage(
       // Worse, `delete` then rejected FOREVER ("its raw representation could not be removed"), taking
       // down every GC batch containing that id, and no store could ever fix it.
       //
-      // `allFileIds` already agrees with this: it yields only regular files, so returning `undefined`
-      // here is what makes enumeration and the point lookups answer the same question. Directories are
+      // `allFileIds` agrees with this: it skips directories and foreign nodes alike, so returning
+      // `undefined` here is what makes enumeration and the point lookups answer the same question — it used
+      // to claim that while yielding fifos and sockets as ids. Directories are
       // never removed to make room — destroying something this storage cannot prove it owns is exactly
       // what the reserved-namespace checks refuse to do.
       if (!stat.isFile()) {
@@ -551,8 +600,22 @@ export async function createFolderBasedFileSystemContentStorage(
         // removal is damage for ids nested under it rather than an ordinary miss. Recording only the id's
         // parent above discarded that — a read-only replica that had seen `<root>/d` through `exist('d')`
         // classified a later read of `d/inner` as absent.
-        if (stat.isDirectory()) rememberDirectory(filePath)
-        return undefined
+        if (stat.isDirectory()) {
+          rememberDirectory(filePath)
+          return absent()
+        }
+        // A FIFO, SOCKET OR DEVICE NODE, which unlike a directory is not another id's content either: nothing
+        // this storage writes can produce one (it commits regular files by rename and makes directories by
+        // mkdir), so no id can have stored it and none can serve it. Collapsing it into the directory case
+        // reported a path that is NOT empty as a clean miss, while the ancestor classifier and
+        // `assertCommitTargetsWritable` both already call the same occupant a fault. `retrieve` returning it
+        // would have been worse than the wrong answer: opening a fifo for reading BLOCKS until a writer
+        // appears, so the request would hang rather than fail.
+        if (deferAbsenceClassification && deferredFault) {
+          deferredFault.path ??= filePath
+          return undefined
+        }
+        throw foreignNodeError(filePath)
       }
       return stat
     } catch (err: any) {
@@ -574,7 +637,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // read" branch below and re-threw. `exist`, `fileInfo` and `retrieve` then rejected with a bare errno
       // for an id that is provably absent, `existMultiple` lost the answers for every OTHER id in the batch,
       // and `delete` of the same id resolved — the exact disagreement the allowance above was added to end.
-      if (err?.code === 'ENAMETOOLONG') return undefined
+      if (err?.code === 'ENAMETOOLONG') return absent()
       // A missing file means one of two very different things, and the tree above it decides which: an
       // ordinary miss, or a tree this instance owns having been destroyed underneath it. Reporting the
       // second as absence is the "a broken store looks like an empty node" answer this contract refuses.
@@ -594,13 +657,13 @@ export async function createFolderBasedFileSystemContentStorage(
       }
       if (parentOccupant === 'directory') {
         rememberDirectory(dirname)
-        return undefined
+        return absent()
       }
 
       // Anything else goes to the classifier, which walks the tree rather than consulting remembered damage
       // and drops every broken path from the mkdir-skip cache as it goes.
       const fault = await faultBehindAbsence(filePath, parentOccupant)
-      if (fault === undefined) return undefined
+      if (fault === undefined) return absent()
       logger.warn(`Refusing to report ${filePath} as absent: ${JSON.stringify(fault)} is no longer a directory`)
       throw err
     }
@@ -916,7 +979,9 @@ export async function createFolderBasedFileSystemContentStorage(
     deferAbsenceClassification = false,
     // Pre-resolved canonical raw path, so an operation that already resolved this id does not pay the
     // sha1 and the path validation again (2.5 µs of CPU per resolve).
-    baseFilePath?: string
+    baseFilePath?: string,
+    /** Shared across the probes of ONE `retrieve()`, so a foreign node at either representation surfaces. */
+    deferredFault?: DeferredFault
   ): Promise<ContentItem | undefined> => {
     // Built through `gzipPathOf`, not by appending `'.' + encoding`. The two happened to agree only
     // because the coding token is spelled the same as the suffix, so `GZIP_EXTENSION` bounded the name a
@@ -925,7 +990,7 @@ export async function createFolderBasedFileSystemContentStorage(
     const base = baseFilePath ?? (await resolveFilePath(id))
     const filePath = encoding === 'gzip' ? gzipPathOf(base) : base
 
-    const stat = await statForRead(filePath, deferAbsenceClassification)
+    const stat = await statForRead(filePath, deferAbsenceClassification, deferredFault)
     if (!stat) return undefined
 
     if (range) {
@@ -1457,9 +1522,13 @@ export async function createFolderBasedFileSystemContentStorage(
       // `cache.touch`.
       const baseFilePath = await resolveFilePath(id)
       let contentItem: ContentItem | undefined = undefined
+      // One per call, so the raw probe raises what the gzip probe found rather than answering a 404 next to it.
+      const deferredFault: DeferredFault = {}
       // The gzip probe defers its absence classification to the raw probe below, which asks the
       // question once for both representations.
-      if (!requestedRange) contentItem = await retrieveWithEncoding(id, 'gzip', undefined, true, true, baseFilePath)
+      if (!requestedRange) {
+        contentItem = await retrieveWithEncoding(id, 'gzip', undefined, true, true, baseFilePath, deferredFault)
+      }
       if (!contentItem) {
         // Pinned for the SAME reason a freshly inflated one is: if this path is a tracked cache file, the
         // item returned here is lazy too, and a burst of concurrent reads over already-materialized entries
@@ -1467,7 +1536,7 @@ export async function createFolderBasedFileSystemContentStorage(
         // yet. Only the inflating call used to wrap its item, so a cache HIT — the common case once a range
         // has been served for an id — was left exposed to exactly the ENOENT the pin exists to prevent.
         contentItem = await pinnedUntilOpen(baseFilePath, () =>
-          retrieveWithEncoding(id, null, requestedRange, true, false, baseFilePath)
+          retrieveWithEncoding(id, null, requestedRange, true, false, baseFilePath, deferredFault)
         )
         if (contentItem && requestedRange) {
           // Update last access if this file is in the cache
@@ -1581,8 +1650,9 @@ export async function createFolderBasedFileSystemContentStorage(
     // contract exists to remove, and one `fileInfo()` already refuses to give for the very same id.
     // The gzip probe DEFERS its absence classification to the raw probe below: both representations
     // share a directory, so a raw hit proves it intact for free and a full miss still classifies once.
-    if ((await statForRead(gzipPathOf(filePath), true)) !== undefined) return true
-    return (await statForRead(filePath)) !== undefined
+    const deferredFault: DeferredFault = {}
+    if ((await statForRead(gzipPathOf(filePath), true, deferredFault)) !== undefined) return true
+    return (await statForRead(filePath, false, deferredFault)) !== undefined
   }
 
   /**
@@ -1664,7 +1734,7 @@ export async function createFolderBasedFileSystemContentStorage(
     const gzipNames = new Set<string>()
     // The directory itself, retained ONLY while it is small enough to be worth retaining — see
     // MAX_BUFFERED_DIRECTORY_ENTRIES. Dropped the moment it is not.
-    let buffered: { name: string; isDirectory: boolean }[] | undefined = []
+    let buffered: { name: string; isDirectory: boolean; isForeign: boolean }[] | undefined = []
 
     const listing = await components.fs.opendir(folder, { bufferSize: 4000 })
     // Opening it proves it is a directory, which is an observation like any other: enumeration is part of the
@@ -1672,9 +1742,17 @@ export async function createFolderBasedFileSystemContentStorage(
     rememberDirectory(folder)
     for await (const entry of listing) {
       const isDirectory = entry.isDirectory()
-      // Non-directory entries only: a DIRECTORY named `<id>.gzip` is another id's nesting, not a compressed
-      // representation, and recording it would suppress a raw file that is a valid id of its own.
-      if (!isDirectory && entry.name.endsWith(GZIP_EXTENSION) && gzipNames.size < MAX_BUFFERED_DIRECTORY_ENTRIES) {
+      const isForeign = !isDirectory && isForeignEntry(entry)
+      // REGULAR-FILE ENTRIES ONLY, for the same reason on both counts: a `<id>.gzip` that is a directory is
+      // another id's nesting and one that is a fifo or socket is foreign state, and neither is a compressed
+      // representation — so recording either would suppress a raw file that is a valid id of its own, leaving
+      // the id yielded by NEITHER entry.
+      if (
+        !isDirectory &&
+        !isForeign &&
+        entry.name.endsWith(GZIP_EXTENSION) &&
+        gzipNames.size < MAX_BUFFERED_DIRECTORY_ENTRIES
+      ) {
         gzipNames.add(entry.name)
       }
       if (buffered) {
@@ -1683,7 +1761,7 @@ export async function createFolderBasedFileSystemContentStorage(
           // exactly the streaming first pass the large-directory path below needs. Nothing is re-read.
           buffered = undefined
         } else {
-          buffered.push({ name: entry.name, isDirectory })
+          buffered.push({ name: entry.name, isDirectory, isForeign })
         }
       }
     }
@@ -1745,6 +1823,7 @@ export async function createFolderBasedFileSystemContentStorage(
           subdirectories.push(entry.name)
           continue
         }
+        if (entry.isForeign) continue
         // A raw whose `.gzip` is in this same snapshot is that gzip's decompressed cache, not a second
         // id — and the gzip entry, also in this snapshot, is the one that yields it.
         if (!entry.name.endsWith(GZIP_EXTENSION) && gzipNames.has(entry.name + GZIP_EXTENSION)) continue
@@ -1780,6 +1859,7 @@ export async function createFolderBasedFileSystemContentStorage(
           yield* allFileIdsRec(entryPath, USE_HASH_PREFIX && folder === root ? entryPath : idBase, prefix)
           continue
         }
+        if (isForeignEntry(entry)) continue
         // CONFIRMED, not assumed — the price of deciding from a listing read BEFORE this one.
         // `gzipNames` describes the directory as the first pass saw it, and a representation transition
         // landing between the two made that answer stale in the direction that HIDES content: the first
@@ -1932,6 +2012,7 @@ export async function createFolderBasedFileSystemContentStorage(
     await assertNotQuarantined(id)
     const possibleEncondings: ('gzip' | null)[] = ['gzip', null]
     const baseFilePath = await resolveFilePath(id)
+    const deferredFault: DeferredFault = {}
 
     // Both representations share a parent directory, so the absence classification happens at most
     // once — on the LAST representation probed, and only if every one of them was absent.
@@ -1939,7 +2020,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // Through `gzipPathOf`, for the reason `retrieveWithEncoding` gives: this is the other read path
       // that used to derive the suffix from the coding token instead of from `GZIP_EXTENSION`.
       const filePath = encoding === 'gzip' ? gzipPathOf(baseFilePath) : baseFilePath
-      const stat = await statForRead(filePath, encoding !== null)
+      const stat = await statForRead(filePath, encoding !== null, deferredFault)
       if (stat) {
         if (encoding === 'gzip') {
           const contentSize = await readGzipOriginalSize(filePath, stat.size)

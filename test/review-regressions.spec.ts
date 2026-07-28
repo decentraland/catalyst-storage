@@ -1275,9 +1275,43 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       )
     })
 
-    it('should not report it as content on a read', async () => {
+    // The direct content path used to be the one place this rule was not applied: every non-file occupant was
+    // collapsed into the directory case and answered as a clean miss, so a fifo or socket sitting exactly where
+    // an id's content belongs made `exist` false, `fileInfo`/`retrieve` undefined and `existMultiple` carry on —
+    // a provably-absent answer for a path that is not empty. Serving it would have been worse still: opening a
+    // fifo for reading blocks until a writer appears, so the request would hang instead of failing.
+    it('should reject exist rather than reporting absence', async () => {
       if (!madeFifo) return
-      expect(await storage.exist('pipe')).toBe(false)
+      await expect(storage.exist('pipe')).rejects.toBeDefined()
+    })
+
+    it('should reject fileInfo rather than reporting absence', async () => {
+      if (!madeFifo) return
+      await expect(storage.fileInfo('pipe')).rejects.toBeDefined()
+    })
+
+    it('should reject retrieve rather than reporting absence', async () => {
+      if (!madeFifo) return
+      await expect(storage.retrieve('pipe')).rejects.toBeDefined()
+    })
+
+    it('should reject a byte-range read rather than reporting absence', async () => {
+      if (!madeFifo) return
+      await expect(storage.retrieve('pipe', { start: 0, end: 4 })).rejects.toBeDefined()
+    })
+
+    it('should fail an existMultiple batch containing it rather than answering false for it', async () => {
+      if (!madeFifo) return
+      await expect(storage.existMultiple(['pipe', 'other'])).rejects.toBeDefined()
+    })
+
+    it('should not enumerate it as an id, which no read would accept', async () => {
+      if (!madeFifo) return
+      // Enumeration and the point lookups have to answer the same question: yielding an id whose `exist()`
+      // throws hands a GC sweep a batch that fails on every retry, forever.
+      const ids: string[] = []
+      for await (const id of storage.allFileIds()) ids.push(id)
+      expect(ids).toEqual([])
     })
 
     it('should reject a read NESTED under it rather than reporting absence', async () => {
@@ -1285,6 +1319,116 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       // Nothing can be created beneath it and nothing serves it, so — like a file no id resolves to — it is
       // foreign state in this storage's own tree rather than a prefix another id legitimately owns.
       await expect(storage.exist('pipe/child')).rejects.toBeDefined()
+    })
+  })
+
+  describe('when a foreign node occupies ONE representation of an id', () => {
+    // A fifo at `<id>.gzip` says nothing about the raw file beside it. Faulting on the first probe would answer
+    // "cannot be read" for content this storage can read — the same bug as reporting a fault as absence, only
+    // pointing the other way — so the fault is deferred and raised only if no representation serves the id.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+    let madeFifo: boolean
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'foreign-representation-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    describe('and it is the COMPRESSED path while the raw content is intact', () => {
+      beforeEach(async () => {
+        await storage.storeStream('a', bufferToStream(Buffer.from('REAL')))
+        madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'a.gzip')]).status === 0
+      })
+
+      it('should still report the id present', async () => {
+        if (!madeFifo) return
+        expect(await storage.exist('a')).toBe(true)
+      })
+
+      it('should still serve the raw bytes', async () => {
+        if (!madeFifo) return
+        const item = await storage.retrieve('a')
+        await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.from('REAL'))
+      })
+
+      it('should still enumerate the id exactly once', async () => {
+        if (!madeFifo) return
+        // The gzip-name set must not count it either: a fifo named `a.gzip` is not a compressed
+        // representation, so suppressing the raw entry for it would leave the id yielded by NEITHER.
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toEqual(['a'])
+      })
+    })
+
+    describe('and it is the RAW path while the compressed content is intact', () => {
+      beforeEach(async () => {
+        await storage.storeStreamAndCompress('g', bufferToStream(Buffer.alloc(3000, 'A')))
+        madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'g')]).status === 0
+      })
+
+      it('should still report the id present', async () => {
+        if (!madeFifo) return
+        expect(await storage.exist('g')).toBe(true)
+      })
+
+      it('should still enumerate the id, from its compressed entry', async () => {
+        if (!madeFifo) return
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toEqual(['g'])
+      })
+    })
+
+    describe('and NEITHER representation holds content', () => {
+      beforeEach(() => {
+        madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'a.gzip')]).status === 0
+      })
+
+      it('should reject the read, since the deferred fault is all that is left', async () => {
+        if (!madeFifo) return
+        await expect(storage.exist('a')).rejects.toBeDefined()
+      })
+
+      it('should not enumerate the id', async () => {
+        if (!madeFifo) return
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toEqual([])
+      })
+    })
+
+    describe('and the directory holding it is too large to buffer', () => {
+      beforeEach(async () => {
+        for (let i = 0; i < MAX_BUFFERED_DIRECTORY_ENTRIES + 4; i++) {
+          await nodeFs.writeFile(path.join(flatRoot, `f${String(i).padStart(6, '0')}`), 'x')
+        }
+        madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'zzpipe')]).status === 0
+      })
+
+      it('should skip it on the streaming pass too, yielding every real id', async () => {
+        if (!madeFifo) return
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toEqual(expect.not.arrayContaining(['zzpipe']))
+      })
+
+      it('should still yield all of the real entries', async () => {
+        if (!madeFifo) return
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toHaveLength(MAX_BUFFERED_DIRECTORY_ENTRIES + 4)
+      })
     })
   })
 
