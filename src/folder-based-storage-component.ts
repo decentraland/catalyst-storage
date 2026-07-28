@@ -453,7 +453,13 @@ export async function createFolderBasedFileSystemContentStorage(
     let candidate = path.dirname(filePath)
     let occupant = parentOccupant
     for (;;) {
-      if (occupant === 'directory') break
+      if (occupant === 'directory') {
+        // Climbing to an intact ancestor proves it is a directory, and recording that is what makes its LATER
+        // disappearance damage rather than an ordinary miss. Skipping it made the same directory observed or not
+        // by the DEPTH of whichever id reached it first: the immediate-parent probe records, this climb did not.
+        rememberDirectory(candidate)
+        break
+      }
       // Anything proven not to be a directory leaves the mkdir-skip cache, so the next write recreates the
       // chain on its first attempt. Done here because the walk knows the whole broken chain.
       forgetDirectory(candidate)
@@ -1061,6 +1067,9 @@ export async function createFolderBasedFileSystemContentStorage(
     for (const target of targets) {
       const occupant = await statOccupant(target)
       if (occupant === 'directory') {
+        // Recorded before refusing: the probe proved a directory is here, and reads of ids nested under it need
+        // that to tell a later removal from a path nothing was ever stored under.
+        rememberDirectory(target)
         throw new PathNotContainedError(
           `The id cannot be stored: ${JSON.stringify(target)} is a directory, which means another id nested ` +
             `under this one already occupies the path its content must be written to. Ids where one is a path ` +

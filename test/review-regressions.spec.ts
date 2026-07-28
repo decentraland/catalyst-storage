@@ -1597,6 +1597,105 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
+  describe('and the directory was observed by a probe that then REFUSED the operation', () => {
+    // The commit-target check proves a directory is there and then refuses to overwrite it. It records it
+    // anyway: otherwise an observation depends on whether the operation that made it SUCCEEDED, and a later
+    // removal of that directory reads as an ordinary miss for ids nested under it.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'refused-observation-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should remember a directory the COMMIT-TARGET check refused to overwrite', async () => {
+      // `<root>/a` is a directory this instance did not create, holding another id's nested content, so the
+      // store of `a` is refused at its commit target — and that refusal is the only thing that observes it.
+      await nodeFs.mkdir(path.join(flatRoot, 'a'))
+      await nodeFs.writeFile(path.join(flatRoot, 'a', 'inner'), 'x')
+      await expect(storage.storeStream('a', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+
+      rmSync(path.join(flatRoot, 'a'), { recursive: true, force: true })
+
+      await expect(storage.exist('a/inner')).rejects.toBeDefined()
+    })
+
+    it('should remember a directory blocking the raw path of gzip-only content', async () => {
+      // The other way a refusal observes a directory: a range read of gzip-only content has to publish its
+      // decompressed copy at the raw path, and that path holds a directory. The read probe records it on the
+      // way to refusing, so the inflation commit's own later re-check needs no separate rule.
+      await storage.storeStreamAndCompress('g', bufferToStream(Buffer.alloc(3000, 'A')))
+      await nodeFs.mkdir(path.join(flatRoot, 'g'))
+      await nodeFs.writeFile(path.join(flatRoot, 'g', 'inner'), 'x')
+      await expect(storage.retrieve('g', { start: 0, end: 9 })).rejects.toBeDefined()
+
+      rmSync(path.join(flatRoot, 'g'), { recursive: true, force: true })
+
+      await expect(storage.exist('g/inner')).rejects.toBeDefined()
+    })
+  })
+
+  describe('and the directory was observed by CLIMBING to it from a deeper miss', () => {
+    // The classifier walks up when the id's own parent is absent, and an intact ancestor it stats there is an
+    // observation exactly like one the immediate-parent probe makes. It was not recorded, so the SAME directory
+    // was observed or not depending only on the depth of the id that touched it first: `exist('d/x')` went
+    // through the parent probe and recorded `<root>/d`, while `exist('d/e/f')` climbed to it and did not — so a
+    // later removal rejected for one id and answered `false` for the other.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    /** Reads `id`, then destroys `<root>/d` and reports how a read under it answers afterwards. */
+    const observeThenRemove = async (id: string): Promise<'rejected' | 'absent'> => {
+      expect(await storage.exist(id)).toBe(false)
+      rmSync(path.join(flatRoot, 'd'), { recursive: true, force: true })
+      return storage.exist('d/e/f').then(
+        () => 'absent' as const,
+        () => 'rejected' as const
+      )
+    }
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'climbed-observation-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      // A directory this instance did not create, so only a read can put it in the observation log.
+      await nodeFs.mkdir(path.join(flatRoot, 'd'))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should reject after removal when the observation came from the immediate parent', async () => {
+      expect(await observeThenRemove('d/x')).toBe('rejected')
+    })
+
+    it('should reject after removal when the observation came from a DEEPER miss', async () => {
+      expect(await observeThenRemove('d/e/f')).toBe('rejected')
+    })
+
+    it('should still report an ordinary miss under a directory it never saw', async () => {
+      // The other side: climbing must not invent observations for paths that were never there.
+      expect(await storage.exist('never/seen/here')).toBe(false)
+    })
+  })
+
   describe('and the directory was observed some way other than by storing its own id', () => {
     // The contract is "a directory this instance created or observed", and three ways of learning one existed
     // did not record it: a recursive `mkdir` recorded only the leaf it was asked for, a lookup that found a
