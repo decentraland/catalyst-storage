@@ -1771,6 +1771,67 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       })
     })
 
+    describe('and the prefix path itself becomes content after the directory is gone', () => {
+      // Caching a checked directory has to be undone by whatever stops it being one. A store into `<root>/a`
+      // records it as present and prefix-verified; the directory is then removed out of band — an operator, a
+      // repair flow — and a store of the id `a` legitimately lands content at that exact path. The next nested
+      // store trusted both stale entries, skipped the stat AND the prefix check, and failed with a bare errno
+      // from its rename: ENOTDIR against the raw file, ENOENT against a gzip-primary commit that reserves the
+      // path for range publication. `writingUnder` cleared the entries only AFTER that failure, so the typed
+      // refusal arrived one attempt late. A successful commit now retires them itself.
+      let repairedRoot: string
+      let repairedStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        repairedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-became-content-'))
+        repairedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          repairedRoot,
+          { disablePrefixHash: true }
+        )
+        await repairedStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))
+        rmSync(path.join(repairedRoot, 'a'), { recursive: true, force: true })
+      })
+
+      afterEach(async () => {
+        await repairedStorage.stop?.()
+        rmSync(repairedRoot, { recursive: true, force: true })
+      })
+
+      describe('and a RAW store claims it', () => {
+        beforeEach(async () => {
+          await repairedStorage.storeStream('a', bufferToStream(Buffer.from('RAW')))
+        })
+
+        it('should refuse the next nested store with the typed error, first attempt', async () => {
+          await expect(
+            repairedStorage.storeStream('a/c', bufferToStream(Buffer.from('nested')))
+          ).rejects.toBeInstanceOf(PathNotContainedError)
+        })
+
+        it('should keep serving the id that claimed the path', async () => {
+          await expect(repairedStorage.exist('a')).resolves.toBe(true)
+        })
+      })
+
+      describe('and a COMPRESSED store claims it', () => {
+        beforeEach(async () => {
+          await repairedStorage.storeStreamAndCompress('a', bufferToStream(Buffer.alloc(3000, 'A')))
+        })
+
+        it('should refuse the next nested store with the typed error, first attempt', async () => {
+          await expect(
+            repairedStorage.storeStream('a/c', bufferToStream(Buffer.from('nested')))
+          ).rejects.toBeInstanceOf(PathNotContainedError)
+        })
+
+        it('should keep byte ranges of the compressed id servable', async () => {
+          const item = await repairedStorage.retrieve('a', { start: 0, end: 9 })
+          await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
+        })
+      })
+    })
+
     describe('and repeated stores go into a directory the store path has already checked', () => {
       // The check is per DIRECTORY, not per store: once the store path has asked, repeat stores skip it and the
       // write path costs exactly what it did before. Only PASSES are cached, so a refusal is re-decided every
@@ -1817,9 +1878,10 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     describe('and the directory vanishes before a compressed store takes the freed name', () => {
       // The one sequence that can falsify a cached pass, and it needs the directory to be removed from under a
       // live instance: the compressed store is legal once the raw path is free, and a store nesting under it
-      // afterwards finds both cache entries stale. It cannot create the collision — the rename has no directory
-      // to land in — but the first attempt reports that as a bare ENOENT rather than the typed refusal, and only
-      // the retry (past the invalidated cache entry) gives the right class. Pinned as the known edge it is.
+      // afterwards used to find both cache entries stale. It never created the collision — the rename has no
+      // directory to land in — but it reported that as a bare ENOENT, and only a RETRY, past the entry
+      // `writingUnder` invalidates, gave the typed refusal. A successful commit now retires both entries for the
+      // path it claimed, so the first attempt is already right.
       let staleRoot: string
       let staleStorage: IContentStorageComponent
 
@@ -1847,7 +1909,13 @@ describe('when a shard directory is destroyed underneath a running instance', ()
         await expect(nodeFs.stat(path.join(staleRoot, 'a', 'b'))).rejects.toMatchObject({ code: 'ENOENT' })
       })
 
-      it('should give the typed refusal once the stale cache entry is gone', async () => {
+      it('should give the typed refusal on the FIRST attempt, not only on a retry', async () => {
+        await expect(staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should still give it on a second attempt', async () => {
         await staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested'))).catch(() => undefined)
 
         await expect(staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(

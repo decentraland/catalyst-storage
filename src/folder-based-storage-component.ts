@@ -308,6 +308,10 @@ export async function createFolderBasedFileSystemContentStorage(
   const prefixVerifiedDirectories = new Set<string>()
 
   function forgetDirectory(dirname: string): void {
+    // ONLY the presence cache, which is enough: it is the one that decides whether the slow path runs, and the
+    // slow path re-runs the prefix check unconditionally. Clearing the verification here as well was tried and
+    // removed as unreachable — no test could tell the two apart, because a path missing from the presence cache
+    // is re-checked whatever the verification still says.
     presentDirectories.delete(dirname)
   }
 
@@ -1559,6 +1563,13 @@ export async function createFolderBasedFileSystemContentStorage(
             if (committed) {
               cache.forget(filePath)
               cache.invalidateInflight(filePath)
+              // THIS PATH IS CONTENT NOW, so any cached belief that it is a usable, prefix-verified directory is
+              // void. It survives a legitimate repair: `a/b` records `<root>/a` as a checked directory, the
+              // directory is removed out of band, a store of `a` lands content there — and the next store of
+              // `a/c` skipped both the stat and the prefix check on that stale entry and failed with a bare
+              // ENOTDIR from its rename, where the classification gives the typed refusal. Retired here rather
+              // than left to `writingUnder`, which only clears it AFTER a store has already failed that way.
+              forgetDirectory(filePath)
             }
           }
         })
@@ -2395,6 +2406,10 @@ export async function createFolderBasedFileSystemContentStorage(
           // bytes for a version that is no longer current, whether or not the counterpart went away.
           if (committed) {
             cache.invalidateInflight(filePath)
+            // As in the raw store, and for the gzip commit too: publishing `<id>.gzip` reserves the raw path for
+            // this id's decompressed copy, so a stale entry calling it a present directory would let the next
+            // nested store past the compressed-prefix guard and fail it with a bare ENOENT.
+            forgetDirectory(filePath)
           }
         }
       })
