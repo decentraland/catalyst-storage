@@ -1428,6 +1428,130 @@ describe('when a shard directory is destroyed underneath a running instance', ()
 
         await expect(nodeFs.readdir(path.join(flatRoot, 'a'))).resolves.toEqual([])
       })
+
+      describe('and something has already put that directory in the mkdir-skip cache', () => {
+        // That cache means "this is a directory RIGHT NOW", which a read, an enumeration, the absence classifier
+        // and the commit-target probe all establish — and none of them runs this check. Gating on it let the
+        // guard lapse the moment anything looked at the tree: enumerating the root was enough.
+        it('should still refuse after allFileIds() has warmed it', async () => {
+          for await (const _unusedId of storage.allFileIds()) {
+            // Drained for the side effect: the walk records every directory it opens.
+          }
+
+          await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+            PathNotContainedError
+          )
+        })
+
+        it('should still refuse after a read of the nested id has warmed it', async () => {
+          await storage.exist('a/b').catch(() => undefined)
+
+          await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+            PathNotContainedError
+          )
+        })
+
+        it('should still refuse after a read of another file inside it has warmed it', async () => {
+          await nodeFs.writeFile(path.join(flatRoot, 'a', 'pre'), 'x')
+          await storage.exist('a/pre').catch(() => undefined)
+
+          await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+            PathNotContainedError
+          )
+        })
+      })
+    })
+
+    describe('and repeated stores go into a directory the store path has already checked', () => {
+      // The check is per DIRECTORY, not per store: once the store path has asked, repeat stores skip it and the
+      // write path costs exactly what it did before. Only PASSES are cached, so a refusal is re-decided every
+      // time and deleting the compressed id lifts it at once.
+      let countingRoot: string
+      let countingStorage: IContentStorageComponent
+      let twinProbes: number
+
+      beforeEach(async () => {
+        countingRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-verify-once-'))
+        twinProbes = 0
+        const base = createFsComponent()
+        const countingFs: IFileSystemComponent = {
+          ...base,
+          stat: (async (probed: any, ...rest: any[]) => {
+            if (String(probed) === path.join(countingRoot, 'd.gzip')) twinProbes++
+            return base.stat(probed, ...rest)
+          }) as any
+        }
+        countingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: countingFs, logs: await createLogComponent({}) },
+          countingRoot,
+          { disablePrefixHash: true }
+        )
+        for (let i = 0; i < 5; i++) {
+          await countingStorage.storeStream(`d/x${i}`, bufferToStream(Buffer.from('x')))
+        }
+      })
+
+      afterEach(async () => {
+        await countingStorage.stop?.()
+        rmSync(countingRoot, { recursive: true, force: true })
+      })
+
+      it('should probe the compressed twin once, not once per store', () => {
+        expect(twinProbes).toBe(1)
+      })
+
+      it('should have stored every id', async () => {
+        await expect(countingStorage.exist('d/x4')).resolves.toBe(true)
+      })
+    })
+
+    describe('and the directory vanishes before a compressed store takes the freed name', () => {
+      // The one sequence that can falsify a cached pass, and it needs the directory to be removed from under a
+      // live instance: the compressed store is legal once the raw path is free, and a store nesting under it
+      // afterwards finds both cache entries stale. It cannot create the collision — the rename has no directory
+      // to land in — but the first attempt reports that as a bare ENOENT rather than the typed refusal, and only
+      // the retry (past the invalidated cache entry) gives the right class. Pinned as the known edge it is.
+      let staleRoot: string
+      let staleStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        staleRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-vanished-'))
+        staleStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          staleRoot,
+          { disablePrefixHash: true }
+        )
+        await staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))
+        await staleStorage.delete(['a/b'])
+        await nodeFs.rmdir(path.join(staleRoot, 'a'))
+        await staleStorage.storeStreamAndCompress('a', bufferToStream(Buffer.alloc(3000, 'A')))
+      })
+
+      afterEach(async () => {
+        await staleStorage.stop?.()
+        rmSync(staleRoot, { recursive: true, force: true })
+      })
+
+      it('should not commit content below the compressed id raw path', async () => {
+        await expect(staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeDefined()
+
+        await expect(nodeFs.stat(path.join(staleRoot, 'a', 'b'))).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+
+      it('should give the typed refusal once the stale cache entry is gone', async () => {
+        await staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested'))).catch(() => undefined)
+
+        await expect(staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should keep byte ranges of the compressed id servable throughout', async () => {
+        await staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested'))).catch(() => undefined)
+
+        const item = await staleStorage.retrieve('a', { start: 0, end: 9 })
+        await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
+      })
     })
 
     it('should still allow a nested store once the compressed id is deleted', async () => {

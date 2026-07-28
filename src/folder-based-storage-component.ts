@@ -288,6 +288,25 @@ export async function createFolderBasedFileSystemContentStorage(
    */
   const observedDirectories = new Set<string>()
 
+  /**
+   * Directories the STORE path has checked for a compressed id owning their name — see
+   * `assertNoCompressedIdOwnsChain`.
+   *
+   * A third set rather than a flag on the first, for the reason the second one exists: the mkdir-skip cache
+   * means "this is a directory RIGHT NOW", which a read, an enumeration, the absence classifier and the
+   * commit-target probe all establish, and none of them runs this check. Sharing it silently skipped the check
+   * for any directory a read had already touched — `allFileIds()` over the root was enough — so the guard held
+   * only until something looked at the tree.
+   *
+   * Only PASSES are recorded, so a refusal is re-decided on every store and deleting the compressed id lifts it
+   * at once. A recorded pass can be falsified only by a compressed twin appearing beside a directory that
+   * already exists, which this storage cannot do to itself: `assertCommitTargetsWritable` refuses a compressed
+   * store whose raw commit target is a directory. The one sequence that could — the directory vanishing, a
+   * compressed store taking the freed name, then a store nesting under it again — is caught because it has to
+   * CREATE the directory, and creation always goes through the checked path below.
+   */
+  const prefixVerifiedDirectories = new Set<string>()
+
   function forgetDirectory(dirname: string): void {
     presentDirectories.delete(dirname)
   }
@@ -990,9 +1009,7 @@ export async function createFolderBasedFileSystemContentStorage(
       // BOTH remaining occupants, because the rule is about the STATE and not about who created it. Gated on
       // the mkdir, it missed the case where `<root>/a` is ALREADY a directory beside `a.gzip` — reachable from a
       // tree an older version wrote (this store used to be allowed), from versions that created directories on
-      // read, or from operator state — which is the very state the check exists to keep out. Costs no extra
-      // frequency: this whole block runs once per directory per instance, since getting past it records the
-      // directory in the mkdir-skip cache.
+      // read, or from operator state — which is the very state the check exists to keep out.
       await assertNoCompressedIdOwnsChain(dirname)
       if (occupant === 'absent') {
         try {
@@ -1039,7 +1056,14 @@ export async function createFolderBasedFileSystemContentStorage(
           throw err
         }
       }
+      addCapped(prefixVerifiedDirectories, dirname)
       rememberDirectory(dirname)
+    } else if (!prefixVerifiedDirectories.has(dirname)) {
+      // THE FAST PATH IS NOT EVIDENCE OF THIS CHECK. Whatever put the directory in the mkdir-skip cache may
+      // have been a read or an enumeration, so the first store into it still has to ask. Once the store path
+      // has asked, repeat stores skip it and the write path costs exactly what it did before.
+      await assertNoCompressedIdOwnsChain(dirname)
+      addCapped(prefixVerifiedDirectories, dirname)
     }
   }
 
