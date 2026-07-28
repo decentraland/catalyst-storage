@@ -63,7 +63,10 @@ export type IContentStorageComponent = IBaseComponent & {
    * `.gzip` sibling fell outside it is yielded rather than probed. Absence from a partial snapshot is not
    * evidence of absence on disk, so the choice there is a possible duplicate or a missing id, and a duplicate
    * costs an idempotent repeat while an omission under-reports what the node holds. With hash prefixes it
-   * cannot arise: a shard holds total/65,536 entries, so every directory is decided from a single read.
+   * cannot arise: a shard holds total/65,536 entries, so every directory is decided from a single read. The
+   * other backends have no such case — S3 rejects an enumeration whose cursor repeats rather than re-yielding a
+   * page, and the in-memory one iterates a map — but a consumer written against this interface must tolerate it,
+   * since the backend behind it can change.
    */
   allFileIds(prefix?: string): AsyncIterable<string>
 }
