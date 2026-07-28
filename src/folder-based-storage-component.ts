@@ -527,7 +527,34 @@ export async function createFolderBasedFileSystemContentStorage(
         return candidate
       }
     }
-    return missing.find(wasObserved)
+    const observedGap = missing.find(wasObserved)
+    if (observedGap === undefined) return undefined
+    // A missing ancestor whose COMPRESSED twin is another id's content can never come back: the store that
+    // would recreate the directory is refused (see `assertNoCompressedIdOwnsChain`), so this id is UNSTORABLE
+    // rather than destroyed, and absence is the answer that keeps the three surfaces agreeing — store refuses
+    // with the typed error, delete resolves, read reports nothing. Exactly the rule already applied to an
+    // ancestor that is a regular file; the only difference is that the filesystem enforces that one and this
+    // storage enforces this one. Probed only when a fault would otherwise be reported, which is the damaged
+    // case, and only for twins the CPU-only canonicality test says an id could own.
+    for (const gap of missing) {
+      const compressedTwin = gzipPathOf(gap)
+      if (!(await isCanonicalContentPath(compressedTwin))) continue
+      let twin: Awaited<ReturnType<typeof statOccupant>>
+      try {
+        twin = await statOccupant(compressedTwin)
+      } catch {
+        // Unreadable, so it cannot be shown to own the prefix. The observed gap stands, which fails closed.
+        return observedGap
+      }
+      if (twin === 'file') {
+        logger.warn(
+          `Reporting ${filePath} as absent: ${JSON.stringify(compressedTwin)} is another id's compressed ` +
+            `content, so the directory this id needs can no longer be created. Whatever was under it is gone.`
+        )
+        return undefined
+      }
+    }
+    return observedGap
   }
 
   /**
@@ -874,6 +901,43 @@ export async function createFolderBasedFileSystemContentStorage(
    * for a nested, caller-supplied id that is an unbounded empty-directory leak per rejected upload,
    * exactly the hazard `resolveFilePath` documents reads being changed to avoid.
    */
+  /**
+   * Refuses a store whose directories would collide with an id already stored COMPRESSED.
+   *
+   * The mirror of `assertCommitTargetsWritable`, for the opposite arrival order. A gzip-only commit leaves the
+   * raw path free, so `storeStreamAndCompress('a')` and then `storeStream('a/b')` creates the directory `a`
+   * beside `a.gzip` with no filesystem conflict at all, and both ids store and read whole. But a byte RANGE of
+   * `a` has to publish its decompressed copy at exactly `a`, so ranges of `a` then reject FOREVER: the raw path
+   * cannot be freed while `a/b` lives there, and neither re-storing `a` (either representation, both refused)
+   * nor deleting it recovers. `assertCommitTargetsWritable` refuses that very end state when it is reached the
+   * other way round — its own reason for existing is an id that "serves whole reads but can never serve a byte
+   * range" — so allowing it here made the verdict depend on arrival order rather than on the state.
+   *
+   * Checked BEFORE the mkdir, not after: an empty directory left behind by a rejection would itself be the
+   * breakage, and this component exposes no `rmdir` to undo one with.
+   *
+   * The canonicality test runs first because it costs NO SYSCALL, which is what keeps this off the write path:
+   * a shard name never spells its own id — `<root>/86f7` is not where `sha1('86f7')` points — so every shard
+   * creation in hash mode settles it in CPU alone and stats nothing.
+   */
+  async function assertNoCompressedIdOwnsChain(dirname: string): Promise<void> {
+    for (let candidate = dirname; candidate.length > root.length; candidate = path.dirname(candidate)) {
+      const parent = path.dirname(candidate)
+      const compressedTwin = gzipPathOf(candidate)
+      // STATE, not authorship: a chain this store did not create can hold the collision too, and a store that
+      // nested further under it would add content to a path already unable to serve ranges.
+      if ((await isCanonicalContentPath(compressedTwin)) && (await statOccupant(compressedTwin)) === 'file') {
+        throw new PathNotContainedError(
+          `The id cannot be stored: ${JSON.stringify(compressedTwin)} is another id's compressed content, and ` +
+            `the directory this id needs at ${JSON.stringify(candidate)} is where that id's decompressed copy ` +
+            `has to be published, so creating it would leave that id unable to serve byte ranges. Ids where one ` +
+            `is a path prefix of another can only coexist when hash prefixes put them in different shards.`
+        )
+      }
+      if (parent === candidate) break
+    }
+  }
+
   async function ensureDirectoryFor(filePath: string): Promise<void> {
     const dirname = path.dirname(filePath)
 
@@ -922,6 +986,7 @@ export async function createFolderBasedFileSystemContentStorage(
         )
       }
       if (occupant === 'absent') {
+        await assertNoCompressedIdOwnsChain(dirname)
         try {
           await components.fs.mkdir(dirname, { recursive: true })
         } catch (err: any) {
