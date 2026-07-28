@@ -57,6 +57,20 @@ const isForeignEntry = (entry: Dirent): boolean =>
  */
 export const MAX_BUFFERED_DIRECTORY_ENTRIES = 4096
 
+/**
+ * The most nested LARGE directories `allFileIdsRec` will descend through before failing. Only the
+ * large-directory path holds a directory handle open across its recursion (the small path collects and
+ * recurses after closing), so an adversarially deep flat-mode tree of oversized directories could
+ * otherwise hold one descriptor per level and exhaust the process's file-descriptor limit (EMFILE).
+ * This counts large-directory nesting, not total depth: a deep but narrow tree of small directories
+ * holds zero handles and is never affected. A chain this deep of >`MAX_BUFFERED_DIRECTORY_ENTRIES`
+ * directories is not physically reachable, so the cap only ever turns that theoretical case into a
+ * clear error instead of a confusing, process-wide EMFILE.
+ *
+ * @internal
+ */
+export const MAX_NESTED_LARGE_DIRECTORIES = 128
+
 const ONE_HOUR_IN_MS = 60 * 60 * 1000
 const FIVE_MINUTES_IN_MS = 5 * 60 * 1000
 const FIVE_GB_IN_BYTES = 5 * 1024 * 1024 * 1024
@@ -1717,7 +1731,20 @@ export async function createFolderBasedFileSystemContentStorage(
    * STOPPED, which is the same inference made where it cannot race a commit.
    */
 
-  const allFileIdsRec = async function* (folder: string, idBase: string, prefix?: string): AsyncIterable<string> {
+  const allFileIdsRec = async function* (
+    folder: string,
+    idBase: string,
+    prefix?: string,
+    largeDepth = 0
+  ): AsyncIterable<string> {
+    // Bail before opening a handle this deep. largeDepth counts only large-directory ancestors, each of
+    // which holds its handle open across this recursion; see MAX_NESTED_LARGE_DIRECTORIES.
+    if (largeDepth > MAX_NESTED_LARGE_DIRECTORIES) {
+      throw new Error(
+        `allFileIds exceeded ${MAX_NESTED_LARGE_DIRECTORIES} nested large directories at "${folder}"; ` +
+          `the tree is too deep to enumerate without risking file-descriptor exhaustion`
+      )
+    }
     // `idBase` is always an ancestor of `folder`, and an entry name never contains a separator or a
     // `.`/`..` segment, so an id is a plain slice of a path built by concatenation — no `path.resolve`
     // (354 ns) or `path.relative` (781 ns) per entry, together the largest single cost of a walk
@@ -1855,8 +1882,14 @@ export async function createFolderBasedFileSystemContentStorage(
           // 400-level chain of small directories holds ZERO extra descriptors, while six nested levels of
           // 4,101 entries each hold six. Exhausting a descriptor limit that way needs hundreds of nested
           // directories each holding thousands of entries, which is more files than the tree could contain;
-          // id length caps the depth at a few hundred in any case.
-          yield* allFileIdsRec(entryPath, USE_HASH_PREFIX && folder === root ? entryPath : idBase, prefix)
+          // id length caps the depth at a few hundred in any case. As a hard backstop, largeDepth counts
+          // these overflowed ancestors and MAX_NESTED_LARGE_DIRECTORIES fails the walk before EMFILE can.
+          yield* allFileIdsRec(
+            entryPath,
+            USE_HASH_PREFIX && folder === root ? entryPath : idBase,
+            prefix,
+            largeDepth + 1
+          )
           continue
         }
         if (isForeignEntry(entry)) continue
@@ -1899,7 +1932,7 @@ export async function createFolderBasedFileSystemContentStorage(
       const entryPath = folder + path.sep + name
       // With hash prefixes the SHARD is the id namespace root, so ids nested inside it are relative
       // to the shard rather than to the storage root.
-      yield* allFileIdsRec(entryPath, USE_HASH_PREFIX && folder === root ? entryPath : idBase, prefix)
+      yield* allFileIdsRec(entryPath, USE_HASH_PREFIX && folder === root ? entryPath : idBase, prefix, largeDepth)
     }
   }
 
