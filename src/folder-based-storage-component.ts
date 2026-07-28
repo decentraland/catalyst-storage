@@ -914,7 +914,9 @@ export async function createFolderBasedFileSystemContentStorage(
    * range" — so allowing it here made the verdict depend on arrival order rather than on the state.
    *
    * Checked BEFORE the mkdir, not after: an empty directory left behind by a rejection would itself be the
-   * breakage, and this component exposes no `rmdir` to undo one with.
+   * breakage, and this component exposes no `rmdir` to undo one with. And checked whether or not the directory
+   * has to be created, since a tree can already hold the collision — the state is what matters, not the order
+   * it was reached in, which is the whole point of the rule.
    *
    * The canonicality test runs first because it costs NO SYSCALL, which is what keeps this off the write path:
    * a shard name never spells its own id — `<root>/86f7` is not where `sha1('86f7')` points — so every shard
@@ -985,8 +987,14 @@ export async function createFolderBasedFileSystemContentStorage(
             `regular file, so this storage cannot create the directory the id needs. Remove whatever occupies it.`
         )
       }
+      // BOTH remaining occupants, because the rule is about the STATE and not about who created it. Gated on
+      // the mkdir, it missed the case where `<root>/a` is ALREADY a directory beside `a.gzip` — reachable from a
+      // tree an older version wrote (this store used to be allowed), from versions that created directories on
+      // read, or from operator state — which is the very state the check exists to keep out. Costs no extra
+      // frequency: this whole block runs once per directory per instance, since getting past it records the
+      // directory in the mkdir-skip cache.
+      await assertNoCompressedIdOwnsChain(dirname)
       if (occupant === 'absent') {
-        await assertNoCompressedIdOwnsChain(dirname)
         try {
           await components.fs.mkdir(dirname, { recursive: true })
         } catch (err: any) {
@@ -1265,6 +1273,14 @@ export async function createFolderBasedFileSystemContentStorage(
     // a range read of an absent id spent the budget — twice, once per attempt of the caller's retry loop
     // — parked behind real inflations for work that never touches a cache file.
     await acquireSlot()
+    // RE-CHECKED after the wait, because waiting is where the answer changes. A request that registered while
+    // the cache was open can sit in the slot queue behind other inflations for as long as they take, and both
+    // `close()` and a writer's `invalidateInflight` can land in that window — the top check cannot see either.
+    // The commit below would then discard the output, so the inflation buys nothing and costs an inflation slot,
+    // gzip CPU and up to `decompressMaxFileSize` of staging write. Measured: with one slot and a 24 MB gzip
+    // parked behind another, a full inflation began AFTER `stop()` had already closed the cache. `isOpen()` is
+    // the discriminating half — `close()` pre-invalidates tokens made after it, not ones already waiting here.
+    if (token.invalidated || !cache.isOpen()) return
 
     const gzipPath = gzipPathOf(uncompressedPath)
     const sourceVanished = () => gzipSourceVanishedForRead(gzipPath)

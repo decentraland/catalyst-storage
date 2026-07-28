@@ -1400,6 +1400,36 @@ describe('when a shard directory is destroyed underneath a running instance', ()
       await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
     })
 
+    describe('and the raw prefix directory ALREADY exists', () => {
+      // The rule is about the state, so it cannot depend on whether this call had to create the directory. A
+      // tree written by an older version has exactly this shape — the nested store used to be allowed — as does
+      // one where a version that created directories on read, or an operator, got there first. Gated on the
+      // mkdir, the check let a store commit content below the very path `a`'s range cache must publish at.
+      beforeEach(async () => {
+        await nodeFs.mkdir(path.join(flatRoot, 'a'))
+      })
+
+      it('should refuse the nested store just the same', async () => {
+        await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should refuse it when the pre-existing directory is deeper than the collision', async () => {
+        await nodeFs.mkdir(path.join(flatRoot, 'a', 'b'))
+
+        await expect(storage.storeStream('a/b/c', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should add nothing under it, so the tree gains no unservable content', async () => {
+        await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeDefined()
+
+        await expect(nodeFs.readdir(path.join(flatRoot, 'a'))).resolves.toEqual([])
+      })
+    })
+
     it('should still allow a nested store once the compressed id is deleted', async () => {
       // The rule is about the STATE, so clearing it lifts the refusal.
       await storage.delete(['a'])
