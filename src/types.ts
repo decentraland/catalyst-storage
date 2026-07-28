@@ -52,6 +52,22 @@ export type IContentStorageComponent = IBaseComponent & {
   fileInfoMultiple(fileIds: string[]): Promise<Map<string, FileInfo | undefined>>
   exist(fileId: string): Promise<boolean>
   existMultiple(fileIds: string[]): Promise<Map<string, boolean>>
+  /**
+   * Yields the ids this storage holds — ids, not filenames, so one containing path separators round-trips
+   * instead of collapsing onto its last segment. `prefix` filters those ids, never the on-disk name.
+   *
+   * Every id present for the whole enumeration is yielded AT LEAST ONCE, and only ids the point lookups accept
+   * are yielded. It is not guaranteed to be a set: **an id can be yielded twice**, so a consumer acting on the
+   * output must be idempotent. That happens in one case — a single flat-mode directory holding more than
+   * `MAX_BUFFERED_DIRECTORY_ENTRIES` entries, where the compressed-name snapshot is capped and a raw file whose
+   * `.gzip` sibling fell outside it is yielded rather than probed. Absence from a partial snapshot is not
+   * evidence of absence on disk, so the choice there is a possible duplicate or a missing id, and a duplicate
+   * costs an idempotent repeat while an omission under-reports what the node holds. With hash prefixes it
+   * cannot arise: a shard holds total/65,536 entries, so every directory is decided from a single read. The
+   * other backends have no such case — S3 rejects an enumeration whose cursor repeats rather than re-yielding a
+   * page, and the in-memory one iterates a map — but a consumer written against this interface must tolerate it,
+   * since the backend behind it can change.
+   */
   allFileIds(prefix?: string): AsyncIterable<string>
 }
 

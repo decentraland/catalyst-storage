@@ -1253,3 +1253,251 @@ describe('S3 Storage injected content-type detector', () => {
     })
   })
 })
+
+describe('when the startup ListBucket probe fails for a reason unrelated to permissions', () => {
+  let warnings: { message: string; context?: unknown }[]
+  let storage: IContentStorageComponent
+
+  beforeEach(async () => {
+    // A throttle or a network blip says nothing about permissions, so construction must not refuse — the
+    // component's own reads and writes surface the same fault if it persists.
+    warnings = []
+    const fake = createFakeS3Client()
+    fake.on('ListObjectsV2Command', () => {
+      throw Object.assign(new Error('slow down'), { name: 'SlowDown', $metadata: { httpStatusCode: 503 } })
+    })
+    const logs = {
+      getLogger: () => ({
+        log: () => undefined,
+        debug: () => undefined,
+        error: () => undefined,
+        info: () => undefined,
+        warn: (message: string, context?: unknown) => warnings.push({ message, context })
+      })
+    } as never
+    storage = await createStorage({ logs }, fake, { Bucket: 'example' })
+  })
+
+  it('should still construct', () => {
+    expect(storage).toBeDefined()
+  })
+
+  it('should say the probe failed for an unrelated reason', () => {
+    expect(warnings.some((each) => each.message.includes('unrelated to permissions'))).toBe(true)
+  })
+})
+
+describe('when repeated 403s are reported as absence', () => {
+  let warned: string[]
+  let debugged: string[]
+  let storage: IContentStorageComponent
+
+  beforeEach(async () => {
+    // For the principal this option exists for, a 403 IS the ordinary miss, so warning on every one buries
+    // the warnings that matter. The first is loud, the rest go to debug until the interval passes.
+    warned = []
+    debugged = []
+    const fake = createFakeS3Client()
+    const forbidden = () => {
+      throw Object.assign(new Error('AccessDenied'), {
+        name: 'AccessDenied',
+        $metadata: { httpStatusCode: 403 }
+      })
+    }
+    fake.on('HeadObjectCommand', forbidden)
+    const logs = {
+      getLogger: () => ({
+        log: () => undefined,
+        info: () => undefined,
+        error: () => undefined,
+        warn: (message: string) => warned.push(message),
+        debug: (message: string) => debugged.push(message)
+      })
+    } as never
+    storage = await createStorage({ logs }, fake, { Bucket: 'example', report403AsAbsent: true })
+    warned.length = 0
+    debugged.length = 0
+    expect(await storage.exist('first')).toBe(false)
+    expect(await storage.exist('second')).toBe(false)
+    expect(await storage.exist('third')).toBe(false)
+  })
+
+  it('should warn once', () => {
+    expect(warned.filter((each) => each.includes('403 Forbidden')).length).toBe(1)
+  })
+
+  it('should send the rest to debug', () => {
+    expect(debugged.filter((each) => each.includes('403 Forbidden')).length).toBe(2)
+  })
+})
+
+describe('when S3 fails with something that is not an Error', () => {
+  // Every log site and message builder falls back with `error?.message ?? String(error)` or `error?.name`,
+  // and an SDK middleware or a custom transport can reject with a string or a bare object. Those fallbacks
+  // are the difference between a usable log line and `undefined`.
+  let logged: { message: string; context?: Record<string, unknown> }[]
+  let probeLogged: { message: string; context?: Record<string, unknown> }[]
+  let storage: IContentStorageComponent
+
+  const loggerCapturing = (sink: typeof logged) =>
+    ({
+      getLogger: () => ({
+        log: () => undefined,
+        debug: () => undefined,
+        info: () => undefined,
+        warn: (message: string, context?: Record<string, unknown>) => sink.push({ message, context }),
+        error: (message: string, context?: Record<string, unknown>) => sink.push({ message, context })
+      })
+    }) as never
+
+  beforeEach(async () => {
+    logged = []
+    const fake = createFakeS3Client()
+    // Not an Error: no `message`, no `name`, no `$metadata`. Thrown by the startup probe as well as the read,
+    // so both fallback shapes are exercised — `?? String(error)` where a message is expected, and the
+    // `|| 'unknown error'` chain where a name is.
+    const bare = (): never => {
+      throw 'a bare string rejection'
+    }
+    fake.on('ListObjectsV2Command', bare)
+    fake.on('HeadObjectCommand', bare)
+    storage = await createStorage({ logs: loggerCapturing(logged) }, fake, { Bucket: 'example' })
+    probeLogged = logged.slice()
+    logged.length = 0
+  })
+
+  it('should surface it rather than reporting the content absent', async () => {
+    await expect(storage.exist('an-id')).rejects.toBe('a bare string rejection')
+  })
+
+  it('should stringify it into the startup probe warning context', () => {
+    // The fallbacks live in the context, which is where an operator reads what actually went wrong.
+    expect(probeLogged[0].context).toEqual({ error: 'a bare string rejection', code: 'unknown' })
+  })
+
+  it('should fall back to a readable phrase when the read has no message or name', async () => {
+    await storage.exist('an-id').catch(() => undefined)
+
+    expect(logged.some((each) => each.message.includes('unknown error'))).toBe(true)
+  })
+
+  it('should omit the code and status it cannot read', async () => {
+    await storage.exist('an-id').catch(() => undefined)
+
+    expect(logged[0].context).toEqual({ key: 'an-id' })
+  })
+})
+
+describe('when a HeadObject answer omits ContentLength', () => {
+  // The SDK types it as optional, and an S3-compatible endpoint may leave it out. `size` is then unknown,
+  // which a ranged read has to survive rather than compute bounds from.
+  let storage: IContentStorageComponent
+
+  beforeEach(async () => {
+    const fake = createFakeS3Client()
+    await createStorage({ logs: await createLogComponent({}) }, fake, { Bucket: 'example' }).then((built) =>
+      built.storeStream('sized', bufferToStream(Buffer.from('0123456789')))
+    )
+    fake.on('HeadObjectCommand', () => ({ ETag: '"sized"' }))
+    storage = await createStorage({ logs: await createLogComponent({}) }, fake, { Bucket: 'example' })
+  })
+
+  it('should report an unknown size', async () => {
+    expect((await storage.fileInfo('sized'))?.size).toBeNull()
+  })
+
+  it('should still serve a whole read', async () => {
+    const item = await storage.retrieve('sized')
+
+    expect((await streamToBuffer(await item!.asStream())).toString()).toBe('0123456789')
+  })
+
+  it('should serve a range with an unknown advertised length', async () => {
+    const item = await storage.retrieve('sized', { start: 2, end: 5 })
+
+    expect(item?.size).toBeNull()
+  })
+
+  it('should still ask S3 for the requested bounds', async () => {
+    const item = await storage.retrieve('sized', { start: 2, end: 5 })
+
+    expect((await streamToBuffer(await item!.asStream())).toString()).toBe('2345')
+  })
+})
+
+describe('when GetObject answers with no usable body', () => {
+  let storage: IContentStorageComponent
+  let fake: ReturnType<typeof createFakeS3Client>
+
+  beforeEach(async () => {
+    fake = createFakeS3Client()
+    storage = await createStorage({ logs: await createLogComponent({}) }, fake, { Bucket: 'example' })
+    await storage.storeStream('an-id', bufferToStream(Buffer.from('content')))
+  })
+
+  it('should name a null body rather than handing it to the caller', async () => {
+    fake.on('GetObjectCommand', () => ({ Body: null }))
+    const item = await storage.retrieve('an-id')
+
+    await expect(item!.asStream()).rejects.toThrow(/received null/)
+  })
+
+  it('should name a body whose constructor it cannot read', async () => {
+    // A prototype-less object has no constructor name to report, so the description falls back to `typeof`.
+    fake.on('GetObjectCommand', () => ({ Body: Object.create(null) }))
+    const item = await storage.retrieve('an-id')
+
+    await expect(item!.asStream()).rejects.toThrow(/received object/)
+  })
+
+  it('should name a non-stream by its constructor when it has one', async () => {
+    fake.on('GetObjectCommand', () => ({ Body: 42 }))
+    const item = await storage.retrieve('an-id')
+
+    await expect(item!.asStream()).rejects.toThrow(/received a Number/)
+  })
+})
+
+describe('when a delete batch reports more per-key failures than it lists', () => {
+  let storage: IContentStorageComponent
+  let rejection: Error | undefined
+
+  beforeEach(async () => {
+    // DeleteObjects reports per-key failures inside a 200, so a resolved send is not a completed delete. The
+    // message shows the first few and says how many there were.
+    const fake = createFakeS3Client()
+    fake.on('DeleteObjectsCommand', ({ Delete }) => ({
+      Errors: Delete.Objects.map(({ Key }: { Key: string }) => ({ Key, Code: 'InternalError' }))
+    }))
+    storage = await createStorage({ logs: await createLogComponent({}) }, fake, { Bucket: 'example' })
+    rejection = undefined
+    await storage.delete(['a', 'b', 'c', 'd', 'e', 'f', 'g']).catch((error: Error) => {
+      rejection = error
+    })
+  })
+
+  it('should report how many failed', () => {
+    expect(rejection?.message).toContain('Failed to delete 7 object(s)')
+  })
+
+  it('should elide the ones past the first few', () => {
+    expect(rejection?.message).toContain(', …')
+  })
+})
+
+describe('when a listing page carries no Contents at all', () => {
+  let listed: string[]
+
+  beforeEach(async () => {
+    // An empty bucket, or an S3-compatible endpoint that omits the key entirely rather than sending [].
+    const fake = createFakeS3Client()
+    fake.on('ListObjectsV2Command', () => ({ IsTruncated: false }))
+    const storage = await createStorage({ logs: await createLogComponent({}) }, fake, { Bucket: 'example' })
+    listed = []
+    for await (const id of storage.allFileIds()) listed.push(id)
+  })
+
+  it('should enumerate nothing rather than failing', () => {
+    expect(listed).toEqual([])
+  })
+})

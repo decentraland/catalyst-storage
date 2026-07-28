@@ -1,5 +1,6 @@
 import { Readable } from 'stream'
-import { runStoreWithSignal } from '../src/cancellation'
+import { isAbortError, markAsNonCancellationError, runStoreWithSignal } from '../src/cancellation'
+import { bufferToStream } from '../src/content-item'
 
 describe('runStoreWithSignal', () => {
   describe('when the abort hook throws', () => {
@@ -251,6 +252,53 @@ describe('runStoreWithSignal', () => {
 
     it('should reject with null instead of a synthesized error', () => {
       expect(outcome).toBe(null)
+    })
+  })
+
+  describe('when a commit-phase error cannot be tagged', () => {
+    let tagged: unknown
+
+    beforeEach(() => {
+      // A frozen error cannot carry the marker. Documented as acceptable degradation — it may then be
+      // translated on abort — so what matters is that tagging does not throw over it.
+      tagged = markAsNonCancellationError(Object.freeze(new Error('frozen commit failure')))
+    })
+
+    it('should return the error unchanged rather than throwing', () => {
+      expect((tagged as Error).message).toBe('frozen commit failure')
+    })
+  })
+
+  describe('when an error carries the ABORT_ERR code rather than the AbortError name', () => {
+    it('should still be recognised as an abort shape', () => {
+      // The shape the AWS SDK and some transports use; both spellings have to count.
+      expect(isAbortError(Object.assign(new Error('torn down'), { code: 'ABORT_ERR' }))).toBe(true)
+    })
+
+    it('should not recognise an unrelated error', () => {
+      expect(isAbortError(new Error('ENOSPC'))).toBe(false)
+    })
+  })
+
+  describe('when the signal aborts with no reason at all', () => {
+    let outcome: unknown
+
+    beforeEach(async () => {
+      // `abort()` with no argument gives a DOMException reason in Node, but a hand-rolled signal can leave it
+      // undefined — and then a store must synthesize one rather than reject with `undefined`.
+      const controller = new AbortController()
+      const signal = Object.create(controller.signal, {
+        aborted: { value: true },
+        reason: { value: undefined }
+      }) as AbortSignal
+      outcome = await runStoreWithSignal(bufferToStream(Buffer.from('x')), signal, async () => 'stored').then(
+        () => 'resolved',
+        (error) => error
+      )
+    })
+
+    it('should reject with a synthesized abort error', () => {
+      expect((outcome as Error).message).toBe('The store operation was aborted.')
     })
   })
 })

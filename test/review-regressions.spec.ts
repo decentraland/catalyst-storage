@@ -1,8 +1,9 @@
+import { spawnSync } from 'child_process'
 import { createHash } from 'crypto'
 import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { Readable, Writable } from 'stream'
+import { PassThrough, Readable, Writable } from 'stream'
 import { gzipSync } from 'zlib'
 import { createLogComponent } from '@well-known-components/logger'
 import {
@@ -20,6 +21,7 @@ import { assertAddressableContentId } from '../src/content-id'
 import { PathNotContainedError } from '../src/folder-based/errors'
 import { intentNameFor } from './file-system-utils'
 import { createDecompressCache } from '../src/folder-based/decompress-cache'
+import { MAX_BUFFERED_DIRECTORY_ENTRIES } from '../src/folder-based-storage-component'
 
 /**
  * Regression tests for the defects found in the deep review. Each block names the failure it pins,
@@ -702,27 +704,2164 @@ describe('when a shard directory is destroyed underneath a running instance', ()
     })
   })
 
-  describe('and an ancestor of the shard stops being a directory', () => {
-    let obstructed: IContentStorageComponent
+  describe('and the STORAGE ROOT itself is destroyed before any operation records a shard', () => {
+    // The root is created by construction, and that `mkdir` is an observation — but it was never recorded,
+    // so at the one boundary nothing else registers there was no observed ancestor to attribute damage to.
+    // A root removed or replaced underneath a live instance therefore classified every read under an
+    // uncreated shard as an ordinary miss: `exist()` answered `false` for a storage root that was GONE,
+    // which is the "a broken store looks like an empty node" outcome this read contract exists to refuse.
+    //
+    // Each case constructs and then destroys WITHOUT performing an operation first, because an operation
+    // records the shard and would supply the observed ancestor by a different route.
+    let parent: string
+    let rootPath: string
+    let orphaned: IContentStorageComponent
+
+    const build = async (useHashPrefix: boolean): Promise<IContentStorageComponent> => {
+      parent = mkdtempSync(path.join(os.tmpdir(), 'root-gone-'))
+      rootPath = path.join(parent, 'storage-root')
+      return createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        rootPath,
+        { disablePrefixHash: !useHashPrefix }
+      )
+    }
+
+    afterEach(async () => {
+      await orphaned?.stop?.().catch(() => undefined)
+      if (parent) rmSync(parent, { recursive: true, force: true })
+    })
+
+    describe('and hash prefixes are enabled', () => {
+      beforeEach(async () => {
+        orphaned = await build(true)
+        rmSync(rootPath, { recursive: true, force: true })
+      })
+
+      it('should reject rather than report the id as absent', async () => {
+        await expect(orphaned.exist('some-id')).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+    })
+
+    describe('and the root is replaced by a regular file', () => {
+      beforeEach(async () => {
+        orphaned = await build(true)
+        rmSync(rootPath, { recursive: true, force: true })
+        await nodeFs.writeFile(rootPath, 'not a directory')
+      })
+
+      it('should reject rather than report the id as absent', async () => {
+        await expect(orphaned.exist('some-id')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and hash prefixes are disabled, so the root IS the namespace directory', () => {
+      beforeEach(async () => {
+        orphaned = await build(false)
+        rmSync(rootPath, { recursive: true, force: true })
+      })
+
+      it('should reject rather than report the id as absent', async () => {
+        await expect(orphaned.exist('some-id')).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+
+      it('should reject retrieve for the same reason', async () => {
+        await expect(orphaned.retrieve('some-id')).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+    })
+  })
+
+  describe('and a store later claims the path a damaged directory occupied', () => {
+    // Damage evidence and a legitimately occupied path are different states, and the first has to stop
+    // applying once the second is true. It did not: after `<root>/a2` had been observed as a directory and
+    // then destroyed, a SUCCESSFUL store of the id `a2` left the damage entry in place, so reads of `a2/b`
+    // kept rejecting — while the store side refuses that id as an ordinary prefix collision and `delete`
+    // resolves for it. Those three have to agree, and under a legitimately occupied prefix the answer is
+    // "absent", which is the case this whole change exists to report correctly.
+    let repaired: IContentStorageComponent
+    let flatRoot: string
+
+    /**
+     * Observes a directory under `a2`, destroys `<root>/a2`, reports the damage once — which is what moves
+     * the observation into the damaged set — then stores the id `a2` so it owns the prefix.
+     *
+     * `nestedId` sets HOW DEEP the observed directory is, and that is the point of parameterising it: damage
+     * is recorded against the store's own `dirname`, so `a2/b` files it under `<root>/a2` — the same path the
+     * later store commits — while `a2/b/c` files it under `<root>/a2/b`, a DESCENDANT of that path. Clearing
+     * only the committed path fixed the first and left the second rejecting.
+     */
+    const damageThenStore = async (compressed: boolean, nestedId: string): Promise<void> => {
+      await repaired.storeStream(nestedId, bufferToStream(Buffer.from('nested')))
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+      await expect(repaired.exist(nestedId)).rejects.toBeDefined()
+      // The id `a2` now legitimately owns that path — as a file for a raw store, or as `a2.gzip` for a
+      // compressed one. Both shapes must clear the evidence: the id exists either way.
+      const body = compressed ? Buffer.alloc(3000, 'A') : Buffer.from('content of a2')
+      if (compressed) await repaired.storeStreamAndCompress('a2', bufferToStream(body))
+      else await repaired.storeStream('a2', bufferToStream(body))
+    }
 
     beforeEach(async () => {
-      // ENOTDIR from the PARENT probe means a hard obstruction above the shard; it used to be
-      // lumped in with "this shard was never created" and answered as a miss.
-      const flatRoot = mkdtempSync(path.join(os.tmpdir(), 'obstructed-'))
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'repaired-prefix-'))
+      repaired = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+    })
+
+    afterEach(async () => {
+      await repaired.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    describe('and the store committed the raw representation', () => {
+      beforeEach(async () => {
+        await damageThenStore(false, 'a2/b')
+      })
+
+      it('should report a read under the occupied prefix as absent rather than a fault', async () => {
+        expect(await repaired.exist('a2/b')).toBe(false)
+      })
+
+      it('should agree with retrieve', async () => {
+        expect(await repaired.retrieve('a2/b')).toBeUndefined()
+      })
+
+      it('should still serve the id that now owns the path', async () => {
+        expect(await repaired.exist('a2')).toBe(true)
+      })
+    })
+
+    describe('and the damage was recorded against a DESCENDANT of the committed path', () => {
+      // The store's own `dirname` is what gets recorded, so a deeper id files the damage below the path the
+      // later store commits: `a2/b/c` records `<root>/a2/b` while the store of `a2` owns `<root>/a2`. Clearing
+      // only the committed path left this rejecting — the same disagreement one level down.
+      beforeEach(async () => {
+        await damageThenStore(false, 'a2/b/c')
+      })
+
+      it('should report the deeper read as absent rather than a fault', async () => {
+        expect(await repaired.exist('a2/b/c')).toBe(false)
+      })
+
+      it('should agree with retrieve', async () => {
+        expect(await repaired.retrieve('a2/b/c')).toBeUndefined()
+      })
+
+      it('should report the intermediate path as absent too', async () => {
+        expect(await repaired.exist('a2/b')).toBe(false)
+      })
+
+      it('should still serve the id that now owns the prefix', async () => {
+        expect(await repaired.exist('a2')).toBe(true)
+      })
+
+      it('should still refuse to STORE the shadowed id, with the typed error', async () => {
+        // The asymmetry the read answer is derived from: nothing can be created under a path a file occupies,
+        // so the store is a caller error while the read has a provable answer.
+        await expect(repaired.storeStream('a2/b/c', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+    })
+
+    describe('and a COMPRESSED commit claims the prefix instead', () => {
+      // A gzip-only commit writes `<root>/a2.gzip` and leaves `<root>/a2` unoccupied, so the filesystem raises
+      // no objection to a directory being created there — but a byte RANGE of `a2` has to publish its
+      // decompressed copy at exactly that path, so allowing it would leave `a2` able to serve whole reads and
+      // never a range, with no way back: the path cannot be freed while the nested id lives there, and neither
+      // re-storing nor deleting `a2` recovers. So the nested store is refused, and the read follows it — an id
+      // that can never be created reads as absent, which is what keeps store, read and delete agreeing.
+      //
+      // Both commit shapes therefore answer the SAME way, by different mechanisms: the filesystem cannot hold a
+      // file and a directory at one path, and this storage will not put a directory where a range must publish.
+      beforeEach(async () => {
+        await damageThenStore(true, 'a2/b/c')
+      })
+
+      it('should refuse a store of the nested id, with the typed error', async () => {
+        await expect(repaired.storeStream('a2/b/c', bufferToStream(Buffer.from('again')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should report the nested id as absent, since it can never be created again', async () => {
+        expect(await repaired.exist('a2/b/c')).toBe(false)
+      })
+
+      it('should agree with retrieve', async () => {
+        expect(await repaired.retrieve('a2/b/c')).toBeUndefined()
+      })
+
+      it('should let delete resolve for it, as the third surface of the same answer', async () => {
+        await expect(repaired.delete(['a2/b/c'])).resolves.toBeUndefined()
+      })
+
+      it('should still serve the compressed id that owns the prefix', async () => {
+        expect(await repaired.exist('a2')).toBe(true)
+      })
+
+      it('should still serve BYTE RANGES of it, which is what the refusal protects', async () => {
+        const item = await repaired.retrieve('a2', { start: 0, end: 9 })
+        await expect(streamToBuffer(await item!.asStream())).resolves.toHaveLength(10)
+      })
+    })
+
+    describe('and an UNRELATED directory is damaged when the store commits', () => {
+      // The other half of the rule: a store supersedes the damage it actually owns, and nothing else. Clearing
+      // the whole set on any successful store would be simpler and wrong — one write anywhere in the root
+      // would silence every outstanding damage report, so a destroyed directory elsewhere would go back to
+      // reading as an ordinary miss, which is the failure this evidence exists to prevent.
+      beforeEach(async () => {
+        await repaired.storeStream('x1/b', bufferToStream(Buffer.from('nested')))
+        rmSync(path.join(flatRoot, 'x1'), { recursive: true, force: true })
+        await expect(repaired.exist('x1/b')).rejects.toBeDefined()
+        // Commits somewhere else entirely; it owns nothing under `<root>/x1`.
+        await repaired.storeStream('y1', bufferToStream(Buffer.from('unrelated')))
+      })
+
+      it('should keep rejecting reads under the still-damaged directory', async () => {
+        await expect(repaired.exist('x1/b')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and a damaged sibling merely SHARES a string prefix with the committed path', () => {
+      // `<root>/a2extra` starts with `<root>/a2` as a string but is not beneath it as a path, so a store of
+      // `a2` must not supersede its damage. Matching on the bare prefix instead of a separator boundary is
+      // the same class of mistake the containment check in `resolveFilePath` guards against.
+      beforeEach(async () => {
+        await repaired.storeStream('a2extra/b', bufferToStream(Buffer.from('nested')))
+        rmSync(path.join(flatRoot, 'a2extra'), { recursive: true, force: true })
+        await expect(repaired.exist('a2extra/b')).rejects.toBeDefined()
+        await repaired.storeStream('a2', bufferToStream(Buffer.from('content of a2')))
+      })
+
+      it('should keep rejecting reads under the damaged sibling', async () => {
+        await expect(repaired.exist('a2extra/b')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and the store committed the compressed representation', () => {
+      beforeEach(async () => {
+        await damageThenStore(true, 'a2/b')
+      })
+
+      it('should report the destroyed nested id as absent, since the compressed id owns the prefix', async () => {
+        // Same reasoning as the deeper compressed case above, one level up: `<root>/a2` is where `a2`'s
+        // decompressed copy has to be published, so `a2/b` can never be stored and absence is the answer the
+        // store and delete surfaces already give.
+        expect(await repaired.exist('a2/b')).toBe(false)
+      })
+
+      it('should still serve the id it committed', async () => {
+        expect(await repaired.exist('a2')).toBe(true)
+      })
+    })
+  })
+
+  describe('when an ancestor cannot be read while an absence is being classified', () => {
+    // The classifier walks up statting ancestors, and either probe can fail for a reason that proves nothing
+    // — EACCES, EIO. Both fail CLOSED, because the alternative is reporting content absent on no evidence.
+    let storage: IContentStorageComponent
+    let storageRoot: string
+    let unreadable: string
+
+    /** A filesystem that answers normally except for one path, which fails as if permissions were damaged. */
+    const failingStatFor = (target: () => string): IFileSystemComponent => {
+      const base = createFsComponent()
+      return {
+        ...base,
+        stat: (async (probed: any, ...rest: any[]) => {
+          if (String(probed) === target()) {
+            throw Object.assign(new Error(`EACCES: permission denied, stat '${probed}'`), { code: 'EACCES' })
+          }
+          return (base.stat as any)(probed, ...rest)
+        }) as IFileSystemComponent['stat']
+      }
+    }
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      if (storageRoot) rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    describe('and the walk reaches it above a path that is merely missing', () => {
+      beforeEach(async () => {
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'unreadable-ancestor-'))
+        unreadable = ''
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingStatFor(() => unreadable), logs: await createLogComponent({}) },
+          storageRoot,
+          { disablePrefixHash: true }
+        )
+        // `<root>/x` becomes a real directory, and `<root>/x/y` is simply not there — so the walk steps past the
+        // missing level and asks about `<root>/x`, which is the level that cannot be read.
+        await storage.storeStream('x/other', bufferToStream(Buffer.from('x')))
+        unreadable = path.join(storageRoot, 'x')
+      })
+
+      it('should reject rather than report the id absent', async () => {
+        await expect(storage.exist('x/y/z')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and it is a path the walk reaches ABOVE a broken observed directory', () => {
+      beforeEach(async () => {
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'unreadable-walk-'))
+        unreadable = ''
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: failingStatFor(() => unreadable), logs: await createLogComponent({}) },
+          storageRoot,
+          { disablePrefixHash: true }
+        )
+        await storage.storeStream('a2/b', bufferToStream(Buffer.from('x')))
+        rmSync(path.join(storageRoot, 'a2'), { recursive: true, force: true })
+        // The walk starts at the broken `<root>/a2` and steps up to the root, which now cannot be read.
+        unreadable = storageRoot
+      })
+
+      it('should reject rather than report the id absent', async () => {
+        await expect(storage.exist('a2/b')).rejects.toBeDefined()
+      })
+    })
+  })
+
+  describe('when a shard holds a file whose name spells no addressable id', () => {
+    let storage: IContentStorageComponent
+    let storageRoot: string
+
+    beforeEach(async () => {
+      // `x.gzip.gzip` would be the compressed representation of `x.gzip`, and no id may end in that suffix,
+      // so the derived id is one `resolveFilePath` refuses — the hash-mode half of that rejection.
+      storageRoot = mkdtempSync(path.join(os.tmpdir(), 'shard-reserved-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        storageRoot
+      )
+      await storage.storeStream('real', bufferToStream(Buffer.from('x')))
+      const shard = createHash('sha1').update('real').digest('hex').substring(0, 4)
+      await nodeFs.writeFile(path.join(storageRoot, shard, 'x.gzip.gzip'), 'foreign')
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    it('should not enumerate it', async () => {
+      const listed: string[] = []
+      for await (const id of storage.allFileIds()) listed.push(id)
+
+      expect(listed).toEqual(['real'])
+    })
+  })
+
+  describe('when a regular file occupies a SHARD path in hash-prefix mode', () => {
+    // A file where a shard belongs is foreign to the layout: content lives at `<root>/<shard>/<id>`, so nothing
+    // resolves to `<root>/<shard>` and this storage would never put anything there. Treating it as another id's
+    // content made every id in that shard — 1/65,536 of the keyspace — read as an empty node, and told a store
+    // its id was bad when the id was fine and the tree was not.
+    let storage: IContentStorageComponent
+    let storageRoot: string
+    const idInShard = 'some-id'
+
+    beforeEach(async () => {
+      storageRoot = mkdtempSync(path.join(os.tmpdir(), 'file-at-shard-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        storageRoot
+      )
+      const shard = createHash('sha1').update(idInShard).digest('hex').substring(0, 4)
+      await nodeFs.writeFile(path.join(storageRoot, shard), 'foreign file where a shard belongs')
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    it('should reject exist rather than report the id absent', async () => {
+      await expect(storage.exist(idInShard)).rejects.toBeDefined()
+    })
+
+    it('should reject fileInfo for the same reason', async () => {
+      await expect(storage.fileInfo(idInShard)).rejects.toBeDefined()
+    })
+
+    it('should reject retrieve for the same reason', async () => {
+      await expect(storage.retrieve(idInShard)).rejects.toBeDefined()
+    })
+
+    it('should refuse a store as a storage fault, NOT as a bad content id', async () => {
+      // The class matters: a service maps the typed error to 400 and stops retrying, which is wrong when the
+      // id is valid and an operator has to clear the obstruction.
+      const failure = await storage.storeStream(idInShard, bufferToStream(Buffer.from('x'))).then(
+        () => undefined,
+        (error) => error
+      )
+
+      expect(failure).toBeDefined()
+      expect(failure).not.toBeInstanceOf(PathNotContainedError)
+    })
+
+    it('should say what is wrong with the tree', async () => {
+      await expect(storage.storeStream(idInShard, bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /no content id resolves to/
+      )
+    })
+  })
+
+  describe('when a NESTED id needs a directory under a foreign file', () => {
+    // The immediate-parent case and the recursive-mkdir case are different branches, and only the first was
+    // classified. `statOccupant` collapses an ancestor ENOTDIR to "absent", so a nested id took the
+    // `mkdir(..., { recursive: true })` path, failed ENOTDIR there, and was reported as a bad content id —
+    // sending a service to 400 over a valid id and hiding the operator action that would fix the tree.
+    const shardOfId = (id: string): string => createHash('sha1').update(id).digest('hex').substring(0, 4)
+    let storage: IContentStorageComponent
+    let storageRoot: string
+    const nestedId = 'some/child'
+
+    beforeEach(async () => {
+      storageRoot = mkdtempSync(path.join(os.tmpdir(), 'nested-foreign-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        storageRoot
+      )
+      // A foreign file where the SHARD belongs, so the obstruction is two levels above the id's own parent.
+      await nodeFs.writeFile(path.join(storageRoot, shardOfId(nestedId)), 'foreign')
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    it('should refuse the store as a storage fault, not as a bad content id', async () => {
+      const failure = await storage.storeStream(nestedId, bufferToStream(Buffer.from('x'))).then(
+        () => undefined,
+        (error) => error
+      )
+
+      expect(failure).toBeDefined()
+      expect(failure).not.toBeInstanceOf(PathNotContainedError)
+    })
+
+    it('should name the obstructing path', async () => {
+      await expect(storage.storeStream(nestedId, bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /is not a directory and is not content any id resolves to/
+      )
+    })
+  })
+
+  describe('when a nested id needs a directory under ANOTHER ID content', () => {
+    // The counterpart, so the recursive-mkdir branch keeps the typed class where the obstruction really is a
+    // prefix collision: `<root>/a` is exactly where the id `a` lives, and `a/b/c` asks for a directory there.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'nested-content-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      await storage.storeStream('a', bufferToStream(Buffer.from('content')))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should refuse the store with the typed error', async () => {
+      await expect(storage.storeStream('a/b/c', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    })
+  })
+
+  describe('when a foreign file is named like the reserved directory plus the compressed suffix', () => {
+    // `<root>/.tmp-writes.gzip` is not inside the reserved directory, so it is enumerable — but the id it
+    // would stand for is `.tmp-writes`, whose RAW path IS the reserved directory, which every point lookup
+    // refuses. Checking only the `.gzip` path for containment accepted it and enumeration reported an id
+    // nothing could serve.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+    let listed: string[]
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'reserved-gzip-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      await nodeFs.writeFile(path.join(flatRoot, '.tmp-writes.gzip'), 'foreign')
+      await storage.storeStream('real', bufferToStream(Buffer.from('x')))
+      listed = []
+      for await (const id of storage.allFileIds()) listed.push(id)
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should not enumerate the reserved id', () => {
+      expect(listed).not.toContain('.tmp-writes')
+    })
+
+    it('should still enumerate the real content', () => {
+      expect(listed).toEqual(['real'])
+    })
+
+    it('should agree with the point lookup, which refuses that id', async () => {
+      await expect(storage.exist('.tmp-writes')).rejects.toBeInstanceOf(PathNotContainedError)
+    })
+  })
+
+  describe('when a regular file occupies a path that IS another id content', () => {
+    // The other side of the same test, so the two classes cannot be conflated: in flat mode `<root>/a` is
+    // exactly where the id `a` lives, so `a/b` really is a prefix collision — absent on a read, and a typed
+    // rejection on a store.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'file-at-content-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      await storage.storeStream('a', bufferToStream(Buffer.from('content')))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should report the nested id as absent', async () => {
+      expect(await storage.exist('a/b')).toBe(false)
+    })
+
+    it('should refuse a store with the typed error', async () => {
+      await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    })
+  })
+
+  describe('when something that is neither a file nor a directory occupies a path', () => {
+    // A fifo, socket or device node is FOREIGN to this storage: no id can create one, so it is a storage
+    // fault rather than a bad request — the distinction the typed error draws everywhere else.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+    let madeFifo: boolean
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'foreign-node-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'pipe')]).status === 0
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should refuse to store an id whose PARENT path is one, as a fault not a bad request', async () => {
+      if (!madeFifo) return
+      await expect(storage.storeStream('pipe/child', bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /neither a directory nor a regular file/
+      )
+    })
+
+    it('should refuse to store an id whose own COMMIT TARGET is one', async () => {
+      if (!madeFifo) return
+      await expect(storage.storeStream('pipe', bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /neither a regular file\s*\n?\s*nor a directory|neither a regular file nor a directory/
+      )
+    })
+
+    // The direct content path used to be the one place this rule was not applied: every non-file occupant was
+    // collapsed into the directory case and answered as a clean miss, so a fifo or socket sitting exactly where
+    // an id's content belongs made `exist` false, `fileInfo`/`retrieve` undefined and `existMultiple` carry on —
+    // a provably-absent answer for a path that is not empty. Serving it would have been worse still: opening a
+    // fifo for reading blocks until a writer appears, so the request would hang instead of failing.
+    it('should reject exist rather than reporting absence', async () => {
+      if (!madeFifo) return
+      await expect(storage.exist('pipe')).rejects.toBeDefined()
+    })
+
+    it('should reject fileInfo rather than reporting absence', async () => {
+      if (!madeFifo) return
+      await expect(storage.fileInfo('pipe')).rejects.toBeDefined()
+    })
+
+    it('should reject retrieve rather than reporting absence', async () => {
+      if (!madeFifo) return
+      await expect(storage.retrieve('pipe')).rejects.toBeDefined()
+    })
+
+    it('should reject a byte-range read rather than reporting absence', async () => {
+      if (!madeFifo) return
+      await expect(storage.retrieve('pipe', { start: 0, end: 4 })).rejects.toBeDefined()
+    })
+
+    it('should fail an existMultiple batch containing it rather than answering false for it', async () => {
+      if (!madeFifo) return
+      await expect(storage.existMultiple(['pipe', 'other'])).rejects.toBeDefined()
+    })
+
+    it('should not enumerate it as an id, which no read would accept', async () => {
+      if (!madeFifo) return
+      // Enumeration and the point lookups have to answer the same question: yielding an id whose `exist()`
+      // throws hands a GC sweep a batch that fails on every retry, forever.
+      const ids: string[] = []
+      for await (const id of storage.allFileIds()) ids.push(id)
+      expect(ids).toEqual([])
+    })
+
+    it('should reject a read NESTED under it rather than reporting absence', async () => {
+      if (!madeFifo) return
+      // Nothing can be created beneath it and nothing serves it, so — like a file no id resolves to — it is
+      // foreign state in this storage's own tree rather than a prefix another id legitimately owns.
+      await expect(storage.exist('pipe/child')).rejects.toBeDefined()
+    })
+  })
+
+  describe('when an id stored COMPRESSED would have a directory created beside it', () => {
+    // `storeStreamAndCompress('a')` leaves only `a.gzip`, so the raw path `a` is free and a nested store used to
+    // create a directory there unopposed. Whole reads of `a` kept working and ranges of it then rejected
+    // FOREVER — the decompressed copy a range needs has to be published at exactly that path. Nothing could
+    // recover it: re-storing `a` raw or compressed is refused (its commit target is now a directory), and
+    // deleting `a` leaves the directory behind. The same end state reached the other way round — directory
+    // first, then a compressed store — was already refused for precisely this reason, so the verdict depended
+    // on arrival order rather than on the state.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'compressed-prefix-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      await storage.storeStreamAndCompress('a', bufferToStream(Buffer.alloc(3000, 'A')))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should refuse the nested store with the typed error', async () => {
+      await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    })
+
+    it('should refuse it however many levels separate the two', async () => {
+      // The collision can sit any number of ancestors above the directory being created.
+      await expect(storage.storeStream('a/b/c', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    })
+
+    it('should refuse a nested COMPRESSED store too, which commits to the same directory', async () => {
+      await expect(
+        storage.storeStreamAndCompress('a/b', bufferToStream(Buffer.alloc(3000, 'B')))
+      ).rejects.toBeInstanceOf(PathNotContainedError)
+    })
+
+    it('should leave NOTHING on disk, since an empty directory would be the breakage itself', async () => {
+      // Checked before the mkdir rather than undone after it: this component exposes no `rmdir`, and a directory
+      // left behind by the rejection would break ranges exactly as the store would have.
+      await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeDefined()
+
+      // The reserved staging directory is this storage's own and always present; nothing else may be.
+      const entries = (await nodeFs.readdir(flatRoot)).filter((name) => !name.startsWith('.tmp'))
+      expect(entries).toEqual(['a.gzip'])
+    })
+
+    it('should keep byte ranges of the compressed id servable, which is the point', async () => {
+      await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeDefined()
+
+      const item = await storage.retrieve('a', { start: 0, end: 9 })
+      await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
+    })
+
+    describe('and the raw prefix directory ALREADY exists', () => {
+      // The rule is about the state, so it cannot depend on whether this call had to create the directory. A
+      // tree written by an older version has exactly this shape — the nested store used to be allowed — as does
+      // one where a version that created directories on read, or an operator, got there first. Gated on the
+      // mkdir, the check let a store commit content below the very path `a`'s range cache must publish at.
+      beforeEach(async () => {
+        await nodeFs.mkdir(path.join(flatRoot, 'a'))
+      })
+
+      it('should refuse the nested store just the same', async () => {
+        await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should refuse it when the pre-existing directory is deeper than the collision', async () => {
+        await nodeFs.mkdir(path.join(flatRoot, 'a', 'b'))
+
+        await expect(storage.storeStream('a/b/c', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should add nothing under it, so the tree gains no unservable content', async () => {
+        await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeDefined()
+
+        await expect(nodeFs.readdir(path.join(flatRoot, 'a'))).resolves.toEqual([])
+      })
+
+      describe('and something has already put that directory in the mkdir-skip cache', () => {
+        // That cache means "this is a directory RIGHT NOW", which a read, an enumeration, the absence classifier
+        // and the commit-target probe all establish — and none of them runs this check. Gating on it let the
+        // guard lapse the moment anything looked at the tree: enumerating the root was enough.
+        it('should still refuse after allFileIds() has warmed it', async () => {
+          for await (const _unusedId of storage.allFileIds()) {
+            // Drained for the side effect: the walk records every directory it opens.
+          }
+
+          await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+            PathNotContainedError
+          )
+        })
+
+        it('should still refuse after a read of the nested id has warmed it', async () => {
+          await storage.exist('a/b').catch(() => undefined)
+
+          await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+            PathNotContainedError
+          )
+        })
+
+        it('should still refuse after a read of another file inside it has warmed it', async () => {
+          await nodeFs.writeFile(path.join(flatRoot, 'a', 'pre'), 'x')
+          await storage.exist('a/pre').catch(() => undefined)
+
+          await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+            PathNotContainedError
+          )
+        })
+      })
+    })
+
+    describe('and a nested store races a compressed store of the prefix id', () => {
+      // TWO PREFLIGHTS THAT EACH PASSED ARE NOT ENOUGH. The compressed store probes its commit targets while the
+      // raw path is free, then spends as long as consuming and compressing its source takes before committing —
+      // and a nested store checking and creating the directory inside that window was correct when it ran too.
+      // Both checks passed, and the pair they exist to prevent existed anyway, permanently.
+      let racedRoot: string
+      let racedStorage: IContentStorageComponent
+      let compressedOutcome: string
+      let nestedOutcome: string
+
+      beforeEach(async () => {
+        racedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-race-'))
+        racedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          racedRoot,
+          { disablePrefixHash: true }
+        )
+        // Stalls after its first chunk, which parks the compressed store past its preflight and before its
+        // commit — the window, held open deterministically instead of raced for.
+        const stalled = new PassThrough()
+        stalled.write(Buffer.alloc(3000, 'A'))
+        const compressed = racedStorage
+          .storeStreamAndCompress('a', stalled)
+          .then(() => 'resolved')
+          .catch((err) => err.constructor.name)
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        nestedOutcome = await racedStorage
+          .storeStream('a/b', bufferToStream(Buffer.from('nested')))
+          .then(() => 'resolved')
+          .catch((err) => err.constructor.name)
+        stalled.end(Buffer.alloc(3000, 'A'))
+        compressedOutcome = await compressed
+      })
+
+      afterEach(async () => {
+        await racedStorage.stop?.()
+        rmSync(racedRoot, { recursive: true, force: true })
+      })
+
+      it('should refuse the compressed store, which is the one that has to lose', () => {
+        expect(compressedOutcome).toBe('PathNotContainedError')
+      })
+
+      it('should let the nested store through', () => {
+        expect(nestedOutcome).toBe('resolved')
+      })
+
+      it('should publish no compressed representation beside the directory', async () => {
+        const entries = (await nodeFs.readdir(racedRoot)).filter((name) => !name.startsWith('.tmp'))
+        expect(entries).toEqual(['a'])
+      })
+
+      it('should keep the nested id readable', async () => {
+        await expect(racedStorage.exist('a/b')).resolves.toBe(true)
+      })
+    })
+
+    describe('and the compressed commit is already holding the prefix path lock', () => {
+      // The other order, and the one that proves it is a LOCK rather than luck: the compressed store is held
+      // INSIDE its commit — past its own re-probe of the raw path — so the only thing that can still stop a
+      // nested store from creating the directory underneath it is the lock itself.
+      let lockedRoot: string
+      let lockedStorage: IContentStorageComponent
+      let settledWhileLocked: boolean
+      let compressedOutcome: string
+      let nestedOutcome: string
+
+      /** Runs `nestedId` against a compressed store of `a` that is frozen mid-publish. */
+      const raceAgainstHeldCommit = async (nestedId: string): Promise<void> => {
+        lockedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-lock-'))
+        let releaseCommit: () => void = () => {}
+        let commitReached: () => void = () => {}
+        const reached = new Promise<void>((resolve) => {
+          commitReached = resolve
+        })
+        const base = createFsComponent()
+        const gatedFs: IFileSystemComponent = {
+          ...base,
+          rename: (async (from: any, to: any) => {
+            // The compressed commit's own publish, which runs inside the prefix path lock.
+            if (String(to).endsWith('a.gzip')) {
+              commitReached()
+              await new Promise<void>((resolve) => {
+                releaseCommit = resolve
+              })
+            }
+            return base.rename(from, to)
+          }) as any
+        }
+        lockedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: gatedFs, logs: await createLogComponent({}) },
+          lockedRoot,
+          { disablePrefixHash: true }
+        )
+        const compressed = lockedStorage
+          .storeStreamAndCompress('a', bufferToStream(Buffer.alloc(3000, 'A')))
+          .then(() => 'resolved')
+          .catch((err) => err.constructor.name)
+        await reached
+
+        settledWhileLocked = false
+        const nested = lockedStorage
+          .storeStream(nestedId, bufferToStream(Buffer.from('nested')))
+          .then(() => 'resolved')
+          .catch((err) => err.constructor.name)
+        void nested.then(() => {
+          settledWhileLocked = true
+        })
+        // A short wait is the safe direction for a negative assertion: a slower machine makes settling LESS
+        // likely, so this cannot fail spuriously — only a nested store that ignored the lock trips it.
+        await new Promise((resolve) => setTimeout(resolve, 120))
+        const observed = settledWhileLocked
+
+        releaseCommit()
+        compressedOutcome = await compressed
+        nestedOutcome = await nested
+        settledWhileLocked = observed
+      }
+
+      afterEach(async () => {
+        await lockedStorage.stop?.()
+        rmSync(lockedRoot, { recursive: true, force: true })
+      })
+
+      describe('and the nested id sits directly under it', () => {
+        beforeEach(async () => {
+          await raceAgainstHeldCommit('a/b')
+        })
+
+        it('should hold the nested store until the commit releases the lock', () => {
+          expect(settledWhileLocked).toBe(false)
+        })
+
+        it('should then refuse it with the typed error', () => {
+          expect(nestedOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should let the compressed store commit', () => {
+          expect(compressedOutcome).toBe('resolved')
+        })
+
+        it('should keep byte ranges of the compressed id servable', async () => {
+          const item = await lockedStorage.retrieve('a', { start: 0, end: 9 })
+          await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
+        })
+      })
+
+      describe('and the nested id sits SEVERAL levels under it', () => {
+        // Every level the check inspects is locked, not just the directory being created. Locking only the
+        // immediate parent left a store of `a/b/c` taking the lock on `<root>/a/b` while the compressed store
+        // held `<root>/a` — so its `mkdir -p` created `<root>/a` in the window between the commit's re-probe
+        // and its rename, which is the one interleaving the re-probe alone cannot see.
+        beforeEach(async () => {
+          await raceAgainstHeldCommit('a/b/c')
+        })
+
+        it('should hold it on the SHALLOWEST level, which is the one being published', () => {
+          expect(settledWhileLocked).toBe(false)
+        })
+
+        it('should then refuse it with the typed error', () => {
+          expect(nestedOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should have published the compressed representation and nothing else', async () => {
+          const entries = (await nodeFs.readdir(lockedRoot)).filter((name) => !name.startsWith('.tmp'))
+          expect(entries).toEqual(['a.gzip'])
+        })
+
+        it('should keep byte ranges of the compressed id servable', async () => {
+          const item = await lockedStorage.retrieve('a', { start: 0, end: 9 })
+          await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
+        })
+      })
+    })
+
+    describe('and a store of the prefix id ITSELF races the nested one', () => {
+      // Preflight values do not survive a wait. `ensureDirectoryFor` probed what occupies the directory before
+      // taking the prefix locks and then branched on that value inside them, so a nested store that saw
+      // `absent`, queued behind a raw store of `a` committing under the same lock, and then ran `mkdir` over the
+      // file it had just published surfaced a bare EEXIST. And a raw commit never re-checked its own target, so
+      // the mirror image — a nested store making `<root>/a` a directory between the raw store's preflight and
+      // its commit — surfaced a bare EISDIR. Both are conflicts the preflights report as typed refusals, so a
+      // service saw 500-and-retry-forever for an id that can never succeed.
+      let racedRoot: string
+      let racedStorage: IContentStorageComponent
+
+      afterEach(async () => {
+        await racedStorage.stop?.()
+        rmSync(racedRoot, { recursive: true, force: true })
+      })
+
+      describe('and the raw store of the prefix commits first, holding the lock', () => {
+        let nestedOutcome: string
+
+        beforeEach(async () => {
+          racedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-stale-'))
+          let releaseCommit: () => void = () => {}
+          let commitReached: () => void = () => {}
+          const reached = new Promise<void>((resolve) => {
+            commitReached = resolve
+          })
+          const base = createFsComponent()
+          const gatedFs: IFileSystemComponent = {
+            ...base,
+            rename: (async (from: any, to: any) => {
+              // The raw commit of `a`, inside the path lock the nested store needs for its mkdir.
+              if (String(to) === path.join(racedRoot, 'a')) {
+                commitReached()
+                await new Promise<void>((resolve) => {
+                  releaseCommit = resolve
+                })
+              }
+              return base.rename(from, to)
+            }) as any
+          }
+          racedStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: gatedFs, logs: await createLogComponent({}) },
+            racedRoot,
+            { disablePrefixHash: true }
+          )
+          const raw = racedStorage.storeStream('a', bufferToStream(Buffer.from('RAW'))).catch(() => undefined)
+          await reached
+          const nested = racedStorage
+            .storeStream('a/b', bufferToStream(Buffer.from('nested')))
+            .then(() => 'resolved')
+            .catch((err) => err.constructor.name)
+          await new Promise((resolve) => setTimeout(resolve, 80))
+          releaseCommit()
+          await raw
+          nestedOutcome = await nested
+        })
+
+        it('should refuse the nested store with the typed error, not a raw EEXIST', () => {
+          expect(nestedOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should have stored the prefix id itself', async () => {
+          await expect(racedStorage.exist('a')).resolves.toBe(true)
+        })
+      })
+
+      describe('and the nested store lands between the raw preflight and its commit', () => {
+        let rawOutcome: string
+
+        beforeEach(async () => {
+          racedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-late-'))
+          racedStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: createFsComponent(), logs: await createLogComponent({}) },
+            racedRoot,
+            { disablePrefixHash: true }
+          )
+          // Stalls after its first chunk, holding the raw store between its preflight and its commit.
+          const stalled = new PassThrough()
+          stalled.write(Buffer.from('RA'))
+          const raw = racedStorage
+            .storeStream('a', stalled)
+            .then(() => 'resolved')
+            .catch((err) => err.constructor.name)
+          await new Promise((resolve) => setTimeout(resolve, 40))
+          await racedStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))
+          stalled.end(Buffer.from('W'))
+          rawOutcome = await raw
+        })
+
+        it('should refuse the raw store with the typed error, not a raw EISDIR', () => {
+          expect(rawOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should keep the nested id that won', async () => {
+          await expect(racedStorage.exist('a/b')).resolves.toBe(true)
+        })
+      })
+
+      describe('and the nested store claims the COMPRESSED target instead', () => {
+        // The same window on the other commit target: `a.gzip/x` is a legal id, so `<root>/a.gzip` can become a
+        // directory while a compressed store of `a` is consuming its source. The gzip commit's re-probe covers
+        // the RAW path, so this one is caught by classifying the commit's own failure.
+        let compressedOutcome: string
+
+        beforeEach(async () => {
+          racedRoot = mkdtempSync(path.join(os.tmpdir(), 'gzip-target-late-'))
+          racedStorage = await createFolderBasedFileSystemContentStorage(
+            { fs: createFsComponent(), logs: await createLogComponent({}) },
+            racedRoot,
+            { disablePrefixHash: true }
+          )
+          const stalled = new PassThrough()
+          stalled.write(Buffer.alloc(3000, 'A'))
+          const compressed = racedStorage
+            .storeStreamAndCompress('a', stalled)
+            .then(() => 'resolved')
+            .catch((err) => err.constructor.name)
+          await new Promise((resolve) => setTimeout(resolve, 40))
+          await racedStorage.storeStream('a.gzip/x', bufferToStream(Buffer.from('nested')))
+          stalled.end(Buffer.alloc(3000, 'A'))
+          compressedOutcome = await compressed
+        })
+
+        it('should refuse the compressed store with the typed error, not a raw EISDIR', () => {
+          expect(compressedOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should keep the id that claimed the compressed path', async () => {
+          await expect(racedStorage.exist('a.gzip/x')).resolves.toBe(true)
+        })
+      })
+    })
+
+    describe('and the prefix path itself becomes content after the directory is gone', () => {
+      // Caching a checked directory has to be undone by whatever stops it being one. A store into `<root>/a`
+      // records it as present and prefix-verified; the directory is then removed out of band — an operator, a
+      // repair flow — and a store of the id `a` legitimately lands content at that exact path. The next nested
+      // store trusted both stale entries, skipped the stat AND the prefix check, and failed with a bare errno
+      // from its rename: ENOTDIR against the raw file, ENOENT against a gzip-primary commit that reserves the
+      // path for range publication. `writingUnder` cleared the entries only AFTER that failure, so the typed
+      // refusal arrived one attempt late. A successful commit now retires them itself.
+      let repairedRoot: string
+      let repairedStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        repairedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-became-content-'))
+        repairedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          repairedRoot,
+          { disablePrefixHash: true }
+        )
+        await repairedStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))
+        rmSync(path.join(repairedRoot, 'a'), { recursive: true, force: true })
+      })
+
+      afterEach(async () => {
+        await repairedStorage.stop?.()
+        rmSync(repairedRoot, { recursive: true, force: true })
+      })
+
+      describe('and a RAW store claims it', () => {
+        beforeEach(async () => {
+          await repairedStorage.storeStream('a', bufferToStream(Buffer.from('RAW')))
+        })
+
+        it('should refuse the next nested store with the typed error, first attempt', async () => {
+          await expect(
+            repairedStorage.storeStream('a/c', bufferToStream(Buffer.from('nested')))
+          ).rejects.toBeInstanceOf(PathNotContainedError)
+        })
+
+        it('should keep serving the id that claimed the path', async () => {
+          await expect(repairedStorage.exist('a')).resolves.toBe(true)
+        })
+      })
+
+      describe('and a COMPRESSED store claims it', () => {
+        beforeEach(async () => {
+          await repairedStorage.storeStreamAndCompress('a', bufferToStream(Buffer.alloc(3000, 'A')))
+        })
+
+        it('should refuse the next nested store with the typed error, first attempt', async () => {
+          await expect(
+            repairedStorage.storeStream('a/c', bufferToStream(Buffer.from('nested')))
+          ).rejects.toBeInstanceOf(PathNotContainedError)
+        })
+
+        it('should keep byte ranges of the compressed id servable', async () => {
+          const item = await repairedStorage.retrieve('a', { start: 0, end: 9 })
+          await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
+        })
+      })
+    })
+
+    describe('and repeated stores go into a directory the store path has already checked', () => {
+      // The check is per DIRECTORY, not per store: once the store path has asked, repeat stores skip it and the
+      // write path costs exactly what it did before. Only PASSES are cached, so a refusal is re-decided every
+      // time and deleting the compressed id lifts it at once.
+      let countingRoot: string
+      let countingStorage: IContentStorageComponent
+      let twinProbes: number
+
+      beforeEach(async () => {
+        countingRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-verify-once-'))
+        twinProbes = 0
+        const base = createFsComponent()
+        const countingFs: IFileSystemComponent = {
+          ...base,
+          stat: (async (probed: any, ...rest: any[]) => {
+            if (String(probed) === path.join(countingRoot, 'd.gzip')) twinProbes++
+            return base.stat(probed, ...rest)
+          }) as any
+        }
+        countingStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: countingFs, logs: await createLogComponent({}) },
+          countingRoot,
+          { disablePrefixHash: true }
+        )
+        for (let i = 0; i < 5; i++) {
+          await countingStorage.storeStream(`d/x${i}`, bufferToStream(Buffer.from('x')))
+        }
+      })
+
+      afterEach(async () => {
+        await countingStorage.stop?.()
+        rmSync(countingRoot, { recursive: true, force: true })
+      })
+
+      it('should probe the compressed twin once, not once per store', () => {
+        expect(twinProbes).toBe(1)
+      })
+
+      it('should have stored every id', async () => {
+        await expect(countingStorage.exist('d/x4')).resolves.toBe(true)
+      })
+    })
+
+    describe('and the directory vanishes before a compressed store takes the freed name', () => {
+      // The one sequence that can falsify a cached pass, and it needs the directory to be removed from under a
+      // live instance: the compressed store is legal once the raw path is free, and a store nesting under it
+      // afterwards used to find both cache entries stale. It never created the collision — the rename has no
+      // directory to land in — but it reported that as a bare ENOENT, and only a RETRY, past the entry
+      // `writingUnder` invalidates, gave the typed refusal. A successful commit now retires both entries for the
+      // path it claimed, so the first attempt is already right.
+      let staleRoot: string
+      let staleStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        staleRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-vanished-'))
+        staleStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          staleRoot,
+          { disablePrefixHash: true }
+        )
+        await staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))
+        await staleStorage.delete(['a/b'])
+        await nodeFs.rmdir(path.join(staleRoot, 'a'))
+        await staleStorage.storeStreamAndCompress('a', bufferToStream(Buffer.alloc(3000, 'A')))
+      })
+
+      afterEach(async () => {
+        await staleStorage.stop?.()
+        rmSync(staleRoot, { recursive: true, force: true })
+      })
+
+      it('should not commit content below the compressed id raw path', async () => {
+        await expect(staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeDefined()
+
+        await expect(nodeFs.stat(path.join(staleRoot, 'a', 'b'))).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+
+      it('should give the typed refusal on the FIRST attempt, not only on a retry', async () => {
+        await expect(staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should still give it on a second attempt', async () => {
+        await staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested'))).catch(() => undefined)
+
+        await expect(staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
+          PathNotContainedError
+        )
+      })
+
+      it('should keep byte ranges of the compressed id servable throughout', async () => {
+        await staleStorage.storeStream('a/b', bufferToStream(Buffer.from('nested'))).catch(() => undefined)
+
+        const item = await staleStorage.retrieve('a', { start: 0, end: 9 })
+        await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
+      })
+    })
+
+    it('should still allow a nested store once the compressed id is deleted', async () => {
+      // The rule is about the STATE, so clearing it lifts the refusal.
+      await storage.delete(['a'])
+
+      await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).resolves.toBeUndefined()
+    })
+
+    it('should still allow an unrelated nested store beside it', async () => {
+      await expect(storage.storeStream('other/b', bufferToStream(Buffer.from('nested')))).resolves.toBeUndefined()
+    })
+
+    describe('and hash prefixes put the two ids in different shards', () => {
+      let hashRoot: string
+      let hashStorage: IContentStorageComponent
+
+      beforeEach(async () => {
+        hashRoot = mkdtempSync(path.join(os.tmpdir(), 'compressed-prefix-hash-'))
+        hashStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          hashRoot
+        )
+        await hashStorage.storeStreamAndCompress('a', bufferToStream(Buffer.alloc(3000, 'A')))
+      })
+
+      afterEach(async () => {
+        await hashStorage.stop?.()
+        rmSync(hashRoot, { recursive: true, force: true })
+      })
+
+      it('should allow the nested store, since the two never share a directory', async () => {
+        await expect(hashStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).resolves.toBeUndefined()
+      })
+
+      it('should keep byte ranges of the compressed id servable', async () => {
+        await hashStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))
+
+        const item = await hashStorage.retrieve('a', { start: 0, end: 9 })
+        await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
+      })
+
+      it('should not refuse for a compressed file no id resolves to', async () => {
+        // A `.gzip` in the WRONG shard is foreign state, not another id's content: `a`'s compressed form lives
+        // under `sha1('a')`, so a file of that name beside `a/b`'s own shard protects no id at all, and refusing
+        // for it would send a service to 400 over a valid id it can never correct. The canonicality test is what
+        // separates the two, and it is also what keeps this check off the hot path — a shard name never spells
+        // its own id, so hash-mode stores settle it without a single stat.
+        const nestedShard = path.join(hashRoot, createHash('sha1').update('a/b').digest('hex').substring(0, 4))
+        await nodeFs.mkdir(nestedShard, { recursive: true })
+        await nodeFs.writeFile(path.join(nestedShard, 'a.gzip'), 'foreign')
+
+        await expect(hashStorage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).resolves.toBeUndefined()
+      })
+    })
+  })
+
+  describe('when a foreign node occupies ONE representation of an id', () => {
+    // A fifo at `<id>.gzip` says nothing about the raw file beside it. Faulting on the first probe would answer
+    // "cannot be read" for content this storage can read — the same bug as reporting a fault as absence, only
+    // pointing the other way — so the fault is deferred and raised only if no representation serves the id.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+    let madeFifo: boolean
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'foreign-representation-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    describe('and it is the COMPRESSED path while the raw content is intact', () => {
+      beforeEach(async () => {
+        await storage.storeStream('a', bufferToStream(Buffer.from('REAL')))
+        madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'a.gzip')]).status === 0
+      })
+
+      it('should still report the id present', async () => {
+        if (!madeFifo) return
+        expect(await storage.exist('a')).toBe(true)
+      })
+
+      it('should still serve the raw bytes', async () => {
+        if (!madeFifo) return
+        const item = await storage.retrieve('a')
+        await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.from('REAL'))
+      })
+
+      it('should still enumerate the id exactly once', async () => {
+        if (!madeFifo) return
+        // The gzip-name set must not count it either: a fifo named `a.gzip` is not a compressed
+        // representation, so suppressing the raw entry for it would leave the id yielded by NEITHER.
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toEqual(['a'])
+      })
+    })
+
+    describe('and it is the RAW path while the compressed content is intact', () => {
+      beforeEach(async () => {
+        await storage.storeStreamAndCompress('g', bufferToStream(Buffer.alloc(3000, 'A')))
+        madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'g')]).status === 0
+      })
+
+      it('should still report the id present', async () => {
+        if (!madeFifo) return
+        expect(await storage.exist('g')).toBe(true)
+      })
+
+      it('should still enumerate the id, from its compressed entry', async () => {
+        if (!madeFifo) return
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toEqual(['g'])
+      })
+    })
+
+    describe('and NEITHER representation holds content', () => {
+      beforeEach(() => {
+        madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'a.gzip')]).status === 0
+      })
+
+      it('should reject the read, since the deferred fault is all that is left', async () => {
+        if (!madeFifo) return
+        await expect(storage.exist('a')).rejects.toBeDefined()
+      })
+
+      it('should not enumerate the id', async () => {
+        if (!madeFifo) return
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toEqual([])
+      })
+    })
+
+    describe('and the directory holding it is too large to buffer', () => {
+      beforeEach(async () => {
+        for (let i = 0; i < MAX_BUFFERED_DIRECTORY_ENTRIES + 4; i++) {
+          await nodeFs.writeFile(path.join(flatRoot, `f${String(i).padStart(6, '0')}`), 'x')
+        }
+        madeFifo = spawnSync('mkfifo', [path.join(flatRoot, 'zzpipe')]).status === 0
+      })
+
+      it('should skip it on the streaming pass too, yielding every real id', async () => {
+        if (!madeFifo) return
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toEqual(expect.not.arrayContaining(['zzpipe']))
+      })
+
+      it('should still yield all of the real entries', async () => {
+        if (!madeFifo) return
+        const ids: string[] = []
+        for await (const id of storage.allFileIds()) ids.push(id)
+        expect(ids).toHaveLength(MAX_BUFFERED_DIRECTORY_ENTRIES + 4)
+      })
+    })
+  })
+
+  describe('when a compressed representation is too small to hold a trailer', () => {
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      // The gzip format keeps the original size in the last four bytes, so a file under eight bytes cannot
+      // carry one — the logical size is genuinely unknown rather than guessable.
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'tiny-gzip-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      await nodeFs.writeFile(path.join(flatRoot, 'tiny.gzip'), Buffer.from([0x1f, 0x8b, 0x08, 0x00]))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should report the content size as unknown rather than inventing one', async () => {
+      expect((await storage.fileInfo('tiny'))?.contentSize).toBeNull()
+    })
+
+    it('should still report the stored size', async () => {
+      expect((await storage.fileInfo('tiny'))?.size).toBe(4)
+    })
+  })
+
+  describe('when an id has an over-long segment that is not its last', () => {
+    let storage: IContentStorageComponent
+
+    beforeEach(() => {
+      // The budget differs by position: a FINAL segment must also leave room for `.gzip`, since that is the
+      // id's compressed representation, while an intermediate one gets all of NAME_MAX. The rejection says
+      // which rule it applied.
+      storage = createInMemoryStorage()
+    })
+
+    it('should reject naming the plain NAME_MAX budget', async () => {
+      const overLong = `${'x'.repeat(300)}/tail`
+
+      await expect(storage.storeStream(overLong, bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /past the 255 this storage can address/
+      )
+    })
+
+    it('should reject a final segment against the smaller budget instead', async () => {
+      const overLongTail = `head/${'x'.repeat(300)}`
+
+      await expect(storage.storeStream(overLongTail, bufferToStream(Buffer.from('x')))).rejects.toThrow(
+        /less \.gzip for the compressed representation/
+      )
+    })
+  })
+
+  describe('when the storage root is given with a trailing separator', () => {
+    let storage: IContentStorageComponent
+    let storageRoot: string
+
+    beforeEach(async () => {
+      // Stripped at construction, because a root that keeps one breaks the containment comparison for every
+      // id: `'/data/x/id'.startsWith('/data/x//')` is false.
+      storageRoot = mkdtempSync(path.join(os.tmpdir(), 'trailing-sep-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        storageRoot + path.sep
+      )
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    it('should store and read back through the normalized root', async () => {
+      await storage.storeStream('an-id', bufferToStream(Buffer.from('content')))
+
+      expect(await storage.exist('an-id')).toBe(true)
+    })
+
+    it('should still refuse an id that escapes the root', async () => {
+      await expect(storage.exist('../evil')).rejects.toBeInstanceOf(PathNotContainedError)
+    })
+  })
+
+  describe('when enumeration recovers an id from a file path', () => {
+    // Slicing the path is only the inverse of storing when the file is where this storage would have put it.
+    // A foreign file in the wrong shard yielded an id whose own shard is elsewhere, so `exist()` answered
+    // false for something enumeration had just reported — and a GC consumer acting on the pair would delete
+    // the REAL id from its own shard while leaving the foreign file behind.
+    const shardOfId = (id: string): string => createHash('sha1').update(id).digest('hex').substring(0, 4)
+    let storage: IContentStorageComponent
+    let storageRoot: string
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      if (storageRoot) rmSync(storageRoot, { recursive: true, force: true })
+    })
+
+    describe('and the file sits in a shard that is not the one its id hashes to', () => {
+      let listed: string[]
+
+      beforeEach(async () => {
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'enum-noncanonical-'))
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          storageRoot
+        )
+        await storage.storeStream('a/b', bufferToStream(Buffer.from('x')))
+        const observed = path.join(storageRoot, shardOfId('a/b'), 'a')
+        rmSync(observed, { recursive: true, force: true })
+        await nodeFs.writeFile(observed, 'foreign')
+        listed = []
+        for await (const id of storage.allFileIds()) listed.push(id)
+      })
+
+      it('should not yield the derived id', async () => {
+        expect(listed).not.toContain('a')
+      })
+
+      it('should agree with the point lookup, which cannot serve it', async () => {
+        // The round-trip contract: enumeration must only ever yield ids the point lookups accept.
+        expect(await storage.exist('a')).toBe(false)
+      })
+    })
+
+    describe('and the file spells a name no id can have', () => {
+      let listed: string[]
+
+      beforeEach(async () => {
+        // `x.gzip.gzip` is the compressed representation of `x.gzip`, and no id may end in that suffix — so
+        // this is a name nothing storable produces. It used to be yielded as `x.gzip`, whose `exist()` then
+        // THREW `PathNotContainedError`, the same shape as the empty-id case this walk already guards.
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'enum-reserved-'))
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          storageRoot,
+          { disablePrefixHash: true }
+        )
+        await nodeFs.writeFile(path.join(storageRoot, 'x.gzip.gzip'), 'foreign')
+        await storage.storeStream('real', bufferToStream(Buffer.from('x')))
+        listed = []
+        for await (const id of storage.allFileIds()) listed.push(id)
+      })
+
+      it('should not yield it', () => {
+        expect(listed).not.toContain('x.gzip')
+      })
+
+      it('should still yield the ids that are real', () => {
+        expect(listed).toEqual(['real'])
+      })
+    })
+
+    describe('and the root is heavy with SUBDIRECTORIES rather than files', () => {
+      let listed: string[]
+      let expected: string[]
+
+      beforeEach(async () => {
+        // Past the buffered cap the walk streams, and it used to collect every subdirectory NAME before
+        // descending — one string per top-level directory, which is the same unbounded shape as holding one
+        // per entry. It now descends inline. This pins the behaviour that change had to preserve: every id
+        // still comes out exactly once.
+        storageRoot = mkdtempSync(path.join(os.tmpdir(), 'enum-dirheavy-'))
+        storage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          storageRoot,
+          { disablePrefixHash: true }
+        )
+        expected = []
+        for (let i = 0; i < MAX_BUFFERED_DIRECTORY_ENTRIES + 20; i++) {
+          const id = `d${String(i).padStart(6, '0')}/x`
+          await nodeFs.mkdir(path.join(storageRoot, path.dirname(id)), { recursive: true })
+          await nodeFs.writeFile(path.join(storageRoot, id), 'x')
+          expected.push(id)
+        }
+        listed = []
+        for await (const id of storage.allFileIds()) listed.push(id)
+      })
+
+      it('should yield every id exactly once', () => {
+        expect(listed.slice().sort()).toEqual(expected.slice().sort())
+      })
+    })
+  })
+
+  describe('and an observed directory is replaced by a file in HASH-PREFIX mode', () => {
+    // A depth test is enough in flat mode and wrong here: an id's shard is `sha1(the whole id)`, so a file at
+    // `<root>/<shard>/a` is content for the id `a` only when that shard is `sha1('a')`. With `a/b` stored, the
+    // observed directory sits in `sha1('a/b')`'s shard, and a file put there is reachable as NO id at all —
+    // `exist('a')` looks in a different shard — so it is foreign state where a directory used to be, which is
+    // damage rather than a legitimately claimed prefix.
+    const shardOfId = (id: string): string => createHash('sha1').update(id).digest('hex').substring(0, 4)
+    let storage: IContentStorageComponent
+    let hashRoot: string
+
+    beforeEach(async () => {
+      hashRoot = mkdtempSync(path.join(os.tmpdir(), 'hash-noncanonical-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        hashRoot
+      )
+      await storage.storeStream('a/b', bufferToStream(Buffer.from('x')))
+      const observed = path.join(hashRoot, shardOfId('a/b'), 'a')
+      rmSync(observed, { recursive: true, force: true })
+      await nodeFs.writeFile(observed, 'foreign, and not any id this storage serves')
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(hashRoot, { recursive: true, force: true })
+    })
+
+    it('should reject exist rather than report the id absent', async () => {
+      await expect(storage.exist('a/b')).rejects.toBeDefined()
+    })
+
+    it('should reject fileInfo for the same reason', async () => {
+      await expect(storage.fileInfo('a/b')).rejects.toBeDefined()
+    })
+
+    it('should reject retrieve for the same reason', async () => {
+      await expect(storage.retrieve('a/b')).rejects.toBeDefined()
+    })
+
+    it('should not serve that file as the id its name spells, since it is in the wrong shard', async () => {
+      // The reason absence would be wrong: nothing resolves to that path, so calling it "content" credits an
+      // id this storage cannot actually serve.
+      expect(await storage.exist('a')).toBe(false)
+    })
+  })
+
+  describe('and the file replacing it IS the canonical path for its id', () => {
+    // The other side, which must stay absence. It needs `p` and `p/child` to land in one shard, so the id is
+    // searched for rather than hard-coded — deterministic, since it only depends on sha1.
+    const shardOfId = (id: string): string => createHash('sha1').update(id).digest('hex').substring(0, 4)
+    let storage: IContentStorageComponent
+    let hashRoot: string
+    let collidingId: string
+
+    beforeEach(async () => {
+      collidingId = ''
+      for (let i = 0; i < 400_000 && !collidingId; i++) {
+        const candidate = `k${i}`
+        if (shardOfId(candidate) === shardOfId(`${candidate}/child`)) collidingId = candidate
+      }
+      expect(collidingId).not.toBe('')
+
+      hashRoot = mkdtempSync(path.join(os.tmpdir(), 'hash-canonical-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        hashRoot
+      )
+      // Observes the directory, has it destroyed, then legitimately stores the id that owns that exact path.
+      await storage.storeStream(`${collidingId}/child`, bufferToStream(Buffer.from('x')))
+      rmSync(path.join(hashRoot, shardOfId(collidingId), collidingId), { recursive: true, force: true })
+      await storage.storeStream(collidingId, bufferToStream(Buffer.from('legitimate content')))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(hashRoot, { recursive: true, force: true })
+    })
+
+    it('should report the nested id as absent, because the prefix is real content', async () => {
+      expect(await storage.exist(`${collidingId}/child`)).toBe(false)
+    })
+
+    it('should serve the id that owns the path', async () => {
+      expect(await storage.exist(collidingId)).toBe(true)
+    })
+  })
+
+  describe('and the file replacing it is the canonical COMPRESSED path for its id', () => {
+    // `<id>.gzip` is this storage's own name for the compressed representation, so it counts as content too —
+    // stripping the suffix before resolving is what makes that work, since no id may end in it.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'gzip-canonical-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      // `g.gzip/inner` is a legal id — only an id ENDING in `.gzip` is reserved — so this observes the
+      // directory `<root>/g.gzip`, which is also where `g`'s compressed representation belongs.
+      await storage.storeStream('g.gzip/inner', bufferToStream(Buffer.from('x')))
+      rmSync(path.join(flatRoot, 'g.gzip'), { recursive: true, force: true })
+      await storage.storeStreamAndCompress('g', bufferToStream(Buffer.alloc(3000, 'A')))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should report the nested id as absent, because the compressed representation owns the path', async () => {
+      expect(await storage.exist('g.gzip/inner')).toBe(false)
+    })
+
+    it('should serve the compressed id itself', async () => {
+      expect(await storage.exist('g')).toBe(true)
+    })
+  })
+
+  describe('and the directory was observed by a probe that then REFUSED the operation', () => {
+    // The commit-target check proves a directory is there and then refuses to overwrite it. It records it
+    // anyway: otherwise an observation depends on whether the operation that made it SUCCEEDED, and a later
+    // removal of that directory reads as an ordinary miss for ids nested under it.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'refused-observation-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should remember a directory the COMMIT-TARGET check refused to overwrite', async () => {
+      // `<root>/a` is a directory this instance did not create, holding another id's nested content, so the
+      // store of `a` is refused at its commit target — and that refusal is the only thing that observes it.
+      await nodeFs.mkdir(path.join(flatRoot, 'a'))
+      await nodeFs.writeFile(path.join(flatRoot, 'a', 'inner'), 'x')
+      await expect(storage.storeStream('a', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+
+      rmSync(path.join(flatRoot, 'a'), { recursive: true, force: true })
+
+      await expect(storage.exist('a/inner')).rejects.toBeDefined()
+    })
+
+    it('should report ids under a directory blocking gzip-only content as absent, not damaged', async () => {
+      // This shape can now only be reached by FOREIGN action — a store that would create the directory beside
+      // `g.gzip` is refused — and once it is reached, ids nested under it are unstorable, so their reads answer
+      // absence however many times this instance saw the directory. The observation is still recorded (the
+      // commit-target case above covers that); what this asserts is that being unstorable wins over it.
+      await storage.storeStreamAndCompress('g', bufferToStream(Buffer.alloc(3000, 'A')))
+      await nodeFs.mkdir(path.join(flatRoot, 'g'))
+      await nodeFs.writeFile(path.join(flatRoot, 'g', 'inner'), 'x')
+      await expect(storage.retrieve('g', { start: 0, end: 9 })).rejects.toBeDefined()
+
+      rmSync(path.join(flatRoot, 'g'), { recursive: true, force: true })
+
+      expect(await storage.exist('g/inner')).toBe(false)
+    })
+  })
+
+  describe('and the directory was observed by CLIMBING to it from a deeper miss', () => {
+    // The classifier walks up when the id's own parent is absent, and an intact ancestor it stats there is an
+    // observation exactly like one the immediate-parent probe makes. It was not recorded, so the SAME directory
+    // was observed or not depending only on the depth of the id that touched it first: `exist('d/x')` went
+    // through the parent probe and recorded `<root>/d`, while `exist('d/e/f')` climbed to it and did not — so a
+    // later removal rejected for one id and answered `false` for the other.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    /** Reads `id`, then destroys `<root>/d` and reports how a read under it answers afterwards. */
+    const observeThenRemove = async (id: string): Promise<'rejected' | 'absent'> => {
+      expect(await storage.exist(id)).toBe(false)
+      rmSync(path.join(flatRoot, 'd'), { recursive: true, force: true })
+      return storage.exist('d/e/f').then(
+        () => 'absent' as const,
+        () => 'rejected' as const
+      )
+    }
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'climbed-observation-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      // A directory this instance did not create, so only a read can put it in the observation log.
+      await nodeFs.mkdir(path.join(flatRoot, 'd'))
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should reject after removal when the observation came from the immediate parent', async () => {
+      expect(await observeThenRemove('d/x')).toBe('rejected')
+    })
+
+    it('should reject after removal when the observation came from a DEEPER miss', async () => {
+      expect(await observeThenRemove('d/e/f')).toBe('rejected')
+    })
+
+    it('should still report an ordinary miss under a directory it never saw', async () => {
+      // The other side: climbing must not invent observations for paths that were never there.
+      expect(await storage.exist('never/seen/here')).toBe(false)
+    })
+  })
+
+  describe('and the directory was observed some way other than by storing its own id', () => {
+    // The contract is "a directory this instance created or observed", and three ways of learning one existed
+    // did not record it: a recursive `mkdir` recorded only the leaf it was asked for, a lookup that found a
+    // directory at a content path discarded the fact, and the enumeration walk opened directories without
+    // noting them. Each left a directory this instance provably saw outside the evidence the classifier reads,
+    // so its later removal was classified as an ordinary miss.
+    let storage: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'observed-ways-'))
+      storage = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+    })
+
+    afterEach(async () => {
+      await storage.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    describe('and it is an INTERMEDIATE directory a recursive mkdir created', () => {
+      beforeEach(async () => {
+        // Creates `<root>/a` and `<root>/a/b`; only the second is the dirname the store asked for.
+        await storage.storeStream('a/b/c', bufferToStream(Buffer.from('x')))
+        rmSync(path.join(flatRoot, 'a'), { recursive: true, force: true })
+      })
+
+      it('should reject a read under the intermediate directory it created', async () => {
+        // `a/other` was never stored, but the directory that would have held the answer is gone, so absence
+        // cannot be proven — and this instance created that directory, which is what makes it damage.
+        await expect(storage.exist('a/other')).rejects.toBeDefined()
+      })
+
+      it('should still reject the read whose own parent was recorded', async () => {
+        await expect(storage.exist('a/b/c')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and it was seen by a LOOKUP that found a directory at a content path', () => {
+      beforeEach(async () => {
+        await nodeFs.mkdir(path.join(flatRoot, 'd'), { recursive: true })
+        await nodeFs.writeFile(path.join(flatRoot, 'd', 'inner'), 'x')
+        // Reports `false` — a directory is not content — but the instance has now seen `<root>/d` be one.
+        expect(await storage.exist('d')).toBe(false)
+        rmSync(path.join(flatRoot, 'd'), { recursive: true, force: true })
+      })
+
+      it('should reject a later read nested under it', async () => {
+        await expect(storage.exist('d/inner')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and it was seen by ENUMERATION', () => {
+      beforeEach(async () => {
+        await nodeFs.mkdir(path.join(flatRoot, 'e'), { recursive: true })
+        await nodeFs.writeFile(path.join(flatRoot, 'e', 'inner'), 'x')
+        const listed: string[] = []
+        for await (const id of storage.allFileIds()) listed.push(id)
+        expect(listed).toEqual(['e/inner'])
+        rmSync(path.join(flatRoot, 'e'), { recursive: true, force: true })
+      })
+
+      it('should reject a later read nested under the walked directory', async () => {
+        await expect(storage.exist('e/inner')).rejects.toBeDefined()
+      })
+    })
+
+    describe('and nothing was ever observed on the path', () => {
+      it('should still report an ordinary miss', async () => {
+        // The other side of the rule: recording more observations must not turn never-created trees into
+        // faults, or every unknown id in a fresh root would reject.
+        expect(await storage.exist('untouched/child')).toBe(false)
+      })
+    })
+  })
+
+  describe('and the root observation has been dropped from the bounded cache', () => {
+    // The root is seeded into `knownDirectories`, but that set is FIFO-bounded and the root is inserted
+    // FIRST, so it is the first entry evicted once a flat-mode deployment observes more than
+    // MAX_KNOWN_DIRECTORIES directories — which nested ids reach in ordinary operation. Filling that cache
+    // in a test would mean creating 100,000 directories, so this drives the SAME loss through
+    // `forgetDirectory(root)`, which a write failing ENOTDIR under a file-occupied root reaches immediately.
+    // Either way the observation is gone from the set, which is the state that must not decide the answer.
+    let orphaned: IContentStorageComponent
+    let parentDir: string
+    let rootPath: string
+
+    beforeEach(async () => {
+      parentDir = mkdtempSync(path.join(os.tmpdir(), 'root-evicted-'))
+      rootPath = path.join(parentDir, 'storage-root')
+      orphaned = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        rootPath,
+        { disablePrefixHash: true }
+      )
+      rmSync(rootPath, { recursive: true, force: true })
+      await nodeFs.writeFile(rootPath, 'not a directory')
+      // Fails ENOTDIR at its staged write, and `writingUnder` responds by forgetting the root entry.
+      await expect(orphaned.storeStream('some-id', bufferToStream(Buffer.from('x')))).rejects.toBeDefined()
+    })
+
+    afterEach(async () => {
+      await orphaned?.stop?.().catch(() => undefined)
+      rmSync(parentDir, { recursive: true, force: true })
+    })
+
+    it('should still reject rather than report the id as absent', async () => {
+      await expect(orphaned.exist('some-id')).rejects.toBeDefined()
+    })
+
+    it('should still reject retrieve', async () => {
+      await expect(orphaned.retrieve('some-id')).rejects.toBeDefined()
+    })
+  })
+
+  describe('and an ancestor of an id path is another id content file', () => {
+    let obstructed: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      // Flat mode, so ids share one namespace directory and `a/b/c/d` really does sit under `a/b`.
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'obstructed-'))
       obstructed = await createFolderBasedFileSystemContentStorage(
         { fs: createFsComponent(), logs: await createLogComponent({}) },
         flatRoot,
         { disablePrefixHash: true }
       )
+      // Creates the directory `a` and the FILE `a/b`, so `a/b/c` can never be a directory.
       await obstructed.storeStream('a/b', bufferToStream(Buffer.from('content')))
     })
 
     afterEach(async () => {
       await obstructed.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
     })
 
-    it('should reject a read nested under the obstruction', async () => {
-      await expect(obstructed.exist('a/b/c/d')).rejects.toMatchObject({ code: 'ENOTDIR' })
+    // THIS EXPECTATION WAS FLIPPED DELIBERATELY. It used to assert a bare ENOTDIR rejection, on the
+    // reasoning that an obstruction above a shard is a hard fault. The rejection was the wrong answer for
+    // THIS shape: a filesystem cannot hold a file and a directory at one path, so no file can exist at
+    // `a/b/c/d` while `a/b` is a regular file — the id is provably absent, exactly as an over-long name
+    // is. Rejecting made the three surfaces contradict each other (see the assertions below) and let one
+    // such id destroy a whole batch. What still rejects is damage this instance can PROVE: a directory it
+    // observed that stops being one, which the sibling describes above cover.
+    it('should report the nested id as absent rather than rejecting', async () => {
+      expect(await obstructed.exist('a/b/c/d')).toBe(false)
+      expect(await obstructed.retrieve('a/b/c/d')).toBeUndefined()
+      expect(await obstructed.fileInfo('a/b/c/d')).toBeUndefined()
+    })
+
+    it('should agree with delete, which already resolved for such an id', async () => {
+      await expect(obstructed.delete(['a/b/c/d'])).resolves.toBeUndefined()
+      expect(await obstructed.exist('a/b/c/d')).toBe(false)
+    })
+
+    it('should not lose the answers for every other id in a batch', async () => {
+      // The whole batch used to reject on the obstructed id, so a GC or availability sweep learned
+      // nothing about the ids around it — and got a 5xx for a question with a provable answer.
+      const answers = await obstructed.existMultiple(['a/b', 'a/b/c/d'])
+      expect(answers.get('a/b')).toBe(true)
+      expect(answers.get('a/b/c/d')).toBe(false)
+    })
+
+    it('should still refuse to STORE the id, with the typed error', async () => {
+      // A read asks a question whose true answer is "nothing"; a store asks to CREATE something no
+      // filesystem can hold. Only the latter is a caller error, so only it rejects.
+      await expect(obstructed.storeStream('a/b/c/d', bufferToStream(Buffer.from('nope')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    })
+
+    it('should report absence even for a prefix this instance had observed as a directory', async () => {
+      // What OCCUPIES the path decides, not what this instance saw there before. A file at a content path is
+      // served as an id, so ids under it are unstorable — `store` refuses them, `delete` resolves for them —
+      // and reads answering absence is what makes those three agree. Deciding from the observation instead
+      // would have two nodes with identical disks answer differently, and would leave reads as the only
+      // surface reporting a fault for an id the storage itself declares unstorable. The transition is still
+      // logged, since it destroyed whatever was under that path.
+      await obstructed.storeStream('a2/b', bufferToStream(Buffer.from('content')))
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+      await nodeFs.writeFile(path.join(flatRoot, 'a2'), 'not a directory')
+
+      expect(await obstructed.exist('a2/b')).toBe(false)
+    })
+
+    it('should serve the file now occupying that path as its own id', async () => {
+      // The reason absence is honest rather than silent: the node is not claiming to hold nothing, it is
+      // claiming to hold `a2` and not `a2/b`, which is exactly the on-disk truth.
+      await obstructed.storeStream('a2/b', bufferToStream(Buffer.from('content')))
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+      await nodeFs.writeFile(path.join(flatRoot, 'a2'), 'not a directory')
+
+      expect(await obstructed.exist('a2')).toBe(true)
+    })
+  })
+
+  describe('and an observed directory is replaced by content, at every depth', () => {
+    // A file at a content path is served as an id, so every id nested under it is unstorable. Reads report
+    // that as absence, which is what makes them agree with the store (a typed rejection) and with `delete`
+    // (resolves) — and the answer is the same at every depth, which is the property that kept breaking while
+    // it was derived from remembered damage keyed on one path.
+    let damaged: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'damaged-deep-'))
+      damaged = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      // Records `<root>/a2` as a directory this instance created...
+      await damaged.storeStream('a2/b', bufferToStream(Buffer.from('content')))
+      // ...which is then destroyed and replaced by a regular file, i.e. by something servable as the id `a2`.
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+      await nodeFs.writeFile(path.join(flatRoot, 'a2'), 'not a directory')
+    })
+
+    afterEach(async () => {
+      await damaged.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it.each([['a2/b'], ['a2/b/c'], ['a2/b/c/d/e']])('should report %s as absent', async (id) => {
+      expect(await damaged.exist(id)).toBe(false)
+    })
+
+    it('should agree with retrieve at depth', async () => {
+      expect(await damaged.retrieve('a2/b/c/d/e')).toBeUndefined()
+    })
+
+    it('should refuse to STORE the nested id, with the typed error', async () => {
+      // The asymmetry that makes absence the right read answer: nothing can be created under a file, so the
+      // store is a caller error while the read has a provable answer.
+      //
+      // The read comes first deliberately. `ensureDirectoryFor` skips its occupant probe for a directory the
+      // mkdir-skip cache still believes in, and this instance created `<root>/a2` before it was replaced — so
+      // with a warm entry the store fails at its commit rename with a bare errno instead. The read is what
+      // drops that entry (the classifier forgets every path it proves is not a directory), which is also the
+      // realistic order: a service reads before it decides to store.
+      expect(await damaged.exist('a2/b')).toBe(false)
+
+      await expect(damaged.storeStream('a2/b', bufferToStream(Buffer.from('x')))).rejects.toBeInstanceOf(
+        PathNotContainedError
+      )
+    })
+
+    it('should resolve a delete of the nested id, as it already did', async () => {
+      await expect(damaged.delete(['a2/b'])).resolves.toBeUndefined()
+    })
+
+    it('should give the same answer every time the id is asked about', async () => {
+      // Derived from the tree on each call, so repetition cannot change it. This is what the previous
+      // remembered-damage design could not hold: the first read rejected and every later one answered
+      // `false` over an unchanged disk, because the report consumed its own evidence.
+      const answers: boolean[] = []
+      for (let attempt = 0; attempt < 3; attempt++) answers.push(await damaged.exist('a2/b'))
+
+      expect(answers).toEqual([false, false, false])
+    })
+  })
+
+  describe('and an observed directory deeper in the tree is REMOVED', () => {
+    let removed: IContentStorageComponent
+    let flatRoot: string
+
+    beforeEach(async () => {
+      // The same hole in the same shape, one branch over: the ENOENT parent probe also decided damage from
+      // `knownDirectories.has(dirname)` alone, so a removed observed directory stayed loud for its immediate
+      // child and went silent for every deeper descendant. Removal and replacement-by-a-file are one
+      // question — "did a directory this instance observed stop being usable?" — so they must answer alike.
+      flatRoot = mkdtempSync(path.join(os.tmpdir(), 'removed-deep-'))
+      removed = await createFolderBasedFileSystemContentStorage(
+        { fs: createFsComponent(), logs: await createLogComponent({}) },
+        flatRoot,
+        { disablePrefixHash: true }
+      )
+      // Records `<root>/a2` as a directory this instance created...
+      await removed.storeStream('a2/b', bufferToStream(Buffer.from('content')))
+      // ...which is then removed outright, so the parent probe fails ENOENT rather than ENOTDIR.
+      rmSync(path.join(flatRoot, 'a2'), { recursive: true, force: true })
+    })
+
+    afterEach(async () => {
+      await removed.stop?.()
+      rmSync(flatRoot, { recursive: true, force: true })
+    })
+
+    it('should reject for the immediate child of the removed directory', async () => {
+      await expect(removed.exist('a2/b')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    // Each of these is the FIRST read this instance performs, so no earlier call can have invalidated the
+    // entry the report is derived from — the reviewed defect is reachable from a cold instance.
+    it('should reject when a deeper descendant is the first id read', async () => {
+      await expect(removed.exist('a2/b/c')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    it('should reject when a descendant several levels below is the first id read', async () => {
+      await expect(removed.exist('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    it('should reject retrieve of a deeper descendant as the first read', async () => {
+      await expect(removed.retrieve('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    it('should reject fileInfo of a deeper descendant as the first read', async () => {
+      await expect(removed.fileInfo('a2/b/c/d/e')).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+
+    it('should give the same answer every time the id is asked about', async () => {
+      const answers: string[] = []
+      for (let attempt = 0; attempt < 3; attempt++) {
+        answers.push(
+          await removed
+            .exist('a2/b/c')
+            .then(() => 'resolved')
+            .catch(() => 'rejected')
+        )
+      }
+
+      expect(answers).toEqual(['rejected', 'rejected', 'rejected'])
+    })
+
+    it('should let the FIRST write after the damage report recreate the directory', async () => {
+      // The two contracts that pull in opposite directions once a directory breaks, and the reason the
+      // observation is held in a second set rather than dropped from the mkdir-skip cache: a read has to keep
+      // rejecting (evidence must survive) while a write has to recreate the tree on its next attempt (the
+      // mkdir must not be skipped). Serving both from one flag meant breaking one of them.
+      await expect(removed.exist('a2/b')).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await expect(removed.storeStream('a2/b', bufferToStream(Buffer.from('again')))).resolves.toBeUndefined()
+    })
+
+    it('should let a write heal the directory after a DEEPER read reported the damage', async () => {
+      // The report can name an ANCESTOR of the id's own parent, and it is THAT path which has to leave the
+      // mkdir-skip cache. Reading the immediate child cannot show this, because there the damaged path and
+      // `dirname` coincide and the plain `forgetDirectory(dirname)` covers it either way; reading `a2/b/c`
+      // makes them differ, so only moving the named path out of the cache lets the write recreate the tree.
+      await expect(removed.exist('a2/b/c')).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await expect(removed.storeStream('a2/b', bufferToStream(Buffer.from('again')))).resolves.toBeUndefined()
+    })
+
+    it('should serve the id again once a write has repaired the directory, clearing the damage', async () => {
+      await expect(removed.exist('a2/b')).rejects.toMatchObject({ code: 'ENOENT' })
+      await removed.storeStream('a2/b', bufferToStream(Buffer.from('again')))
+
+      expect(await removed.exist('a2/b')).toBe(true)
+    })
+
+    it('should still report an id under a shard that was never created as absent', async () => {
+      // The ordinary miss, which must stay a miss: nothing on `<root>/never/...` was ever observed, so there
+      // is no damage to report even though a removed observed directory exists elsewhere in this root.
+      expect(await removed.exist('never/stored/here')).toBe(false)
     })
   })
 

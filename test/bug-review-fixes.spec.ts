@@ -1,7 +1,7 @@
 import { mkdtempSync, promises as nodeFs, readFileSync, rmSync, writeFileSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { Readable } from 'stream'
+import { PassThrough, Readable } from 'stream'
 import { createLogComponent } from '@well-known-components/logger'
 import {
   bufferToStream,
@@ -520,6 +520,103 @@ describe('bug review fixes', () => {
     })
   })
 
+  describe('when a range read is waiting for an inflation slot as shutdown begins', () => {
+    // The pre-inflation check cannot see a `close()` that lands while the request sits in the slot QUEUE, and
+    // that wait is unbounded in the number of inflations ahead of it. So a request registered while the cache
+    // was open went on to inflate after shutdown had closed it — one inflation slot, gzip CPU and up to
+    // `decompressMaxFileSize` of staging write, for output the commit then discards. Measured with one slot and
+    // a parked 24 MB gzip: a full inflation began after `stop()` had already closed the cache.
+    let storage: IContentStorageComponent
+    let root: string
+    let closed: boolean
+    let stagingWritesAfterClose: string[]
+    let releaseFirstInflation: () => void
+
+    beforeEach(async () => {
+      root = mkdtempSync(path.join(os.tmpdir(), 'slot-queue-shutdown-'))
+      closed = false
+      stagingWritesAfterClose = []
+      let parkedHasProbed: () => void = () => {}
+      const probed = new Promise<void>((resolve) => {
+        parkedHasProbed = resolve
+      })
+      let slotHolderIsInflating: () => void = () => {}
+      const inflating = new Promise<void>((resolve) => {
+        slotHolderIsInflating = resolve
+      })
+      // ARMED ONLY FOR THE READ PHASE. A compressed store checks BOTH of its commit targets, so the gzip path is
+      // stated during setup too — signalling on that made the wait below return immediately and left the timer as
+      // the only synchronisation, which held when this test ran alone and not under full-suite load: the parked
+      // request then registered AFTER `close()`, so its token was born invalidated and the top-of-function check
+      // absorbed it. The test passed while the guard it exists for was neutralised.
+      let armed = false
+      const base = createFsComponent()
+      const gatedFs: IFileSystemComponent = {
+        ...base,
+        // Holds the ONLY inflation slot open until the test releases it, so the second request is genuinely
+        // parked in the queue rather than merely slower.
+        createReadStream: ((probedPath: any, options: any) => {
+          if (!String(probedPath).endsWith(`first${GZIP_SUFFIX}`)) return base.createReadStream(probedPath, options)
+          const gate = new PassThrough()
+          releaseFirstInflation = () => {
+            base.createReadStream(probedPath, options).pipe(gate)
+          }
+          // Reached only AFTER this request has taken the slot, so it is proof of which one holds it.
+          slotHolderIsInflating()
+          return gate as any
+        }) as any,
+        createWriteStream: ((written: any, options: any) => {
+          if (closed) stagingWritesAfterClose.push(path.basename(String(written)))
+          return base.createWriteStream(written, options)
+        }) as any,
+        stat: (async (probedPath: any, ...rest: any[]) => {
+          // The parked request's own gzip probe: it happens after its token is registered and with nothing but
+          // microtasks left before it queues for a slot, so this proves the window is genuinely open.
+          if (armed && String(probedPath).endsWith(`second${GZIP_SUFFIX}`)) parkedHasProbed()
+          return base.stat(probedPath, ...rest)
+        }) as any
+      }
+      storage = await createFolderBasedFileSystemContentStorage({ fs: gatedFs, logs: await logs() }, root, {
+        disablePrefixHash: true,
+        decompressMaxConcurrentInflations: 1,
+        decompressCacheMaxSize: 50_000_000
+      })
+      for (const id of ['first', 'second']) {
+        await storage.storeStreamAndCompress(id, bufferToStream(Buffer.from('z'.repeat(200_000))))
+      }
+
+      armed = true
+      // STRICTLY SEQUENCED, because with one slot the winner of a free-for-all is whichever request happens to
+      // probe faster — and if the second one wins it, the first parks somewhere this gate cannot reach.
+      const holdsTheSlot = storage.retrieve('first', { start: 0, end: 9 }).catch(() => undefined)
+      await inflating
+      const parked = storage.retrieve('second', { start: 0, end: 9 }).catch(() => undefined)
+      await probed
+      // A macrotask, which drains every pending microtask: the parked request has nothing but those left to do
+      // before it queues, so after this it is provably IN the queue rather than merely likely to be.
+      await new Promise((resolve) => setImmediate(resolve))
+      // `stop()` closes the cache synchronously and only then awaits the inflights, so the parked request is
+      // still queued at the moment the cache closes — releasing the slot holder is what lets it through.
+      closed = true
+      const stopped = storage.stop!()
+      releaseFirstInflation()
+      await Promise.all([stopped, holdsTheSlot, parked])
+    })
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('should not stage an inflation that shutdown has already made pointless', () => {
+      expect(stagingWritesAfterClose).toEqual([])
+    })
+
+    it('should leave no derived copy of the parked id on disk', async () => {
+      await expect(nodeFs.stat(path.join(root, 'second'))).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+  })
+
   describe('when a reader pins a cache entry after an eviction pass has already selected it', () => {
     let cache: DecompressCache
     let unlinked: string[]
@@ -774,6 +871,76 @@ describe('bug review fixes', () => {
       const second = cache.deduplicateInflation('/second', async (_token, acquireSlot) => acquireSlot())
 
       await expect(settleOrHang(second)).resolves.not.toBe('never settled')
+    })
+  })
+
+  describe('when a range read runs while the storage is shutting down', () => {
+    let storage: IContentStorageComponent
+    let root: string
+    let range: { start: number; end: number }
+    let writesOpened: string[]
+
+    beforeEach(async () => {
+      // A closed cache refuses to publish a derived file, so a range read of gzip-only content cannot be
+      // served and REJECTS — "cannot be read right now", not "not here", because the content is on disk.
+      // The guard implementing that asserted the premise instead of checking it.
+      root = mkdtempSync(path.join(os.tmpdir(), 'shutdown-range-'))
+      range = { start: 0, end: 9 }
+      writesOpened = []
+      const base = createFsComponent()
+      const observed: IFileSystemComponent = {
+        ...base,
+        createWriteStream: ((target: any, ...rest: any[]) => {
+          writesOpened.push(String(target))
+          return (base.createWriteStream as any)(target, ...rest)
+        }) as IFileSystemComponent['createWriteStream']
+      }
+      storage = await createFolderBasedFileSystemContentStorage({ fs: observed, logs: await logs() }, root, {
+        disablePrefixHash: true
+      })
+      await storage.start?.({} as never)
+      await storage.storeStreamAndCompress('gz-id', bufferToStream(Buffer.from('z'.repeat(30_000))))
+      await storage.stop?.()
+      writesOpened.length = 0
+    })
+
+    afterEach(async () => {
+      await storage?.stop?.()
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('should report an absent id as absent rather than as a storage fault', async () => {
+      // The guard's premise is "the id's gzip is present", which is FALSE here: an id with no gzip returns
+      // from the inflation early, having discarded nothing. Every range read of an unknown id answered 5xx
+      // for as long as the cache stayed closed, with a message claiming the content was intact — for content
+      // `exist()` simultaneously reported absent.
+      await expect(storage.retrieve('never-stored', range)).resolves.toBeUndefined()
+    })
+
+    it('should agree with exist about the absent id', async () => {
+      expect(await storage.exist('never-stored')).toBe(false)
+    })
+
+    it('should still reject for gzip-only content that IS present', async () => {
+      // The other direction, which must not regress: this content is on disk and simply cannot be served as
+      // a range while shutting down. Answering `undefined` here would hand the caller a 404 for content
+      // `exist()` reports present.
+      await expect(storage.retrieve('gz-id', range)).rejects.toThrow(/shutting down/)
+    })
+
+    it('should still serve a range of raw-primary content', async () => {
+      await storage.storeStream('raw-id', bufferToStream(Buffer.from('r'.repeat(100))))
+
+      expect((await storage.retrieve('raw-id', range))?.size).toBe(10)
+    })
+
+    it('should not inflate anything it is going to discard', async () => {
+      // The token is born invalidated once the cache is closed, so the commit would unlink whatever this
+      // produced — after paying an inflation slot, the gzip CPU and up to `decompressMaxFileSize` of staged
+      // write, twice, since `retrieve` retries. No staged file should be opened at all.
+      await storage.retrieve('gz-id', range).catch(() => undefined)
+
+      expect(writesOpened).toEqual([])
     })
   })
 })

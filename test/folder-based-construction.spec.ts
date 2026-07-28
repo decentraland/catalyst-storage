@@ -180,3 +180,38 @@ describe('folder-based storage construction', () => {
     })
   })
 })
+
+describe('when the reserved temp path cannot be probed at construction', () => {
+  let root: string
+  let failure: unknown
+
+  beforeEach(async () => {
+    // ENOENT and ENOTDIR mean "nothing is there", which is the ordinary first boot. Anything else — a
+    // permission or IO fault — leaves it unknown whether the staging area is safe to use, and construction
+    // must not proceed on that: the reservation checks are what stop it hiding addressable content.
+    root = mkdtempSync(path.join(os.tmpdir(), 'temp-unprobeable-'))
+    const base = createFsComponent()
+    const tempDir = path.join(root, '.tmp-writes')
+    const fs: IFileSystemComponent = {
+      ...base,
+      stat: (async (target: any, ...rest: any[]) => {
+        if (String(target) === tempDir) {
+          throw Object.assign(new Error(`EACCES: permission denied, stat '${target}'`), { code: 'EACCES' })
+        }
+        return (base.stat as any)(target, ...rest)
+      }) as IFileSystemComponent['stat']
+    }
+    failure = await createFolderBasedFileSystemContentStorage({ fs, logs: await createLogComponent({}) }, root).then(
+      () => undefined,
+      (error) => error
+    )
+  })
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('should refuse to start rather than guess', () => {
+    expect((failure as { code?: string })?.code).toBe('EACCES')
+  })
+})

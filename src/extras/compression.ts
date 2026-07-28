@@ -5,7 +5,7 @@ import { pipeline } from 'stream/promises'
 import { createGzip } from 'zlib'
 import { ILoggerComponent } from '@well-known-components/interfaces'
 import { IFileSystemComponent } from '../fs/types'
-import { destroyAllQuietly } from '../stream-teardown'
+import { destroyAllQuietly, ignoreStreamError } from '../stream-teardown'
 
 /**
  * The filesystem surface compression needs: the two streams, a size probe and a cleanup unlink.
@@ -111,11 +111,17 @@ async function gzipCompressFile(
   try {
     try {
       source = fs.createReadStream(input)
+      // ABSORBED FROM THE MOMENT IT EXISTS, not only once the teardown below runs: a read stream reports a
+      // failed `open(2)` asynchronously and the very next line AWAITS, so an emit landing in that window is an
+      // unhandled 'error' event, which terminates the process by default. The teardown cannot cover it — it
+      // does not run until the await has settled. Reachable with no adapter and no corruption, since a MISSING
+      // input fails both the open and the probe and load decides which lands first; it surfaced twice here as
+      // an intermittent uncaught ENOENT. An extra listener does not displace `pipeline`'s own.
+      source.on('error', ignoreStreamError)
       // Probed AFTER the source is constructed but BEFORE the destination, and both halves of that are
       // load-bearing:
-      // - after the source, so a failure here still runs the teardown that attaches its 'error'
-      //   handler; a stream destroyed with its `open(2)` still in flight goes on to emit one, and with
-      //   no listener that is an uncaught exception.
+      // - after the source, so a failure here runs the teardown that releases it rather than leaking the
+      //   descriptor.
       // - before the destination, so a failure here never leaves an output file behind. Opening the
       //   destination first meant its `open(2)` could still be in flight when this probe rejected, and
       //   complete AFTER the cleanup unlink — re-creating the very `.gzip` that was just removed, which
