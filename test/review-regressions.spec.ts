@@ -3,7 +3,7 @@ import { createHash } from 'crypto'
 import { mkdtempSync, promises as nodeFs, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
-import { Readable, Writable } from 'stream'
+import { PassThrough, Readable, Writable } from 'stream'
 import { gzipSync } from 'zlib'
 import { createLogComponent } from '@well-known-components/logger'
 import {
@@ -1458,6 +1458,182 @@ describe('when a shard directory is destroyed underneath a running instance', ()
           await expect(storage.storeStream('a/b', bufferToStream(Buffer.from('nested')))).rejects.toBeInstanceOf(
             PathNotContainedError
           )
+        })
+      })
+    })
+
+    describe('and a nested store races a compressed store of the prefix id', () => {
+      // TWO PREFLIGHTS THAT EACH PASSED ARE NOT ENOUGH. The compressed store probes its commit targets while the
+      // raw path is free, then spends as long as consuming and compressing its source takes before committing —
+      // and a nested store checking and creating the directory inside that window was correct when it ran too.
+      // Both checks passed, and the pair they exist to prevent existed anyway, permanently.
+      let racedRoot: string
+      let racedStorage: IContentStorageComponent
+      let compressedOutcome: string
+      let nestedOutcome: string
+
+      beforeEach(async () => {
+        racedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-race-'))
+        racedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: createFsComponent(), logs: await createLogComponent({}) },
+          racedRoot,
+          { disablePrefixHash: true }
+        )
+        // Stalls after its first chunk, which parks the compressed store past its preflight and before its
+        // commit — the window, held open deterministically instead of raced for.
+        const stalled = new PassThrough()
+        stalled.write(Buffer.alloc(3000, 'A'))
+        const compressed = racedStorage
+          .storeStreamAndCompress('a', stalled)
+          .then(() => 'resolved')
+          .catch((err) => err.constructor.name)
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        nestedOutcome = await racedStorage
+          .storeStream('a/b', bufferToStream(Buffer.from('nested')))
+          .then(() => 'resolved')
+          .catch((err) => err.constructor.name)
+        stalled.end(Buffer.alloc(3000, 'A'))
+        compressedOutcome = await compressed
+      })
+
+      afterEach(async () => {
+        await racedStorage.stop?.()
+        rmSync(racedRoot, { recursive: true, force: true })
+      })
+
+      it('should refuse the compressed store, which is the one that has to lose', () => {
+        expect(compressedOutcome).toBe('PathNotContainedError')
+      })
+
+      it('should let the nested store through', () => {
+        expect(nestedOutcome).toBe('resolved')
+      })
+
+      it('should publish no compressed representation beside the directory', async () => {
+        const entries = (await nodeFs.readdir(racedRoot)).filter((name) => !name.startsWith('.tmp'))
+        expect(entries).toEqual(['a'])
+      })
+
+      it('should keep the nested id readable', async () => {
+        await expect(racedStorage.exist('a/b')).resolves.toBe(true)
+      })
+    })
+
+    describe('and the compressed commit is already holding the prefix path lock', () => {
+      // The other order, and the one that proves it is a LOCK rather than luck: the compressed store is held
+      // INSIDE its commit — past its own re-probe of the raw path — so the only thing that can still stop a
+      // nested store from creating the directory underneath it is the lock itself.
+      let lockedRoot: string
+      let lockedStorage: IContentStorageComponent
+      let settledWhileLocked: boolean
+      let compressedOutcome: string
+      let nestedOutcome: string
+
+      /** Runs `nestedId` against a compressed store of `a` that is frozen mid-publish. */
+      const raceAgainstHeldCommit = async (nestedId: string): Promise<void> => {
+        lockedRoot = mkdtempSync(path.join(os.tmpdir(), 'prefix-lock-'))
+        let releaseCommit: () => void = () => {}
+        let commitReached: () => void = () => {}
+        const reached = new Promise<void>((resolve) => {
+          commitReached = resolve
+        })
+        const base = createFsComponent()
+        const gatedFs: IFileSystemComponent = {
+          ...base,
+          rename: (async (from: any, to: any) => {
+            // The compressed commit's own publish, which runs inside the prefix path lock.
+            if (String(to).endsWith('a.gzip')) {
+              commitReached()
+              await new Promise<void>((resolve) => {
+                releaseCommit = resolve
+              })
+            }
+            return base.rename(from, to)
+          }) as any
+        }
+        lockedStorage = await createFolderBasedFileSystemContentStorage(
+          { fs: gatedFs, logs: await createLogComponent({}) },
+          lockedRoot,
+          { disablePrefixHash: true }
+        )
+        const compressed = lockedStorage
+          .storeStreamAndCompress('a', bufferToStream(Buffer.alloc(3000, 'A')))
+          .then(() => 'resolved')
+          .catch((err) => err.constructor.name)
+        await reached
+
+        settledWhileLocked = false
+        const nested = lockedStorage
+          .storeStream(nestedId, bufferToStream(Buffer.from('nested')))
+          .then(() => 'resolved')
+          .catch((err) => err.constructor.name)
+        void nested.then(() => {
+          settledWhileLocked = true
+        })
+        // A short wait is the safe direction for a negative assertion: a slower machine makes settling LESS
+        // likely, so this cannot fail spuriously — only a nested store that ignored the lock trips it.
+        await new Promise((resolve) => setTimeout(resolve, 120))
+        const observed = settledWhileLocked
+
+        releaseCommit()
+        compressedOutcome = await compressed
+        nestedOutcome = await nested
+        settledWhileLocked = observed
+      }
+
+      afterEach(async () => {
+        await lockedStorage.stop?.()
+        rmSync(lockedRoot, { recursive: true, force: true })
+      })
+
+      describe('and the nested id sits directly under it', () => {
+        beforeEach(async () => {
+          await raceAgainstHeldCommit('a/b')
+        })
+
+        it('should hold the nested store until the commit releases the lock', () => {
+          expect(settledWhileLocked).toBe(false)
+        })
+
+        it('should then refuse it with the typed error', () => {
+          expect(nestedOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should let the compressed store commit', () => {
+          expect(compressedOutcome).toBe('resolved')
+        })
+
+        it('should keep byte ranges of the compressed id servable', async () => {
+          const item = await lockedStorage.retrieve('a', { start: 0, end: 9 })
+          await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
+        })
+      })
+
+      describe('and the nested id sits SEVERAL levels under it', () => {
+        // Every level the check inspects is locked, not just the directory being created. Locking only the
+        // immediate parent left a store of `a/b/c` taking the lock on `<root>/a/b` while the compressed store
+        // held `<root>/a` — so its `mkdir -p` created `<root>/a` in the window between the commit's re-probe
+        // and its rename, which is the one interleaving the re-probe alone cannot see.
+        beforeEach(async () => {
+          await raceAgainstHeldCommit('a/b/c')
+        })
+
+        it('should hold it on the SHALLOWEST level, which is the one being published', () => {
+          expect(settledWhileLocked).toBe(false)
+        })
+
+        it('should then refuse it with the typed error', () => {
+          expect(nestedOutcome).toBe('PathNotContainedError')
+        })
+
+        it('should have published the compressed representation and nothing else', async () => {
+          const entries = (await nodeFs.readdir(lockedRoot)).filter((name) => !name.startsWith('.tmp'))
+          expect(entries).toEqual(['a.gzip'])
+        })
+
+        it('should keep byte ranges of the compressed id servable', async () => {
+          const item = await lockedStorage.retrieve('a', { start: 0, end: 9 })
+          await expect(streamToBuffer(await item!.asStream())).resolves.toEqual(Buffer.alloc(10, 'A'))
         })
       })
     })

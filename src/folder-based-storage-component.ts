@@ -941,6 +941,29 @@ export async function createFolderBasedFileSystemContentStorage(
    * a shard name never spells its own id — `<root>/86f7` is not where `sha1('86f7')` points — so every shard
    * creation in hash mode settles it in CPU alone and stats nothing.
    */
+  /**
+   * Every ancestor path the check below inspects, SHALLOWEST FIRST.
+   *
+   * The order is the deadlock argument: these are taken nested, and every acquisition in the component goes
+   * from the shallowest to the deepest, so two stores creating overlapping chains can never hold what the other
+   * wants. Empty when the directory is the root itself, which owns no id's name and so needs no lock.
+   */
+  function prefixLevels(dirname: string): string[] {
+    const levels: string[] = []
+    for (let candidate = dirname; candidate.length > root.length; candidate = path.dirname(candidate)) {
+      levels.unshift(candidate)
+      if (path.dirname(candidate) === candidate) break
+    }
+    return levels
+  }
+
+  /** Holds every level's path lock for the duration of `fn`, acquiring them shallowest first. */
+  function withPrefixLocks<T>(levels: string[], fn: () => Promise<T>): Promise<T> {
+    if (levels.length === 0) return fn()
+    const [shallowest, ...deeper] = levels
+    return withPathLock(shallowest, () => withPrefixLocks(deeper, fn))
+  }
+
   async function assertNoCompressedIdOwnsChain(dirname: string): Promise<void> {
     for (let candidate = dirname; candidate.length > root.length; candidate = path.dirname(candidate)) {
       const parent = path.dirname(candidate)
@@ -1010,8 +1033,16 @@ export async function createFolderBasedFileSystemContentStorage(
       // the mkdir, it missed the case where `<root>/a` is ALREADY a directory beside `a.gzip` — reachable from a
       // tree an older version wrote (this store used to be allowed), from versions that created directories on
       // read, or from operator state — which is the very state the check exists to keep out.
-      await assertNoCompressedIdOwnsChain(dirname)
-      if (occupant === 'absent') {
+      // CHECKED AND CREATED UNDER ONE LOCK, because two preflights that each passed are not enough: a
+      // compressed store of `a` probes its commit targets while `<root>/a` is free, blocks for as long as
+      // consuming and compressing its source takes, and commits `a.gzip` afterwards — so a nested store that
+      // checked and created `<root>/a` inside that window produced exactly the unrangeable pair both checks
+      // exist to prevent, each having been correct when it ran. The lock is the compressed store's OWN: it
+      // commits under the path lock of `<root>/a`, which is the directory created here, and it re-probes that
+      // path under it (see the gzip commit). One of the two now always loses.
+      await withPrefixLocks(prefixLevels(dirname), async () => {
+        await assertNoCompressedIdOwnsChain(dirname)
+        if (occupant !== 'absent') return
         try {
           await components.fs.mkdir(dirname, { recursive: true })
         } catch (err: any) {
@@ -1055,7 +1086,7 @@ export async function createFolderBasedFileSystemContentStorage(
           }
           throw err
         }
-      }
+      })
       addCapped(prefixVerifiedDirectories, dirname)
       rememberDirectory(dirname)
     } else if (!prefixVerifiedDirectories.has(dirname)) {
@@ -2250,6 +2281,29 @@ export async function createFolderBasedFileSystemContentStorage(
           // Intent-journaled: a crash between the commit rename and the counterpart cleanup is
           // reconciled at next construction, never leaving mixed versions for reads to prefer.
           if (compressed) {
+            // RE-PROBED UNDER THE LOCK, immediately before publishing. This store's preflight found the raw path
+            // free, and nothing since has been serialized with a nested store creating a directory there — that
+            // store takes this very path lock around its own check and mkdir, so reaching here with a directory
+            // present means it won the race. Publishing anyway would leave `a.gzip` beside the directory `a`:
+            // whole reads fine, byte ranges of `a` rejecting forever, and no way back. Unlike a raw commit,
+            // nothing here would fail on its own — renaming onto `a.gzip` succeeds whatever occupies `a`.
+            const rawOccupant = await statOccupant(filePath)
+            if (rawOccupant === 'directory') {
+              rememberDirectory(filePath)
+              throw new PathNotContainedError(
+                `The id cannot be stored: while this store was in flight, another id nested under ` +
+                  `${JSON.stringify(filePath)} and made it a directory, which is where this id's decompressed ` +
+                  `copy has to be published for byte-range reads. Ids where one is a path prefix of another can ` +
+                  `only coexist when hash prefixes put them in different shards: ${JSON.stringify(id)}`
+              )
+            }
+            if (rawOccupant === 'other') {
+              throw new Error(
+                `Cannot store ${JSON.stringify(id)}: ${JSON.stringify(filePath)} exists but is neither a regular ` +
+                  `file nor a directory, so this storage cannot publish this id's decompressed copy there. ` +
+                  `Remove whatever occupies it.`
+              )
+            }
             await journal.commitRepresentation(
               'gzip',
               id,
